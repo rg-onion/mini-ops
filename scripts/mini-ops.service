@@ -1,0 +1,23 @@
+[Unit]
+Description=Mini-Ops Agent
+After=network.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=miniops
+Group=miniops
+SupplementaryGroups=docker
+WorkingDirectory=/opt/mini-ops
+ExecStart=/opt/mini-ops/mini-ops
+EnvironmentFile=/opt/mini-ops/.env
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/mini-ops /tmp
+
+[Install]
+WantedBy=multi-user.target

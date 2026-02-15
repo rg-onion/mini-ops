@@ -1,0 +1,21 @@
+# Rust
+/target
+/mini-ops.db
+/mini-ops.db-journal
+/mini-ops-internal.token
+/history.json
+
+# Frontend
+/frontend/node_modules
+/frontend/dist
+
+# Environment
+.env
+
+# IDEs
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
