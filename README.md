@@ -41,14 +41,18 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 
 ## 🚀 Quick Start
 
-### 1. Installation (Linux)
+### 1. Installation
 
+Mini-Ops is designed to be built from source or deployed via an automated script.
+
+#### Option A: Automated Ubuntu Bootstrap (Recommended)
+This script will build the app locally and deploy it to your server:
 ```bash
-# Download the latest release (example)
-wget https://github.com/rg-onion/mini-ops/releases/latest/download/mini-ops
-chmod +x mini-ops
-sudo mv mini-ops /usr/local/bin/
+DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 ```
+
+#### Option B: Manual Installation
+See the [Development](#-development) section below to build the binary from source.
 
 ### 2. Configuration (`.env`)
 
