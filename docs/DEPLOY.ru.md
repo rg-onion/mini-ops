@@ -39,8 +39,8 @@ TELEGRAM_CHAT_ID=...             # optional
 ```
 
 ### Режимы сети
-1. `DEPLOY_MODE=test`: откроет `3000/tcp` в UFW (для демо/лаба).
-2. `DEPLOY_MODE=production`: не открывает `3000/tcp` (ожидается reverse proxy + HTTPS).
+1. `DEPLOY_MODE=test`: откроет `8090/tcp` в UFW (для демо/лаба).
+2. `DEPLOY_MODE=production`: не открывает `8090/tcp` (ожидается reverse proxy + HTTPS).
 
 ### Safe mode (без изменения firewall/пакетов)
 ```bash

@@ -246,7 +246,11 @@ async fn main() {
             ssh_alerts: ssh_alerts_service,
         });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let app_port = std::env::var("APP_PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr_str = format!("{}:{}", app_host, app_port);
+    let addr: SocketAddr = addr_str.parse().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 3000)));
+
     tracing::info!("Mini-Ops listening on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

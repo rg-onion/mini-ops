@@ -14,6 +14,9 @@ DEPLOY_TARGET_DIR="${DEPLOY_TARGET_DIR:-/opt/mini-ops}"
 DEPLOY_APP_USER="${DEPLOY_APP_USER:-miniops}"
 DEPLOY_MODE="${DEPLOY_MODE:-test}"                       # test | production
 DEPLOY_INSTALL_DOCKER="${DEPLOY_INSTALL_DOCKER:-1}"      # 1 | 0
+DEPLOY_SETUP_NGINX="${DEPLOY_SETUP_NGINX:-1}"            # 1 | 0
+DEPLOY_NGINX_PORT="${DEPLOY_NGINX_PORT:-8090}"
+DEPLOY_APP_PORT="${DEPLOY_APP_PORT:-3000}"               # internal app port
 DEPLOY_ENABLE_SSH_ALERTS="${DEPLOY_ENABLE_SSH_ALERTS:-1}" # 1 | 0
 DEPLOY_RUN_LOCAL_BUILD="${DEPLOY_RUN_LOCAL_BUILD:-1}"    # 1 | 0
 DEPLOY_HARDENING="${DEPLOY_HARDENING:-1}"                # 1 | 0
@@ -91,9 +94,17 @@ if [ "$DEPLOY_SYSTEMD_ONLY" = "1" ]; then
 else
   if [ "$DEPLOY_HARDENING" = "1" ] && [ "$DEPLOY_MINIMAL" != "1" ]; then
     echo "[3/7] Installing baseline packages and hardening tools..."
-    "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO bash -lc 'apt-get update && apt-get install -y ca-certificates curl git ufw fail2ban rsync && systemctl enable fail2ban --now'"
+    if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+      "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO bash -lc 'apt-get update && apt-get install -y ca-certificates curl git ufw fail2ban rsync nginx && systemctl enable fail2ban --now'"
+    else
+      "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO bash -lc 'apt-get update && apt-get install -y ca-certificates curl git ufw fail2ban rsync && systemctl enable fail2ban --now'"
+    fi
   else
     echo "[3/7] Skipping hardening step (DEPLOY_HARDENING=0)"
+    if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+      echo "Ensuring Nginx is installed even though hardening is disabled..."
+      "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO bash -lc 'if ! command -v nginx >/dev/null 2>&1; then apt-get update && apt-get install -y nginx; fi'"
+    fi
   fi
 fi
 
@@ -181,10 +192,32 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
   else
     echo "[6/7] Writing .env only (DEPLOY_MINIMAL=1, DEPLOY_WRITE_ENV=1)"
   fi
-  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_APP_USER='$DEPLOY_APP_USER' AUTH_TOKEN='$AUTH_TOKEN' TELEGRAM_BOT_TOKEN='$TELEGRAM_BOT_TOKEN' TELEGRAM_CHAT_ID='$TELEGRAM_CHAT_ID' SERVER_NAME='$SERVER_NAME' AGENT_LANG='$AGENT_LANG' RUST_LOG='$RUST_LOG' DEPLOY_MINIMAL='$DEPLOY_MINIMAL' bash -s" <<'EOF'
+
+  SCP_CMD=(scp -P "${SSH_PORT:-22}")
+  if [ -n "${SSH_KEY_PATH:-}" ]; then
+    SCP_CMD+=("-i" "$SSH_KEY_PATH")
+  fi
+
+  if [ -f ".env" ]; then
+    echo "Found local .env file. Syncing to target..."
+    "${SCP_CMD[@]}" .env "$REMOTE:/tmp/mini-ops-env.new"
+  elif [ -f ".env.example" ]; then
+    echo "No local .env found. Uploading .env.example as fallback..."
+    "${SCP_CMD[@]}" .env.example "$REMOTE:/tmp/mini-ops-env.new"
+  fi
+
+  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_APP_USER='$DEPLOY_APP_USER' AUTH_TOKEN='$AUTH_TOKEN' TELEGRAM_BOT_TOKEN='$TELEGRAM_BOT_TOKEN' TELEGRAM_CHAT_ID='$TELEGRAM_CHAT_ID' SERVER_NAME='$SERVER_NAME' AGENT_LANG='$AGENT_LANG' RUST_LOG='$RUST_LOG' DEPLOY_MINIMAL='$DEPLOY_MINIMAL' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
 set -euo pipefail
 
-touch "$DEPLOY_TARGET_DIR/.env"
+if [ -f /tmp/mini-ops-env.new ]; then
+  cp /tmp/mini-ops-env.new "$DEPLOY_TARGET_DIR/.env"
+  rm -f /tmp/mini-ops-env.new
+else
+  touch "$DEPLOY_TARGET_DIR/.env"
+fi
+grep -q '^APP_HOST=' "$DEPLOY_TARGET_DIR/.env" || echo 'APP_HOST=127.0.0.1' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^APP_PORT=' "$DEPLOY_TARGET_DIR/.env" || echo "APP_PORT=$DEPLOY_APP_PORT" >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^DEPLOY_NGINX_PORT=' "$DEPLOY_TARGET_DIR/.env" || echo "DEPLOY_NGINX_PORT=$DEPLOY_NGINX_PORT" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^DATABASE_URL=' "$DEPLOY_TARGET_DIR/.env" || echo 'DATABASE_URL=sqlite:mini-ops.db' >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^RUST_LOG=' "$DEPLOY_TARGET_DIR/.env" || echo "RUST_LOG=$RUST_LOG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^AGENT_LANG=' "$DEPLOY_TARGET_DIR/.env" || echo "AGENT_LANG=$AGENT_LANG" >> "$DEPLOY_TARGET_DIR/.env"
@@ -238,6 +271,30 @@ SERVICE
 
 systemctl daemon-reload
 systemctl enable mini-ops --now
+
+if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+  cat > /etc/nginx/sites-available/mini-ops <<NGINX
+server {
+    listen $DEPLOY_NGINX_PORT;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:$DEPLOY_APP_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+  rm -f /etc/nginx/sites-enabled/default
+  ln -sf /etc/nginx/sites-available/mini-ops /etc/nginx/sites-enabled/mini-ops
+  nginx -t && systemctl restart nginx
+fi
 EOF
 else
   echo "[6/7] Skipping .env and systemd changes (DEPLOY_MINIMAL=1)"
@@ -247,11 +304,13 @@ if [ "$DEPLOY_SYSTEMD_ONLY" = "1" ]; then
   echo "[7/7] Systemd-only mode: skipping firewall and SSH alerts"
 elif [ "$DEPLOY_HARDENING" = "1" ] && [ "$DEPLOY_MINIMAL" != "1" ]; then
   echo "[7/7] Applying firewall and optional SSH alerts hook..."
-  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' bash -s" <<'EOF'
+  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
 set -euo pipefail
 
 ufw allow OpenSSH
-if [ "$DEPLOY_MODE" = "test" ]; then
+if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+  ufw allow "$DEPLOY_NGINX_PORT/tcp"
+elif [ "$DEPLOY_MODE" = "test" ]; then
   ufw allow 3000/tcp
 fi
 ufw --force enable
@@ -268,7 +327,9 @@ echo
 echo "Bootstrap complete."
 echo "Host: $DEPLOY_HOST"
 echo "Mode: $DEPLOY_MODE"
-if [ "$DEPLOY_MODE" = "test" ]; then
+if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+  echo "Dashboard: http://$DEPLOY_HOST:$DEPLOY_NGINX_PORT"
+elif [ "$DEPLOY_MODE" = "test" ]; then
   echo "Dashboard: http://$DEPLOY_HOST:3000"
 else
   echo "Port 3000 was not opened by this script (production mode)."

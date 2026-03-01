@@ -19,3 +19,7 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Test/Local Configs
+mini-ops-*.conf
+mini-ops-*.service

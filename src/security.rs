@@ -258,7 +258,9 @@ impl SecurityAuditor {
         
         if let Ok(output) = Command::new(&ss_path).args(&["-tulpn"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let allowed_ports = ["22", "80", "443", "3000"];
+            let nginx_port = std::env::var("DEPLOY_NGINX_PORT").unwrap_or_else(|_| "8090".to_string());
+            let app_port = std::env::var("APP_PORT").unwrap_or_else(|_| "3000".to_string());
+            let allowed_ports = vec!["22".to_string(), "80".to_string(), "443".to_string(), app_port, nginx_port];
             
             let mut suspicious = Vec::new();
             for line in stdout.lines() {
@@ -266,7 +268,7 @@ impl SecurityAuditor {
                     // Extract port using simple split
                     if let Some(local_part) = line.split_whitespace().nth(4) {
                         if let Some(port) = local_part.split(':').last() {
-                            if !allowed_ports.contains(&port) {
+                            if !allowed_ports.contains(&port.to_string()) {
                                 suspicious.push(port.to_string());
                             }
                         }

@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID=your_chat_id
 ### Тестирование
 Вы можете проверить отправку уведомлений вручную:
 ```bash
-curl -X POST http://YOUR_SERVER_IP:3000/api/test-notification \
+curl -X POST http://YOUR_SERVER_IP:8090/api/test-notification \
   -H "Authorization: Bearer YOUR_AUTH_TOKEN"
 ```
 Если настройки верны, бот пришлет тестовое сообщение.

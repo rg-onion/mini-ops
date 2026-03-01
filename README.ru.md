@@ -91,7 +91,7 @@ EOF
 sudo systemctl enable --now mini-ops
 ```
 
-Доступ к дашборду: **http://your-server-ip:3000**
+Доступ к дашборду: **http://your-server-ip:8090**
 
 **Автоматическая установка (Ubuntu, рекомендуется):**
 ```bash
@@ -104,7 +104,7 @@ DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 
 ## 🌐 Сетевые режимы
 
-- **Test mode (без SSL)**: прямой доступ к `http://server-ip:3000` для тестов.
+- **Test mode (без SSL)**: прямой доступ к `http://server-ip:8090` для тестов.
 - **Production mode (SSL)**: запускайте Mini-Ops за Nginx/Caddy/Cloudflare Tunnel и используйте только HTTPS.
 
 ---

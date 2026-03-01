@@ -95,7 +95,7 @@ EOF
 sudo systemctl enable --now mini-ops
 ```
 
-Access dashboard at: **http://your-server-ip:3000**
+Access dashboard at: **http://your-server-ip:8090**
 
 Automated Ubuntu bootstrap (recommended for fast demo):
 ```bash
@@ -123,7 +123,7 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for full options.
 
 ## 🌐 Networking Modes
 
-- **Test mode (no SSL)**: direct access to `http://server-ip:3000` for lab/internal testing.
+- **Test mode (no SSL)**: direct access to `http://server-ip:8090` for lab/internal testing.
 - **Production mode (SSL)**: run Mini-Ops behind Nginx/Caddy/Cloudflare Tunnel and expose only HTTPS.
 
 ---
@@ -162,7 +162,7 @@ Mini-Ops is designed with security in mind:
 
 Production recommendations:
 - Put Mini-Ops behind HTTPS reverse proxy (Nginx/Caddy/Cloudflare Tunnel).
-- Avoid exposing port `3000` publicly without TLS.
+- Avoid exposing port `8090` publicly without TLS.
 - Run service as dedicated non-root user whenever possible.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
