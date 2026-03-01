@@ -260,7 +260,7 @@ EnvironmentFile=$DEPLOY_TARGET_DIR/.env
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
-PrivateTmp=true
+PrivateTmp=false
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$DEPLOY_TARGET_DIR /tmp
@@ -270,7 +270,8 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable mini-ops --now
+systemctl enable mini-ops
+systemctl restart mini-ops
 
 if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
   cat > /etc/nginx/sites-available/mini-ops <<NGINX
@@ -302,25 +303,27 @@ fi
 
 if [ "$DEPLOY_SYSTEMD_ONLY" = "1" ]; then
   echo "[7/7] Systemd-only mode: skipping firewall and SSH alerts"
-elif [ "$DEPLOY_HARDENING" = "1" ] && [ "$DEPLOY_MINIMAL" != "1" ]; then
-  echo "[7/7] Applying firewall and optional SSH alerts hook..."
-  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
+elif [ "$DEPLOY_MINIMAL" != "1" ] && { [ "$DEPLOY_HARDENING" = "1" ] || [ "$DEPLOY_ENABLE_SSH_ALERTS" = "1" ]; }; then
+  echo "[7/7] Applying firewall (if enabled) and optional SSH alerts hook..."
+  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_HARDENING='$DEPLOY_HARDENING' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
 set -euo pipefail
 
-ufw allow OpenSSH
-if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
-  ufw allow "$DEPLOY_NGINX_PORT/tcp"
-elif [ "$DEPLOY_MODE" = "test" ]; then
-  ufw allow 3000/tcp
+if [ "$DEPLOY_HARDENING" = "1" ]; then
+  ufw allow OpenSSH
+  if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+    ufw allow "$DEPLOY_NGINX_PORT/tcp"
+  elif [ "$DEPLOY_MODE" = "test" ]; then
+    ufw allow 3000/tcp
+  fi
+  ufw --force enable
 fi
-ufw --force enable
 
 if [ "$DEPLOY_ENABLE_SSH_ALERTS" = "1" ]; then
   bash "$DEPLOY_TARGET_DIR/scripts/setup_ssh_alerts.sh"
 fi
 EOF
 else
-  echo "[7/7] Skipping firewall and SSH alerts (DEPLOY_HARDENING=0)"
+  echo "[7/7] Skipping firewall and SSH alerts"
 fi
 
 echo

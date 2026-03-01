@@ -131,5 +131,23 @@
         "ws_connected": "WebSocket подключен.",
         "ws_closed": "Соединение закрыто.",
         "ws_error": "Ошибка WebSocket."
+    },
+    "ssh": {
+        "setup": {
+            "btn": "Настроить SSH",
+            "success": "Успешно настроено",
+            "error": "Ошибка настройки"
+        },
+        "trusted": {
+            "title": "Доверенные IP"
+        },
+        "logs": {
+            "title": "SSH Логи"
+        },
+        "table": {
+            "time": "Время",
+            "user": "Пользователь",
+            "status": "Статус"
+        }
     }
 }

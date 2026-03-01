@@ -17,8 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 # 1. Install script
 if [ -f "${SCRIPT_DIR}/ssh-alert.sh" ]; then
     cp "${SCRIPT_DIR}/ssh-alert.sh" /usr/local/bin/ssh-alert.sh
+    sed -i "s/3000/${DEPLOY_APP_PORT:-3000}/g" /usr/local/bin/ssh-alert.sh
     chmod +x /usr/local/bin/ssh-alert.sh
-    echo "✅ Copied hook to /usr/local/bin/ssh-alert.sh"
+    echo "✅ Copied hook to /usr/local/bin/ssh-alert.sh with port ${DEPLOY_APP_PORT:-3000}"
 else
     echo "❌ Error: Could not find ${SCRIPT_DIR}/ssh-alert.sh"
     exit 1

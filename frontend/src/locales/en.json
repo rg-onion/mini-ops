@@ -131,5 +131,23 @@
         "ws_connected": "WebSocket Connected.",
         "ws_closed": "Connection closed.",
         "ws_error": "WebSocket Error."
+    },
+    "ssh": {
+        "setup": {
+            "btn": "Setup SSH",
+            "success": "Setup successful",
+            "error": "Setup error"
+        },
+        "trusted": {
+            "title": "Trusted IPs"
+        },
+        "logs": {
+            "title": "SSH Logs"
+        },
+        "table": {
+            "time": "Time",
+            "user": "User",
+            "status": "Status"
+        }
     }
 }
