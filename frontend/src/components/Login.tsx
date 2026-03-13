@@ -17,21 +17,21 @@ export default function Login() {
     };
 
     return (
-        <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-neutral-900 relative">
-            <div className="absolute top-4 right-4">
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => i18n.changeLanguage(i18n.language === 'en' ? 'ru' : 'en')}
-                    className="gap-2"
-                >
-                    <Languages className="h-4 w-4" />
-                    {i18n.language === 'en' ? 'Русский' : 'English'}
-                </Button>
-            </div>
+        <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-neutral-900">
             <Card className="w-[350px]">
                 <CardHeader>
-                    <CardTitle>{t('login.title')}</CardTitle>
+                    <div className="flex items-center justify-between">
+                        <CardTitle>{t('login.title')}</CardTitle>
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => i18n.changeLanguage(i18n.language === 'en' ? 'ru' : 'en')}
+                            className="gap-2 -mr-2"
+                        >
+                            <Languages className="h-4 w-4" />
+                            {i18n.language === 'en' ? 'Русский' : 'English'}
+                        </Button>
+                    </div>
                 </CardHeader>
                 <CardContent>
                     <div className="flex flex-col space-y-4">

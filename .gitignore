@@ -23,3 +23,8 @@ Thumbs.db
 # Test/Local Configs
 mini-ops-*.conf
 mini-ops-*.service
+
+# Agent Skills & Workflows (local dev tooling)
+.agent/
+CLAUDE.md
+.claude/
