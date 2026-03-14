@@ -1,5 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { LayoutDashboard, Box, Settings, LogOut, Terminal, History as HistoryIcon, Languages, ShieldAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Button } from "./ui/button";
 import { useState, useEffect } from "react";
 import { UpdateDialog } from "./UpdateDialog";
@@ -10,6 +11,12 @@ import { useTranslation } from "react-i18next";
 
 interface LayoutProps {
     children: React.ReactNode;
+}
+
+interface NavItem {
+    path: string;
+    icon: LucideIcon;
+    label: string;
 }
 
 export default function Layout({ children }: LayoutProps) {
@@ -36,80 +43,133 @@ export default function Layout({ children }: LayoutProps) {
     };
 
     const toggleLanguage = () => {
-        const newLang = i18n.language === 'en' ? 'ru' : 'en';
-        i18n.changeLanguage(newLang);
+        i18n.changeLanguage(i18n.language === 'en' ? 'ru' : 'en');
     };
 
+    const navItems: NavItem[] = [
+        { path: "/",           icon: LayoutDashboard, label: t('common.dashboard') },
+        { path: "/containers", icon: Box,              label: t('common.containers') },
+        { path: "/history",    icon: HistoryIcon,      label: t('common.history') },
+        { path: "/security",   icon: ShieldAlert,      label: t('security.short_title') },
+    ];
+
     return (
-        <div className="flex min-h-screen bg-neutral-50/50 dark:bg-neutral-900 w-full">
-            {/* Sidebar - Sticky */}
-            <aside className="sticky top-0 h-screen w-64 shrink-0 border-r bg-background shadow-sm overflow-y-auto z-40">
-                <div className="flex h-full flex-col">
-                    <div className="flex h-16 items-center px-6 border-b shrink-0 justify-between">
-                        <div className="flex items-center">
-                            <Terminal className="mr-2 h-6 w-6 text-primary" />
-                            <span className="font-bold text-lg tracking-tight">Mini-Ops</span>
-                        </div>
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={toggleLanguage}
-                            className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                            title={i18n.language === 'en' ? 'RU' : 'EN'}
-                        >
-                            <Languages className="h-4 w-4" />
-                        </Button>
+        <div className="flex h-dvh overflow-hidden bg-neutral-50/50 dark:bg-neutral-900 w-full">
+
+            {/* ── Sidebar (desktop only) ───────────────────────────────── */}
+            <aside className="hidden md:flex flex-col w-64 shrink-0 border-r bg-background shadow-sm overflow-y-auto z-40">
+                <div className="flex h-16 items-center px-6 border-b shrink-0 justify-between">
+                    <div className="flex items-center">
+                        <Terminal className="mr-2 h-6 w-6 text-primary" />
+                        <span className="font-bold text-lg tracking-tight">Mini-Ops</span>
                     </div>
+                    <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={toggleLanguage}
+                        className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                        title={i18n.language === 'en' ? 'RU' : 'EN'}
+                    >
+                        <Languages className="h-4 w-4" />
+                    </Button>
+                </div>
 
-                    <nav className="flex-1 space-y-1 px-4 py-4">
-                        <Link to="/" className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${isActive("/") ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}>
-                            <LayoutDashboard className="h-4 w-4" />
-                            {t('common.dashboard')}
+                <nav className="flex-1 space-y-1 px-4 py-4">
+                    {navItems.map(({ path, icon: Icon, label }) => (
+                        <Link
+                            key={path}
+                            to={path}
+                            className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${isActive(path) ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}
+                        >
+                            <Icon className="h-4 w-4" />
+                            {label}
                         </Link>
-                        <Link to="/containers" className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${isActive("/containers") ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}>
-                            <Box className="h-4 w-4" />
-                            {t('common.containers')}
-                        </Link>
-                        <Link to="/history" className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${isActive("/history") ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}>
-                            <HistoryIcon className="h-4 w-4" />
-                            {t('common.history')}
-                        </Link>
-                        <Link to="/security" className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all ${isActive("/security") ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-muted hover:text-foreground"}`}>
-                            <ShieldAlert className="h-4 w-4" />
-                            {t('security.title')}
-                        </Link>
+                    ))}
 
-                        <div className="pt-4 mt-4 border-t">
-                            <div className="px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-                                {t('common.system')}
-                            </div>
-                            <DiskManager />
-                            <button onClick={handleUpdate} className="w-full flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground text-left transition-all mt-1">
-                                <Settings className="h-4 w-4" />
-                                {t('common.update_agent')}
-                            </button>
+                    <div className="pt-4 mt-4 border-t">
+                        <div className="px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                            {t('common.system')}
                         </div>
-                    </nav>
+                        <DiskManager />
+                        <button
+                            onClick={handleUpdate}
+                            className="w-full flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground text-left transition-all mt-1"
+                        >
+                            <Settings className="h-4 w-4" />
+                            {t('common.update_agent')}
+                        </button>
+                    </div>
+                </nav>
 
-                    <div className="p-4 border-t mt-auto">
-                        <Button variant="ghost" className="w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10" onClick={handleLogout}>
-                            <LogOut className="mr-2 h-4 w-4" />
-                            {t('common.logout')}
-                        </Button>
-                        <div className="mt-4 px-3 text-[10px] text-muted-foreground font-mono flex justify-between">
-                            <span>{t('common.version')}</span>
-                            <span>{version}</span>
-                        </div>
+                <div className="p-4 border-t">
+                    <Button
+                        variant="ghost"
+                        className="w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10"
+                        onClick={handleLogout}
+                    >
+                        <LogOut className="mr-2 h-4 w-4" />
+                        {t('common.logout')}
+                    </Button>
+                    <div className="mt-4 px-3 text-[10px] text-muted-foreground font-mono flex justify-between">
+                        <span>{t('common.version')}</span>
+                        <span>{version}</span>
                     </div>
                 </div>
             </aside>
 
-            {/* Main Content */}
-            <main className="flex-1 w-full overflow-x-hidden">
-                <div className="container py-8 px-4 md:px-8 max-w-7xl mx-auto">
-                    {children}
-                </div>
-            </main>
+            {/* ── Content column ───────────────────────────────────────── */}
+            <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+
+                {/* Mobile header */}
+                <header className="md:hidden shrink-0 h-14 border-b bg-background flex items-center px-4 justify-between">
+                    <div className="flex items-center gap-2">
+                        <Terminal className="h-5 w-5 text-primary" />
+                        <span className="font-bold tracking-tight">Mini-Ops</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={toggleLanguage}
+                            className="h-9 w-9 text-muted-foreground hover:text-foreground"
+                        >
+                            <Languages className="h-4 w-4" />
+                        </Button>
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={handleLogout}
+                            className="h-9 w-9 text-destructive hover:text-destructive hover:bg-destructive/10"
+                        >
+                            <LogOut className="h-4 w-4" />
+                        </Button>
+                    </div>
+                </header>
+
+                {/* Scrollable main content */}
+                <main className="flex-1 overflow-y-auto">
+                    <div className="container py-6 px-4 md:py-8 md:px-8 max-w-7xl mx-auto">
+                        {children}
+                    </div>
+                </main>
+
+                {/* Mobile bottom navigation */}
+                <nav className="md:hidden shrink-0 h-16 border-t bg-background">
+                    <div className="flex h-full items-stretch">
+                        {navItems.map(({ path, icon: Icon, label }) => (
+                            <Link
+                                key={path}
+                                to={path}
+                                className={`flex flex-1 flex-col items-center justify-center gap-1 transition-colors ${isActive(path) ? "text-primary" : "text-muted-foreground"}`}
+                            >
+                                <Icon className="h-5 w-5" />
+                                <span className="text-[10px] font-medium leading-none">{label}</span>
+                            </Link>
+                        ))}
+                    </div>
+                </nav>
+
+            </div>
 
             <UpdateDialog open={showUpdateDialog} onOpenChange={setShowUpdateDialog} />
             <Toaster position="top-right" />

@@ -68,7 +68,7 @@ export default function ContainerList() {
                 </Button>
             </div>
 
-            <div className="rounded-md border bg-card text-card-foreground shadow-sm">
+            <div className="rounded-md border bg-card text-card-foreground shadow-sm overflow-x-auto">
                 <Table>
                     <TableHeader>
                         <TableRow>

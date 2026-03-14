@@ -43,7 +43,8 @@ export default function HistoryLog() {
                         {t('history.timeline')}
                     </CardTitle>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="p-0 sm:p-6">
+                    <div className="overflow-x-auto">
                     <Table>
                         <TableHeader>
                             <TableRow>
@@ -93,6 +94,7 @@ export default function HistoryLog() {
                             )}
                         </TableBody>
                     </Table>
+                    </div>
                 </CardContent>
             </Card>
         </div>

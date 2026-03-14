@@ -101,6 +101,7 @@
     },
     "security": {
         "title": "Security Audit",
+        "short_title": "Audit",
         "test_alert": "Test Alert",
         "status": "Status",
         "check": "Check",

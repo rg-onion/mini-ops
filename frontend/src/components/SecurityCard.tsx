@@ -52,7 +52,7 @@ export function SecurityCard() {
 
     return (
         <Card className="h-full">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between sm:gap-0 sm:space-y-0">
                 <div className="flex items-center gap-2">
                     <CardTitle className="text-sm font-medium">{t('security.title')}</CardTitle>
                     {allPass ? (
@@ -81,7 +81,7 @@ export function SecurityCard() {
                 </div>
             </CardHeader>
             <CardContent>
-                <div className="rounded-md border">
+                <div className="rounded-md border overflow-x-auto">
                     <Table>
                         <TableHeader>
                             <TableRow>
