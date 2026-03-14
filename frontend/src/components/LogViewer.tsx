@@ -145,51 +145,40 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
     };
 
     const buttons = [
-        { label: "btn_100", tail: "100", labelKey: "last_100" },
-        { label: "btn_1k", tail: "1000", labelKey: "last_1000" },
-        { label: "btn_15m", minutes: 15, labelKey: "last_15m" },
-        { label: "btn_1h", minutes: 60, labelKey: "last_1h" },
+        { label: "btn_100", tail: "100",  labelKey: "last_100" },
+        { label: "btn_1k",  tail: "1000", labelKey: "last_1000" },
+        { label: "btn_15m", minutes: 15,   labelKey: "last_15m" },
+        { label: "btn_1h",  minutes: 60,   labelKey: "last_1h" },
         { label: "btn_24h", minutes: 1440, labelKey: "last_24h" },
-        { label: "btn_all", tail: "all", labelKey: "last_10000" },
+        { label: "btn_all", tail: "all",  labelKey: "last_10000" },
     ];
+
+    const statusColors = {
+        connected: "bg-green-500/20 text-green-500",
+        error:     "bg-red-500/20 text-red-500",
+        connecting:"bg-yellow-500/20 text-yellow-500",
+        closed:    "bg-yellow-500/20 text-yellow-500",
+    };
 
     return (
         <div className="flex flex-col h-full bg-black text-green-500 font-mono text-xs overflow-hidden">
             <div className="flex flex-col border-b border-white/10 bg-zinc-900 text-white shrink-0 z-10">
-                <div className="flex justify-between items-center p-3 pb-2">
-                    <div className="flex items-center gap-3">
-                        <h3 className="font-semibold flex items-center gap-2">
-                            <Clock className="w-4 h-4 text-muted-foreground" />
-                            {containerId.substring(0, 12)}
-                            <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded ${status === "connected" ? "bg-green-500/20 text-green-500" :
-                                status === "error" ? "bg-red-500/20 text-red-500" : "bg-yellow-500/20 text-yellow-500"
-                                }`}>
-                                {t(`common.status.${status}`)}
-                            </span>
-                        </h3>
 
-                        <div className="h-4 w-[1px] bg-white/10 mx-1" />
+                {/* ── Row 1: ID + status  |  actions ──────────────────────── */}
+                <div className="flex items-center justify-between px-3 pt-3 pb-2 gap-2">
+                    {/* Left: ID + status */}
+                    <h3 className="font-semibold flex items-center gap-2 min-w-0">
+                        <Clock className="w-4 h-4 text-muted-foreground shrink-0" />
+                        <span className="truncate">{containerId.substring(0, 12)}</span>
+                        <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded shrink-0 ${statusColors[status]}`}>
+                            {t(`common.status.${status}`)}
+                        </span>
+                    </h3>
 
-                        <div className="flex bg-white/5 rounded-md p-0.5 gap-0.5">
-                            {buttons.map((btn) => (
-                                <button
-                                    key={btn.labelKey}
-                                    onClick={() => handleTimeSelect(btn.labelKey, btn.tail, btn.minutes)}
-                                    className={`px-3 py-1.5 text-xs rounded transition-colors ${timeRange.labelKey === btn.labelKey
-                                        ? "bg-white/20 text-white font-medium shadow-sm"
-                                        : "text-white/50 hover:text-white hover:bg-white/10"
-                                        }`}
-                                    title={t(`containers.logs_control.${btn.labelKey}`)}
-                                >
-                                    {t(`containers.logs_control.${btn.label}`)}
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                        <div className="flex items-center gap-1 mr-2">
-                            <div className="relative w-40 sm:w-64">
+                    {/* Right: actions — search hidden on mobile */}
+                    <div className="flex items-center gap-1 shrink-0">
+                        <div className="hidden sm:flex items-center gap-1 mr-1">
+                            <div className="relative w-40 sm:w-52">
                                 <Input
                                     placeholder={t('containers.logs_control.search_placeholder')}
                                     value={searchTerm}
@@ -210,13 +199,14 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         <Button
                             variant="ghost"
                             size="sm"
-                            className="h-8 gap-2 text-white/70 hover:text-white"
+                            className="hidden sm:flex h-8 gap-2 text-white/70 hover:text-white"
                             onClick={handleDownload}
                             title={t('containers.logs_control.download')}
                         >
                             <Download className="w-4 h-4" />
                             <span className="hidden sm:inline">{t('containers.logs_control.download')}</span>
                         </Button>
+
                         <Button
                             variant="ghost"
                             size="sm"
@@ -225,58 +215,86 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         >
                             {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
                         </Button>
-                        <Button variant="ghost" size="icon" className="h-8 w-8 text-white/50 hover:text-red-400" onClick={clearLogs} title={t('containers.logs_control.clear')}>
+
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            className="hidden sm:flex h-8 w-8 text-white/50 hover:text-red-400"
+                            onClick={clearLogs}
+                            title={t('containers.logs_control.clear')}
+                        >
                             <Trash2 className="w-4 h-4" />
                         </Button>
-                        <div className="h-4 w-[1px] bg-white/10 mx-1" />
-                        <Button variant="ghost" size="icon" className="h-8 w-8 text-white/50 hover:text-white" onClick={onClose} title={t('common.close')}>
+
+                        <div className="hidden sm:block h-4 w-[1px] bg-white/10 mx-1" />
+
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 text-white/50 hover:text-white"
+                            onClick={onClose}
+                            title={t('common.close')}
+                        >
                             <X className="w-4 h-4" />
                         </Button>
                     </div>
                 </div>
 
+                {/* ── Row 2: time range buttons (full width, scrollable) ─── */}
+                <div className="flex px-3 pb-2 overflow-x-auto">
+                    <div className="flex bg-white/5 rounded-md p-0.5 gap-0.5">
+                        {buttons.map((btn) => (
+                            <button
+                                key={btn.labelKey}
+                                onClick={() => handleTimeSelect(btn.labelKey, btn.tail, btn.minutes)}
+                                className={`px-3 py-1.5 text-xs rounded whitespace-nowrap transition-colors ${
+                                    timeRange.labelKey === btn.labelKey
+                                        ? "bg-white/20 text-white font-medium shadow-sm"
+                                        : "text-white/50 hover:text-white hover:bg-white/10"
+                                }`}
+                                title={t(`containers.logs_control.${btn.labelKey}`)}
+                            >
+                                {t(`containers.logs_control.${btn.label}`)}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                {/* ── Row 3: quick filters ──────────────────────────────── */}
                 <div className="flex items-center gap-2 px-3 pb-2 overflow-x-auto">
-                    <span className="text-[10px] text-white/40 uppercase font-medium">Quick Filter:</span>
-                    <button
-                        onClick={() => toggleFilter("ERROR")}
-                        className={`text-xs px-3 py-1 rounded border ${searchTerm === "ERROR"
-                            ? "bg-red-500/20 border-red-500/50 text-red-500"
-                            : "bg-transparent border-white/10 text-white/50 hover:border-white/30 hover:text-white"
+                    <span className="text-[10px] text-white/40 uppercase font-medium shrink-0">Quick Filter:</span>
+                    {(["ERROR", "WARN", "INFO"] as const).map((level) => (
+                        <button
+                            key={level}
+                            onClick={() => toggleFilter(level)}
+                            className={`text-xs px-3 py-1 rounded border shrink-0 ${
+                                searchTerm === level
+                                    ? level === "ERROR" ? "bg-red-500/20 border-red-500/50 text-red-500"
+                                    : level === "WARN"  ? "bg-yellow-500/20 border-yellow-500/50 text-yellow-500"
+                                    :                    "bg-blue-500/20 border-blue-500/50 text-blue-500"
+                                    : "bg-transparent border-white/10 text-white/50 hover:border-white/30 hover:text-white"
                             }`}
-                    >
-                        ERROR
-                    </button>
-                    <button
-                        onClick={() => toggleFilter("WARN")}
-                        className={`text-xs px-3 py-1 rounded border ${searchTerm === "WARN"
-                            ? "bg-yellow-500/20 border-yellow-500/50 text-yellow-500"
-                            : "bg-transparent border-white/10 text-white/50 hover:border-white/30 hover:text-white"
-                            }`}
-                    >
-                        WARN
-                    </button>
-                    <button
-                        onClick={() => toggleFilter("INFO")}
-                        className={`text-xs px-3 py-1 rounded border ${searchTerm === "INFO"
-                            ? "bg-blue-500/20 border-blue-500/50 text-blue-500"
-                            : "bg-transparent border-white/10 text-white/50 hover:border-white/30 hover:text-white"
-                            }`}
-                    >
-                        INFO
-                    </button>
+                        >
+                            {level}
+                        </button>
+                    ))}
                     {searchTerm && !["ERROR", "WARN", "INFO"].includes(searchTerm) && (
-                        <span className="text-[10px] text-white/70 bg-white/10 px-2 py-0.5 rounded">
+                        <span className="text-[10px] text-white/70 bg-white/10 px-2 py-0.5 rounded shrink-0">
                             Searching: "{searchTerm}" ({filteredLogs.length} matches)
                         </span>
                     )}
                 </div>
             </div>
 
-            <ScrollArea className="flex-1 p-4 overflow-y-auto">
-                <div className="space-y-0.5">
+            {/* ── Log area ─────────────────────────────────────────────── */}
+            <ScrollArea className="flex-1 min-w-0">
+                <div className="p-4 space-y-0.5 overflow-hidden">
                     {filteredLogs.length > 0 ? (
                         filteredLogs.map((log, index) => (
-                            <div key={index} className="whitespace-pre-wrap break-all opacity-90 hover:opacity-100 transition-opacity">
+                            <div
+                                key={index}
+                                className="whitespace-pre-wrap break-all opacity-90 hover:opacity-100 transition-opacity"
+                            >
                                 {log}
                             </div>
                         ))

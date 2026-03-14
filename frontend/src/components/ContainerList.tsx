@@ -148,7 +148,7 @@ export default function ContainerList() {
             </div>
 
             <Dialog open={!!selectedLogId} onOpenChange={(open) => !open && setSelectedLogId(null)}>
-                <DialogContent className="sm:max-w-[800px] h-[80vh] flex flex-col p-0 gap-0">
+                <DialogContent className="flex flex-col p-0 gap-0 h-[100dvh] rounded-none sm:h-[80vh] sm:max-w-[800px] sm:rounded-lg">
                     <DialogTitle className="sr-only">Container Logs</DialogTitle>
                     <DialogDescription className="sr-only">Real-time logs for the selected container</DialogDescription>
                     {selectedLogId && <LogViewer containerId={selectedLogId} onClose={() => setSelectedLogId(null)} />}
