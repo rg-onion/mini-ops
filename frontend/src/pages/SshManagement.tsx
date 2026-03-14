@@ -53,12 +53,12 @@ export default function SshManagement() {
             queryClient.invalidateQueries({ queryKey: ["trusted-ips"] });
             setNewIp("");
             setNewDesc("");
-            toast.success("IP added to whitelist");
+            toast.success(t('ssh.trusted.added'));
         }
     });
 
     const deleteIpMutation = useMutation({
-        mutationFn: (id: number) => apiFetch(`/ssh/trusted-ips/${id}`, { method: "POST" }),
+        mutationFn: (id: number) => apiFetch(`/ssh/trusted-ips/${id}`, { method: "DELETE" }),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["trusted-ips"] }),
     });
 

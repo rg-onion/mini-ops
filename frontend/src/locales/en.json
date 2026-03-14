@@ -140,7 +140,8 @@
             "error": "Setup error"
         },
         "trusted": {
-            "title": "Trusted IPs"
+            "title": "Trusted IPs",
+            "added": "IP added to whitelist"
         },
         "logs": {
             "title": "SSH Logs"

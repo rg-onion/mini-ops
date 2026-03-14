@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "./ui/dialog";
 import { Button } from "./ui/button";
 import { HardDrive, Trash2, RotateCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
+import { apiFetch } from "@/api";
 
 interface DiskUsage {
     target_size: string;
@@ -19,15 +20,8 @@ export function DiskManager() {
     const [cleaning, setCleaning] = useState<string | null>(null);
 
     const fetchUsage = async () => {
-        try {
-            const token = localStorage.getItem("auth_token");
-            const res = await fetch("/api/disk/usage", {
-                headers: { "Authorization": `Bearer ${token}` }
-            });
-            if (res.ok) setUsage(await res.json());
-        } finally {
-            // done
-        }
+        const res = await apiFetch("/disk/usage");
+        if (res.ok) setUsage(await res.json());
     };
 
     const handleClean = async (target: string) => {
@@ -35,13 +29,8 @@ export function DiskManager() {
 
         setCleaning(target);
         try {
-            const token = localStorage.getItem("auth_token");
-            const res = await fetch("/api/disk/clean", {
+            const res = await apiFetch("/disk/clean", {
                 method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${token}`,
-                    "Content-Type": "application/json"
-                },
                 body: JSON.stringify({ target })
             });
 
@@ -55,9 +44,6 @@ export function DiskManager() {
             setCleaning(null);
         }
     };
-
-    useEffect(() => {
-    }, []);
 
     return (
         <Dialog onOpenChange={(open) => open && fetchUsage()}>

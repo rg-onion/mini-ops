@@ -198,15 +198,39 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
     SCP_CMD+=("-i" "$SSH_KEY_PATH")
   fi
 
+  # Build .env locally with secret overrides applied BEFORE SCP.
+  # This avoids passing AUTH_TOKEN/TELEGRAM_BOT_TOKEN as env= command-line args
+  # (which would be visible in `ps aux` on the remote machine).
+  _TMP_ENV=$(mktemp)
+  trap 'rm -f "$_TMP_ENV"' EXIT
+
   if [ -f ".env" ]; then
     echo "Found local .env file. Syncing to target..."
-    "${SCP_CMD[@]}" .env "$REMOTE:/tmp/mini-ops-env.new"
+    cp .env "$_TMP_ENV"
   elif [ -f ".env.example" ]; then
     echo "No local .env found. Uploading .env.example as fallback..."
-    "${SCP_CMD[@]}" .env.example "$REMOTE:/tmp/mini-ops-env.new"
+    cp .env.example "$_TMP_ENV"
   fi
 
-  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_APP_USER='$DEPLOY_APP_USER' AUTH_TOKEN='$AUTH_TOKEN' TELEGRAM_BOT_TOKEN='$TELEGRAM_BOT_TOKEN' TELEGRAM_CHAT_ID='$TELEGRAM_CHAT_ID' SERVER_NAME='$SERVER_NAME' AGENT_LANG='$AGENT_LANG' RUST_LOG='$RUST_LOG' DEPLOY_MINIMAL='$DEPLOY_MINIMAL' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
+  # Inject secret overrides locally — never passed over the wire as CLI args
+  if [ -n "${AUTH_TOKEN:-}" ]; then
+    sed -i '/^AUTH_TOKEN=/d' "$_TMP_ENV"
+    echo "AUTH_TOKEN=$AUTH_TOKEN" >> "$_TMP_ENV"
+  fi
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+    sed -i '/^TELEGRAM_BOT_TOKEN=/d' "$_TMP_ENV"
+    echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$_TMP_ENV"
+  fi
+  if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    sed -i '/^TELEGRAM_CHAT_ID=/d' "$_TMP_ENV"
+    echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$_TMP_ENV"
+  fi
+
+  "${SCP_CMD[@]}" "$_TMP_ENV" "$REMOTE:/tmp/mini-ops-env.new"
+  rm -f "$_TMP_ENV"
+
+  # Pass only non-sensitive deployment config vars as remote env args
+  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_APP_USER='$DEPLOY_APP_USER' SERVER_NAME='$SERVER_NAME' AGENT_LANG='$AGENT_LANG' RUST_LOG='$RUST_LOG' DEPLOY_MINIMAL='$DEPLOY_MINIMAL' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
 set -euo pipefail
 
 if [ -f /tmp/mini-ops-env.new ]; then
@@ -222,19 +246,6 @@ grep -q '^DATABASE_URL=' "$DEPLOY_TARGET_DIR/.env" || echo 'DATABASE_URL=sqlite:
 grep -q '^RUST_LOG=' "$DEPLOY_TARGET_DIR/.env" || echo "RUST_LOG=$RUST_LOG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^AGENT_LANG=' "$DEPLOY_TARGET_DIR/.env" || echo "AGENT_LANG=$AGENT_LANG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^SERVER_NAME=' "$DEPLOY_TARGET_DIR/.env" || echo "SERVER_NAME=${SERVER_NAME:-$(hostname)}" >> "$DEPLOY_TARGET_DIR/.env"
-
-if [ -n "$AUTH_TOKEN" ]; then
-  sed -i '/^AUTH_TOKEN=/d' "$DEPLOY_TARGET_DIR/.env"
-  echo "AUTH_TOKEN=$AUTH_TOKEN" >> "$DEPLOY_TARGET_DIR/.env"
-fi
-if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-  sed -i '/^TELEGRAM_BOT_TOKEN=/d' "$DEPLOY_TARGET_DIR/.env"
-  echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$DEPLOY_TARGET_DIR/.env"
-fi
-if [ -n "$TELEGRAM_CHAT_ID" ]; then
-  sed -i '/^TELEGRAM_CHAT_ID=/d' "$DEPLOY_TARGET_DIR/.env"
-  echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$DEPLOY_TARGET_DIR/.env"
-fi
 
 chown root:"$DEPLOY_APP_USER" "$DEPLOY_TARGET_DIR/.env"
 chmod 0640 "$DEPLOY_TARGET_DIR/.env"
@@ -260,7 +271,7 @@ EnvironmentFile=$DEPLOY_TARGET_DIR/.env
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
-PrivateTmp=false
+PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$DEPLOY_TARGET_DIR /tmp

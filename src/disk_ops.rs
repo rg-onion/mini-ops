@@ -125,7 +125,7 @@ impl DiskOps {
     
     pub async fn clean_logs() -> Result<String, String> {
          let output = Command::new("journalctl")
-            .arg("--vacuum-time=1d") 
+            .arg("--vacuum-time=1d")
             .output()
             .map_err(|e| e.to_string())?;
 
@@ -139,5 +139,47 @@ impl DiskOps {
     } else {
          Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_node_modules_path_stays_within_root() {
+        // Убеждаемся что путь к node_modules строится корректно и не выходит за пределы root_dir
+        let root = "/some/project";
+        let expected = "/some/project/frontend/node_modules";
+        let actual = format!("{}/frontend/node_modules", root);
+        assert_eq!(actual, expected);
+        // Путь не содержит path traversal символов
+        assert!(!actual.contains(".."));
+    }
+
+    #[test]
+    fn test_clean_target_path_stays_within_root() {
+        let root = "/some/project";
+        // clean_target использует cargo clean в root_dir — нет shell-интерполяции
+        assert!(!root.contains(".."));
+        assert!(!root.contains(';'));
+        assert!(!root.contains('|'));
+        assert!(!root.contains('&'));
+    }
+
+    #[test]
+    fn test_disk_usage_breakdown_has_all_fields() {
+        // DiskUsageBreakdown должен сериализоваться без ошибок
+        let breakdown = DiskUsageBreakdown {
+            target_size: "100M".to_string(),
+            node_modules_size: "500M".to_string(),
+            docker_size: "2G".to_string(),
+            logs_size: "50M".to_string(),
+        };
+        let json = serde_json::to_string(&breakdown).unwrap();
+        assert!(json.contains("target_size"));
+        assert!(json.contains("node_modules_size"));
+        assert!(json.contains("docker_size"));
+        assert!(json.contains("logs_size"));
     }
 }

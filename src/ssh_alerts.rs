@@ -3,8 +3,20 @@ use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
+use std::net::IpAddr;
 use crate::notifications::NotificationService;
 use chrono::{DateTime, Utc};
+
+/// Validates that the given string is a syntactically correct IPv4 or IPv6 address.
+/// Rejects hostnames, CIDR ranges, and other arbitrary input.
+pub fn validate_ip(ip: &str) -> Result<(), String> {
+    if ip.is_empty() {
+        return Err("IP address cannot be empty".to_string());
+    }
+    ip.parse::<IpAddr>()
+        .map(|_| ())
+        .map_err(|_| format!("Invalid IP address: '{}'", ip))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SshLoginEvent {
@@ -69,6 +81,9 @@ impl SshAlertsService {
                 return Err("Invalid internal token".to_string());
             }
         }
+
+        // Validate IP address format to prevent storage of arbitrary values
+        validate_ip(&event.ip)?;
 
         // Rate limiting (10s per IP)
         {
@@ -155,6 +170,9 @@ impl SshAlertsService {
     }
 
     pub async fn add_trusted_ip(&self, ip: String, description: Option<String>) -> Result<(), sqlx::Error> {
+        // Validate IP before storing
+        validate_ip(&ip).map_err(|e| sqlx::Error::Protocol(e))?;
+
         sqlx::query("INSERT INTO trusted_ips (ip, description, added_at) VALUES (?, ?, ?)")
             .bind(ip)
             .bind(description)
@@ -170,5 +188,50 @@ impl SshAlertsService {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_ip_valid_ipv4() {
+        assert!(validate_ip("192.168.1.1").is_ok());
+        assert!(validate_ip("10.0.0.1").is_ok());
+        assert!(validate_ip("0.0.0.0").is_ok());
+        assert!(validate_ip("255.255.255.255").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ip_valid_ipv6() {
+        assert!(validate_ip("::1").is_ok());
+        assert!(validate_ip("2001:db8::1").is_ok());
+        assert!(validate_ip("fe80::1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ip_rejects_hostname() {
+        assert!(validate_ip("example.com").is_err());
+        assert!(validate_ip("localhost").is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_rejects_cidr() {
+        assert!(validate_ip("192.168.1.0/24").is_err());
+        assert!(validate_ip("10.0.0.0/8").is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_rejects_empty() {
+        assert!(validate_ip("").is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_rejects_malformed() {
+        assert!(validate_ip("999.999.999.999").is_err());
+        assert!(validate_ip("1.2.3").is_err());
+        assert!(validate_ip("not_an_ip").is_err());
+        assert!(validate_ip("192.168.1.1; rm -rf /").is_err());
     }
 }

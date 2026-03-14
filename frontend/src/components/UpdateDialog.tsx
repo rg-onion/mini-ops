@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { BASE_URL, getAuthHeaders } from "@/api";
 
 interface UpdateDialogProps {
     open: boolean;
@@ -40,15 +41,15 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
 
     const startUpdate = async () => {
         try {
-            const token = localStorage.getItem("auth_token");
-            if (!token) {
+            const authHeaders = getAuthHeaders();
+            if (!authHeaders["Authorization"]) {
                 setLogs(prev => [...prev, `❌ ${t('common.error')}: No auth token`]);
                 setStatus("error");
                 return;
             }
-            const res = await fetch("/api/deploy/webhook", {
+            const res = await fetch(`${BASE_URL}/deploy/webhook`, {
                 method: "POST",
-                headers: { "Authorization": `Bearer ${token}` }
+                headers: authHeaders,
             });
 
             if (!res.ok) {
@@ -63,8 +64,8 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
             const controller = new AbortController();
             abortRef.current = controller;
 
-            const streamResp = await fetch("/api/deploy/logs", {
-                headers: { "Authorization": `Bearer ${token}` },
+            const streamResp = await fetch(`${BASE_URL}/deploy/logs`, {
+                headers: authHeaders,
                 signal: controller.signal,
             });
 

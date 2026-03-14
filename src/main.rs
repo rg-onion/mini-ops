@@ -19,7 +19,7 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::{IntoResponse, Response, sse::{Event, Sse}},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -43,31 +43,35 @@ struct Asset;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    
-    // Check or generate AUTH_TOKEN
-    if std::env::var("AUTH_TOKEN").is_err() {
-        let token: String = (0..32)
-            .map(|_| {
-                let idx = rand::rng().random_range(0..62);
-                let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                chars[idx] as char
-            })
-            .collect();
 
-        let preview = format!("{}***", &token.chars().take(6).collect::<String>());
-        println!("\n\n WARNING: AUTH_TOKEN not found. Generated and persisted to .env.");
-        println!(" Token preview: {}", preview);
-        println!(" Please rotate it for production use.\n\n");
+    // Resolve AUTH_TOKEN: from env (loaded by dotenv) or generate a new one
+    let auth_token = match std::env::var("AUTH_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            let token: String = (0..32)
+                .map(|_| {
+                    let idx = rand::rng().random_range(0..62);
+                    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                    chars[idx] as char
+                })
+                .collect();
 
-        // Save to .env
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".env") {
-            writeln!(file, "AUTH_TOKEN={}", token).ok();
+            let preview = format!("{}***", &token.chars().take(6).collect::<String>());
+            println!("\n\n WARNING: AUTH_TOKEN not found. Generated and persisted to .env.");
+            println!(" Token preview: {}", preview);
+            println!(" Please rotate it for production use.\n\n");
+
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".env") {
+                writeln!(file, "AUTH_TOKEN={}", token).ok();
+            }
+
+            token
         }
+    };
 
-        // Set for current process
-        unsafe { std::env::set_var("AUTH_TOKEN", token); }
-    }
+    // Initialize auth token in OnceLock — safe, called before any threads are spawned
+    auth::init_token(auth_token);
     
     // Initialize tracing with RUST_LOG support
     tracing_subscriber::fmt()
@@ -219,7 +223,7 @@ async fn main() {
         .route("/ssh/logs", get(get_ssh_logs_handler))
         .route("/ssh/trusted-ips", get(get_trusted_ips_handler))
         .route("/ssh/trusted-ips", post(add_trusted_ip_handler))
-        .route("/ssh/trusted-ips/{id}", post(delete_trusted_ip_handler))
+        .route("/ssh/trusted-ips/{id}", delete(delete_trusted_ip_handler))
         .route("/ssh/setup-alerts", post(setup_ssh_alerts_handler))
         .route("/version", get(get_version_handler));
 
@@ -537,7 +541,13 @@ async fn delete_trusted_ip_handler(
 
 async fn setup_ssh_alerts_handler() -> Response {
     use std::process::Command;
-    match Command::new("sudo").arg("./scripts/setup_ssh_alerts.sh").output() {
+
+    // Use absolute path for sudo and canonicalize script path to prevent PATH-based attacks
+    let script_path = std::env::current_dir()
+        .map(|d| d.join("scripts/setup_ssh_alerts.sh"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mini-ops/scripts/setup_ssh_alerts.sh"));
+
+    match Command::new("/usr/bin/sudo").arg(&script_path).output() {
         Ok(output) => {
             if output.status.success() {
                 StatusCode::OK.into_response()

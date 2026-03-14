@@ -4,12 +4,20 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::sync::OnceLock;
+
+static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// Инициализирует токен аутентификации. Вызывается один раз из main до старта сервера.
+pub fn init_token(token: String) {
+    AUTH_TOKEN.set(token).expect("CRITICAL: AUTH_TOKEN already initialized");
+}
 
 pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let token = std::env::var("AUTH_TOKEN").expect("CRITICAL: AUTH_TOKEN must be set in env or .env file");
+    let token = AUTH_TOKEN.get().expect("CRITICAL: AUTH_TOKEN not initialized — call auth::init_token() before serving");
 
     let auth_header = request.headers()
         .get(header::AUTHORIZATION)
@@ -47,4 +55,46 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_time_eq_same() {
+        assert!(constant_time_eq("abc123", "abc123"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different() {
+        assert!(!constant_time_eq("abc123", "abc124"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_length() {
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("", "x"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty() {
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn test_auth_header_valid() {
+        assert!(auth_header_is_valid("Bearer mytoken123", "mytoken123"));
+    }
+
+    #[test]
+    fn test_auth_header_invalid_token() {
+        assert!(!auth_header_is_valid("Bearer wrong", "mytoken123"));
+    }
+
+    #[test]
+    fn test_auth_header_missing_bearer() {
+        assert!(!auth_header_is_valid("mytoken123", "mytoken123"));
+        assert!(!auth_header_is_valid("Token mytoken123", "mytoken123"));
+    }
 }

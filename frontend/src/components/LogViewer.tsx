@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useTranslation } from "react-i18next";
 import { Pause, Play, Clock, Trash2, X, Download } from "lucide-react";
+import { BASE_URL, getAuthHeaders } from "@/api";
 
 interface LogViewerProps {
     containerId: string;
@@ -22,9 +23,9 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
     const abortRef = useRef<AbortController | null>(null);
 
     useEffect(() => {
-        const token = localStorage.getItem("auth_token");
+        const authHeaders = getAuthHeaders();
 
-        if (!token) {
+        if (!authHeaders["Authorization"]) {
             setLogs([`--- ${t('common.error')}: No Auth Token Found ---`]);
             setStatus("error");
             return;
@@ -33,14 +34,14 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
         const params = new URLSearchParams();
         if (timeRange.tail) params.set("tail", timeRange.tail);
         if (timeRange.since) params.set("since", String(timeRange.since));
-        const url = `/api/docker/containers/${containerId}/logs?${params.toString()}`;
+        const url = `${BASE_URL}/docker/containers/${containerId}/logs?${params.toString()}`;
         const controller = new AbortController();
         abortRef.current = controller;
 
         const connect = async () => {
             try {
                 const response = await fetch(url, {
-                    headers: { "Authorization": `Bearer ${token}` },
+                    headers: authHeaders,
                     signal: controller.signal,
                 });
 

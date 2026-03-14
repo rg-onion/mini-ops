@@ -1,13 +1,20 @@
 export const BASE_URL = "/api";
 
-export async function apiFetch(endpoint: string, options: RequestInit = {}) {
+/** Returns auth + lang headers without making a request. Use for streaming (SSE) fetch calls. */
+export function getAuthHeaders(): Record<string, string> {
     const token = localStorage.getItem("auth_token");
     const lang = localStorage.getItem("i18nextLng") || "en";
+    return {
+        "Accept-Language": lang,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+}
+
+export async function apiFetch(endpoint: string, options: RequestInit = {}) {
     const headers = {
         "Content-Type": "application/json",
-        "Accept-Language": lang,
+        ...getAuthHeaders(),
         ...options.headers,
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
 
     const response = await fetch(`${BASE_URL}${endpoint}`, {
@@ -16,7 +23,6 @@ export async function apiFetch(endpoint: string, options: RequestInit = {}) {
     });
 
     if (response.status === 401) {
-        // Redirect to login if unauthorized
         window.location.href = "/login";
         throw new Error("Unauthorized");
     }

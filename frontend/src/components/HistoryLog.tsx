@@ -5,6 +5,7 @@ import { Badge } from "./ui/badge";
 import { History, RotateCcw } from "lucide-react";
 import { Button } from "./ui/button";
 import { useTranslation } from "react-i18next";
+import { apiFetch } from "@/api";
 
 interface DeploymentRecord {
     id: string;
@@ -21,10 +22,7 @@ export default function HistoryLog() {
     const { data: history, isLoading } = useQuery<DeploymentRecord[]>({
         queryKey: ["history"],
         queryFn: async () => {
-            const token = localStorage.getItem("auth_token");
-            const res = await fetch("/api/history", {
-                headers: { "Authorization": `Bearer ${token}` }
-            });
+            const res = await apiFetch("/history");
             if (!res.ok) throw new Error(t('common.error'));
             return res.json();
         }
