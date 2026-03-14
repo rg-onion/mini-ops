@@ -28,3 +28,7 @@ mini-ops-*.service
 .agent/
 CLAUDE.md
 .claude/
+
+# Internal planning & audit docs (not for public repo)
+docs/planning/
+docs/SECURITY_AUDIT.md
