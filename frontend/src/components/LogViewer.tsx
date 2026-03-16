@@ -176,7 +176,7 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         </span>
                     </h3>
 
-                    {/* Right: actions — search hidden on mobile */}
+                    {/* Right: actions */}
                     <div className="flex items-center gap-1 shrink-0">
                         <div className="hidden sm:flex items-center gap-1 mr-1">
                             <div className="relative w-40 sm:w-52">
@@ -200,7 +200,7 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         <Button
                             variant="ghost"
                             size="sm"
-                            className="hidden sm:flex h-8 gap-2 text-white/70 hover:text-white"
+                            className="h-8 gap-2 text-white/70 hover:text-white"
                             onClick={handleDownload}
                             title={t('containers.logs_control.download')}
                         >
@@ -239,6 +239,24 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                             <X className="w-4 h-4" />
                         </Button>
                     </div>
+                </div>
+
+                {/* ── Row 1.5: search (mobile only) ───────────────────── */}
+                <div className="flex sm:hidden items-center gap-1 px-3 pb-2">
+                    <Input
+                        placeholder={t('containers.logs_control.search_placeholder')}
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                        className="h-8 flex-1 px-3 bg-black/20 border-white/10 text-xs text-white placeholder:text-white/30 focus-visible:ring-1 focus-visible:ring-white/20"
+                    />
+                    {searchTerm && (
+                        <button
+                            onClick={() => setSearchTerm("")}
+                            className="h-8 w-8 flex items-center justify-center text-white/50 hover:text-white hover:bg-white/10 rounded transition-colors"
+                        >
+                            <X className="w-3 h-3" />
+                        </button>
+                    )}
                 </div>
 
                 {/* ── Row 2: time range buttons (full width, scrollable) ─── */}
