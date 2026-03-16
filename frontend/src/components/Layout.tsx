@@ -147,14 +147,14 @@ export default function Layout({ children }: LayoutProps) {
                 </header>
 
                 {/* Scrollable main content */}
-                <main className="flex-1 overflow-y-auto">
+                <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
                     <div className="container py-6 px-4 md:py-8 md:px-8 max-w-7xl mx-auto">
                         {children}
                     </div>
                 </main>
 
-                {/* Mobile bottom navigation */}
-                <nav className="md:hidden shrink-0 h-16 border-t bg-background">
+                {/* Mobile bottom navigation — fixed so it's always visible */}
+                <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 h-16 border-t bg-background">
                     <div className="flex h-full items-stretch">
                         {navItems.map(({ path, icon: Icon, label }) => (
                             <Link
