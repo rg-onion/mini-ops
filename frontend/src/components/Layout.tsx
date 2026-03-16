@@ -160,10 +160,10 @@ export default function Layout({ children }: LayoutProps) {
                             <Link
                                 key={path}
                                 to={path}
-                                className={`flex flex-1 flex-col items-center justify-center gap-1 transition-colors ${isActive(path) ? "text-primary" : "text-muted-foreground"}`}
+                                className={`flex flex-1 min-w-0 flex-col items-center justify-center gap-1 transition-colors ${isActive(path) ? "text-primary" : "text-muted-foreground"}`}
                             >
-                                <Icon className="h-5 w-5" />
-                                <span className="text-[10px] font-medium leading-none">{label}</span>
+                                <Icon className="h-5 w-5 shrink-0" />
+                                <span className="text-[10px] font-medium leading-none w-full text-center truncate px-1">{label}</span>
                             </Link>
                         ))}
                     </div>
