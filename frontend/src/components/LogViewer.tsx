@@ -21,6 +21,8 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
 
     const scrollRef = useRef<HTMLDivElement>(null);
     const abortRef = useRef<AbortController | null>(null);
+    const isPausedRef = useRef(false);
+    const pendingLogsRef = useRef<string[]>([]);
 
     useEffect(() => {
         const authHeaders = getAuthHeaders();
@@ -72,10 +74,14 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         const payload = normalized.slice(5).trimStart();
                         if (!payload) continue;
 
-                        setLogs((prev: string[]) => {
-                            const newLogs = [...prev, payload];
-                            return newLogs.length > 10000 ? newLogs.slice(-10000) : newLogs;
-                        });
+                        if (isPausedRef.current) {
+                            pendingLogsRef.current.push(payload);
+                        } else {
+                            setLogs((prev: string[]) => {
+                                const newLogs = [...prev, payload];
+                                return newLogs.length > 10000 ? newLogs.slice(-10000) : newLogs;
+                            });
+                        }
                     }
                 }
 
@@ -212,7 +218,19 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                             variant="ghost"
                             size="sm"
                             className={`h-8 gap-2 rounded-md ${isPaused ? "text-amber-500 hover:text-amber-400 bg-amber-500/10" : "text-white/70 hover:text-white"}`}
-                            onClick={() => setIsPaused(!isPaused)}
+                            onClick={() => {
+                                const next = !isPaused;
+                                setIsPaused(next);
+                                isPausedRef.current = next;
+                                if (!next && pendingLogsRef.current.length > 0) {
+                                    const pending = pendingLogsRef.current;
+                                    pendingLogsRef.current = [];
+                                    setLogs((prev) => {
+                                        const merged = [...prev, ...pending];
+                                        return merged.length > 10000 ? merged.slice(-10000) : merged;
+                                    });
+                                }
+                            }}
                         >
                             {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
                         </Button>
@@ -307,7 +325,7 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
 
             {/* ── Log area ─────────────────────────────────────────────── */}
             <ScrollArea className="flex-1 min-w-0">
-                <div className="p-4 space-y-0.5 overflow-hidden">
+                <div className="p-4 space-y-0.5 overflow-hidden" style={{ overflowAnchor: "none" }}>
                     {filteredLogs.length > 0 ? (
                         filteredLogs.map((log, index) => (
                             <div

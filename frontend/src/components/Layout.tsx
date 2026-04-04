@@ -154,18 +154,25 @@ export default function Layout({ children }: LayoutProps) {
                 </main>
 
                 {/* Mobile bottom navigation — fixed so it's always visible */}
-                <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 h-16 border-t bg-background">
-                    <div className="flex h-full items-stretch">
-                        {navItems.map(({ path, icon: Icon, label }) => (
-                            <Link
-                                key={path}
-                                to={path}
-                                className={`flex flex-1 min-w-0 flex-col items-center justify-center gap-1 transition-colors ${isActive(path) ? "text-primary" : "text-muted-foreground"}`}
-                            >
-                                <Icon className="h-5 w-5 shrink-0" />
-                                <span className="text-[10px] font-medium leading-none w-full text-center truncate px-1">{label}</span>
-                            </Link>
-                        ))}
+                <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t bg-background">
+                    <div className="flex h-16 gap-1 px-1 items-center">
+                        {navItems.map(({ path, icon: Icon, label }) => {
+                            const active = isActive(path);
+                            return (
+                                <Link
+                                    key={path}
+                                    to={path}
+                                    className={`flex flex-1 min-w-0 flex-col items-center justify-center gap-0.5 h-12 rounded-xl transition-all border ${
+                                        active
+                                            ? "bg-primary text-primary-foreground border-primary shadow-sm"
+                                            : "bg-muted text-muted-foreground border-border/70 border-2 hover:text-foreground"
+                                    }`}
+                                >
+                                    <Icon className="h-4 w-4 shrink-0" />
+                                    <span className="text-[10px] font-medium leading-none w-full text-center truncate px-1">{label}</span>
+                                </Link>
+                            );
+                        })}
                     </div>
                 </nav>
 
