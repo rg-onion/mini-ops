@@ -8,6 +8,8 @@ mod history;
 mod security;
 mod i18n;
 mod ssh_alerts;
+mod cloud_payload;
+mod cloud_push;
 
 use security::{SecurityAuditor, SecurityCheck, SecurityMonitor};
 use ssh_alerts::{SshAlertsService, SshLoginEvent};
@@ -170,7 +172,45 @@ async fn main() {
 
     let deployment_service = Arc::new(DeploymentService::new());
     let history_manager = Arc::new(HistoryManager::new("history.json"));
-    
+
+    // Cloud Push (optional)
+    if std::env::var("CLOUD_PUSH_ENABLED").as_deref() == Ok("true") {
+        match (
+            std::env::var("CLOUD_HUB_URL"),
+            std::env::var("CLOUD_AGENT_ID"),
+            std::env::var("CLOUD_AGENT_TOKEN"),
+        ) {
+            (Ok(hub_url), Ok(agent_id), Ok(agent_token)) => {
+                let interval = std::env::var("CLOUD_PUSH_INTERVAL")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(60u64);
+                let config = cloud_push::CloudPushConfig {
+                    hub_url,
+                    agent_id,
+                    agent_token,
+                    push_interval_secs: interval,
+                };
+                match cloud_push::CloudPushService::new(config) {
+                    Ok(svc) => {
+                        Arc::new(svc).start(
+                            Arc::clone(&metrics_state),
+                            docker_service.clone(),
+                            Arc::clone(&ssh_alerts_service),
+                        );
+                        tracing::info!("Cloud push enabled, interval={}s", interval);
+                    }
+                    Err(e) => {
+                        tracing::error!("Cloud push disabled: {}", e);
+                    }
+                }
+            }
+            _ => tracing::warn!(
+                "CLOUD_PUSH_ENABLED=true but CLOUD_HUB_URL/CLOUD_AGENT_ID/CLOUD_AGENT_TOKEN missing"
+            ),
+        }
+    }
+
     // 3. Start Background Task for Metrics & Alerts
     let metrics_clone = Arc::clone(&metrics_state);
     let notifier_clone = Arc::clone(&notifications);
