@@ -17,9 +17,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 # 1. Install script
 if [ -f "${SCRIPT_DIR}/ssh-alert.sh" ]; then
     cp "${SCRIPT_DIR}/ssh-alert.sh" /usr/local/bin/ssh-alert.sh
-    sed -i "s/3000/${DEPLOY_APP_PORT:-3000}/g" /usr/local/bin/ssh-alert.sh
+    TOKEN_FILE="${MINI_OPS_INTERNAL_TOKEN_FILE:-${DEPLOY_TARGET_DIR:-/opt/mini-ops}/mini-ops-internal.token}"
+    sed -i "s#http://127.0.0.1:3000#http://127.0.0.1:${DEPLOY_APP_PORT:-3000}#g" /usr/local/bin/ssh-alert.sh
+    sed -i "s#/opt/mini-ops/mini-ops-internal.token#$TOKEN_FILE#g" /usr/local/bin/ssh-alert.sh
     chmod +x /usr/local/bin/ssh-alert.sh
     echo "✅ Copied hook to /usr/local/bin/ssh-alert.sh with port ${DEPLOY_APP_PORT:-3000}"
+    echo "🔐 Internal token file: $TOKEN_FILE"
 else
     echo "❌ Error: Could not find ${SCRIPT_DIR}/ssh-alert.sh"
     exit 1

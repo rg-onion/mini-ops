@@ -4,7 +4,8 @@
 
 Новый скрипт `scripts/bootstrap_server.sh` автоматизирует:
 1. Базовый hardening (`ufw`, `fail2ban`).
-2. Создание non-root пользователя сервиса (`miniops`).
+2. Установку Mini-Ops как systemd-сервис. По умолчанию сервис запускается от
+   `root`, чтобы сохранить полный функционал VPS-control панели.
 3. Установку/проверку Docker (опционально).
 4. Локальную сборку и выкладку бинаря.
 5. Создание `.env` и systemd unit.
@@ -26,7 +27,7 @@ DEPLOY_HOST=203.0.113.10
 DEPLOY_SSH_USER=root
 DEPLOY_SSH_PORT=22
 DEPLOY_TARGET_DIR=/opt/mini-ops
-DEPLOY_APP_USER=miniops
+DEPLOY_APP_USER=root               # root|miniops
 DEPLOY_MODE=test                 # test|production
 DEPLOY_ENABLE_SSH_ALERTS=1       # 1|0
 DEPLOY_HARDENING=1               # 1|0 (ufw + fail2ban)
@@ -70,19 +71,27 @@ AUTH_TOKEN=your_strong_token \
 ```bash
 DEPLOY_HOST=203.0.113.10 \
 DEPLOY_SYSTEMD_ONLY=1 \
-DEPLOY_APP_USER=miniops \
+DEPLOY_APP_USER=root \
 DEPLOY_TARGET_DIR=/opt/mini-ops \
 ./scripts/bootstrap_server.sh
 ```
 
-### Ограничения режима Non-Root
-При запуске от пользователя `miniops` некоторые функции дэшборда могут быть ограничены:
+### Режимы привилегий
+
+Mini-Ops — локальная VPS-control панель. Режим `DEPLOY_APP_USER=root` теперь
+является рекомендуемым для полного функционала: управление Docker, чтение и
+очистка journal, настройка SSH/PAM alerts, проверка размеров системных
+директорий и более полезный security audit. При этом важно держать
+`APP_HOST=127.0.0.1`, использовать сильный `AUTH_TOKEN` и отдавать публичный
+доступ через nginx или другой reverse proxy.
+
+Режим `DEPLOY_APP_USER=miniops` остаётся как restricted-вариант. В нём некоторые
+функции дэшборда могут быть ограничены:
+
 1. **System Logs**: чтение системных логов (`journalctl`) требует членства в группе `systemd-journal` или `root`.
 2. **System Cleansing**: очистка системных кэшей (`apt`, `journald`) невозможна без `sudo`.
 3. **Frontend Cache**: если папка `node_modules` была создана при сборке от другого юзера, очистка может не сработать (хотя в `bootstrap_server.sh` делается `chown`).
 4. **Docker**: работает корректно (пользователь добавляется в группу `docker`).
-
-Для полного доступа к системным функциям требуется настройка `sudo` правил или запуск агента от `root` (не рекомендуется).
 
 
 ## Legacy scripts

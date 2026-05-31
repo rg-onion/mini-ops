@@ -51,7 +51,7 @@ pub struct SecurityMetrics {
     pub ufw_enabled: bool,
     pub open_ports: Vec<u16>,
     /// Last SSH login event: username + source IP + timestamp.
-    /// Sent to the Hub so the commercial dashboard can show login activity
+    /// Sent to a Hub-compatible endpoint so operators can show login activity
     /// across multiple servers in one place. Never collected unless
     /// CLOUD_PUSH_ENABLED=true is explicitly set by the operator.
     pub last_ssh_login: Option<SshLoginInfo>,

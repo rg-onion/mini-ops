@@ -21,9 +21,10 @@ SERVICE="$PAM_SERVICE"
 METHOD="ssh" 
 TIMESTAMP=$(date +%s)
 API_URL="${MINI_OPS_API_URL:-http://127.0.0.1:3000/api/internal/ssh-login}"
+TOKEN_FILE="${MINI_OPS_INTERNAL_TOKEN_FILE:-/opt/mini-ops/mini-ops-internal.token}"
 
 # Read internal token
-INTERNAL_TOKEN=$(cat /tmp/mini-ops-internal.token 2>/dev/null || echo "")
+INTERNAL_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null || echo "")
 
 if [ -z "$INTERNAL_TOKEN" ]; then
     # Silently fail or log to syslog

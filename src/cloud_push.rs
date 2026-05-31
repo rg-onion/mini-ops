@@ -70,10 +70,7 @@ impl CloudPushService {
             let mut backoff_secs: u64 = 1;
             loop {
                 interval.tick().await;
-                match self
-                    .push_once(&metrics, docker.as_ref(), &ssh_alerts)
-                    .await
-                {
+                match self.push_once(&metrics, docker.as_ref(), &ssh_alerts).await {
                     Ok(()) => {
                         backoff_secs = 1;
                     }
@@ -210,21 +207,18 @@ impl CloudPushService {
 
         // Security metrics
         let lang = Lang::EN;
-        let checks = SecurityAuditor::run_audit(&lang).await;
-        let pass_count = checks.iter().filter(|c| c.status == "PASS").count();
-        let ssh_hardening_score = (pass_count as u32 * 100) / 7;
+        let checks = SecurityAuditor::run_audit(&lang, docker.map(|svc| svc.as_ref())).await;
+        let ssh_hardening_score = SecurityAuditor::calculate_score(&checks);
         let fail2ban_active = checks
             .iter()
-            .any(|c| c.name.contains("Fail2Ban") && c.status == "PASS");
+            .any(|c| c.id == "intrusion.fail2ban" && c.status == "PASS");
         let ufw_enabled = checks
             .iter()
-            .any(|c| c.name.contains("UFW") && c.status == "PASS");
+            .any(|c| c.id == "firewall.ufw" && c.status == "PASS");
+        let open_ports = SecurityAuditor::extract_open_ports(&checks);
 
         // SSH alerts
-        let logs = ssh_alerts
-            .get_logs()
-            .await
-            .map_err(|e| e.to_string())?;
+        let logs = ssh_alerts.get_logs().await.map_err(|e| e.to_string())?;
         let trusted_ips_list = ssh_alerts
             .get_trusted_ips()
             .await
@@ -248,7 +242,7 @@ impl CloudPushService {
             ssh_hardening_score,
             fail2ban_active,
             ufw_enabled,
-            open_ports: Vec::new(),
+            open_ports,
             last_ssh_login,
             trusted_ips: trusted_ip_strings,
         };

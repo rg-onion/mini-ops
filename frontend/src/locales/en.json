@@ -105,6 +105,7 @@
         "test_alert": "Test Alert",
         "status": "Status",
         "check": "Check",
+        "risk": "Risk",
         "message": "Message",
         "test_sent": "Test notification sent!",
         "test_fail": "Failed to send notification",

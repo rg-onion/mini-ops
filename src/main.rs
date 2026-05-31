@@ -137,9 +137,20 @@ async fn main() {
     // 2. Setup Services
     let metrics_state = Arc::new(MetricsState::new());
     let notifications = Arc::new(NotificationService::new());
+
+    let docker_service = match DockerService::new() {
+        Ok(s) => Some(Arc::new(s)),
+        Err(e) => {
+            tracing::error!("Failed to initialize Docker service: {}", e);
+            None
+        }
+    };
     
     // Start Security Monitor
-    let security_monitor = Arc::new(SecurityMonitor::new(notifications.clone()));
+    let security_monitor = Arc::new(SecurityMonitor::new(
+        notifications.clone(),
+        docker_service.clone(),
+    ));
     tokio::spawn(async move {
         security_monitor.run_loop().await;
     });
@@ -149,26 +160,18 @@ async fn main() {
     
     // Generate and save internal token
     let internal_token = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = std::fs::write("/tmp/mini-ops-internal.token", &internal_token) {
-        tracing::error!("Failed to write internal token: {}", e);
-    } else {
-        // Build script requires 600 permissions
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata("/tmp/mini-ops-internal.token") {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions("/tmp/mini-ops-internal.token", perms);
-        }
+    let internal_token_path = std::env::var("MINI_OPS_INTERNAL_TOKEN_FILE")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| "mini-ops-internal.token".to_string());
+    if let Err(e) = write_internal_token(&internal_token_path, &internal_token) {
+        tracing::error!(
+            "Failed to write internal token to {}: {}",
+            internal_token_path,
+            e
+        );
     }
     ssh_alerts_service.set_token(internal_token);
-
-    let docker_service = match DockerService::new() {
-        Ok(s) => Some(Arc::new(s)),
-        Err(e) => {
-            tracing::error!("Failed to initialize Docker service: {}", e);
-            None
-        }
-    };
 
     let deployment_service = Arc::new(DeploymentService::new());
     let history_manager = Arc::new(HistoryManager::new("history.json"));
@@ -299,6 +302,34 @@ async fn main() {
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn write_internal_token(path: &str, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = std::path::Path::new(path);
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(std::io::Error::other(
+            "refusing to write internal token through symlink",
+        ));
+    }
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -511,9 +542,12 @@ fn serve_file(path: &str) -> Response {
     (StatusCode::NOT_FOUND, "index.html not found").into_response()
 }
 
-async fn get_security_audit_handler(headers: header::HeaderMap) -> Json<Vec<SecurityCheck>> {
+async fn get_security_audit_handler(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+) -> Json<Vec<SecurityCheck>> {
     let lang = i18n::Lang::from_headers(&headers);
-    Json(SecurityAuditor::run_audit(&lang).await)
+    Json(SecurityAuditor::run_audit(&lang, state.docker.as_deref()).await)
 }
 
 async fn get_version_handler() -> &'static str {
@@ -580,19 +614,28 @@ async fn delete_trusted_ip_handler(
 }
 
 async fn setup_ssh_alerts_handler() -> Response {
-    use std::process::Command;
+    use std::process::{Command, Output};
 
-    // Use absolute path for sudo and canonicalize script path to prevent PATH-based attacks
     let script_path = std::env::current_dir()
         .map(|d| d.join("scripts/setup_ssh_alerts.sh"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mini-ops/scripts/setup_ssh_alerts.sh"));
 
-    match Command::new("/usr/bin/sudo").arg(&script_path).output() {
+    let direct_output = Command::new(&script_path).output();
+    let output: Result<Output, std::io::Error> = match direct_output {
+        Ok(output) if output.status.success() => Ok(output),
+        _ => Command::new("/usr/bin/sudo").arg(&script_path).output(),
+    };
+
+    match output {
         Ok(output) => {
             if output.status.success() {
                 StatusCode::OK.into_response()
             } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, String::from_utf8_lossy(&output.stderr).to_string()).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                )
+                    .into_response()
             }
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

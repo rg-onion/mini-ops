@@ -3,7 +3,7 @@ set -euo pipefail
 
 # One-command bootstrap for Ubuntu VPS.
 # - Baseline hardening (UFW + fail2ban)
-# - Non-root systemd service user
+# - Configurable systemd service user (root by default for full VPS control)
 # - Deploy Mini-Ops binary
 # - Optional SSH alerts PAM hook setup
 
@@ -11,7 +11,7 @@ DEPLOY_HOST="${DEPLOY_HOST:-}"
 DEPLOY_SSH_USER="${DEPLOY_SSH_USER:-root}"
 DEPLOY_SSH_PORT="${DEPLOY_SSH_PORT:-22}"
 DEPLOY_TARGET_DIR="${DEPLOY_TARGET_DIR:-/opt/mini-ops}"
-DEPLOY_APP_USER="${DEPLOY_APP_USER:-miniops}"
+DEPLOY_APP_USER="${DEPLOY_APP_USER:-root}"
 DEPLOY_MODE="${DEPLOY_MODE:-test}"                       # test | production
 DEPLOY_INSTALL_DOCKER="${DEPLOY_INSTALL_DOCKER:-1}"      # 1 | 0
 DEPLOY_SETUP_NGINX="${DEPLOY_SETUP_NGINX:-1}"            # 1 | 0
@@ -78,6 +78,9 @@ if [ "$DEPLOY_SYSTEMD_ONLY" != "1" ]; then
 fi
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
+if [ -n "${SSH_KEY_PATH:-}" ]; then
+  SSH_OPTS+=(-i "$SSH_KEY_PATH")
+fi
 REMOTE_SSH=(ssh -p "$DEPLOY_SSH_PORT" "${SSH_OPTS[@]}")
 REMOTE_SCP=(scp -P "$DEPLOY_SSH_PORT" "${SSH_OPTS[@]}")
 REMOTE="${DEPLOY_SSH_USER}@${DEPLOY_HOST}"
@@ -177,7 +180,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=$DEPLOY_TARGET_DIR /tmp
+ReadWritePaths=$DEPLOY_TARGET_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -191,11 +194,6 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
     echo "[6/7] Writing .env and systemd service..."
   else
     echo "[6/7] Writing .env only (DEPLOY_MINIMAL=1, DEPLOY_WRITE_ENV=1)"
-  fi
-
-  SCP_CMD=(scp -P "${SSH_PORT:-22}")
-  if [ -n "${SSH_KEY_PATH:-}" ]; then
-    SCP_CMD+=("-i" "$SSH_KEY_PATH")
   fi
 
   # Build .env locally with secret overrides applied BEFORE SCP.
@@ -226,7 +224,7 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
     echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$_TMP_ENV"
   fi
 
-  "${SCP_CMD[@]}" "$_TMP_ENV" "$REMOTE:/tmp/mini-ops-env.new"
+  "${REMOTE_SCP[@]}" "$_TMP_ENV" "$REMOTE:/tmp/mini-ops-env.new"
   rm -f "$_TMP_ENV"
 
   # Pass only non-sensitive deployment config vars as remote env args
@@ -243,6 +241,11 @@ grep -q '^APP_HOST=' "$DEPLOY_TARGET_DIR/.env" || echo 'APP_HOST=127.0.0.1' >> "
 grep -q '^APP_PORT=' "$DEPLOY_TARGET_DIR/.env" || echo "APP_PORT=$DEPLOY_APP_PORT" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^DEPLOY_NGINX_PORT=' "$DEPLOY_TARGET_DIR/.env" || echo "DEPLOY_NGINX_PORT=$DEPLOY_NGINX_PORT" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^DATABASE_URL=' "$DEPLOY_TARGET_DIR/.env" || echo 'DATABASE_URL=sqlite:mini-ops.db' >> "$DEPLOY_TARGET_DIR/.env"
+if grep -q '^MINI_OPS_INTERNAL_TOKEN_FILE=' "$DEPLOY_TARGET_DIR/.env"; then
+  sed -i "s#^MINI_OPS_INTERNAL_TOKEN_FILE=$#MINI_OPS_INTERNAL_TOKEN_FILE=$DEPLOY_TARGET_DIR/mini-ops-internal.token#" "$DEPLOY_TARGET_DIR/.env"
+else
+  echo "MINI_OPS_INTERNAL_TOKEN_FILE=$DEPLOY_TARGET_DIR/mini-ops-internal.token" >> "$DEPLOY_TARGET_DIR/.env"
+fi
 grep -q '^RUST_LOG=' "$DEPLOY_TARGET_DIR/.env" || echo "RUST_LOG=$RUST_LOG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^AGENT_LANG=' "$DEPLOY_TARGET_DIR/.env" || echo "AGENT_LANG=$AGENT_LANG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^SERVER_NAME=' "$DEPLOY_TARGET_DIR/.env" || echo "SERVER_NAME=${SERVER_NAME:-$(hostname)}" >> "$DEPLOY_TARGET_DIR/.env"
@@ -274,7 +277,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=$DEPLOY_TARGET_DIR /tmp
+ReadWritePaths=$DEPLOY_TARGET_DIR
 
 [Install]
 WantedBy=multi-user.target

@@ -6,8 +6,8 @@ Mini-Ops can send Telegram notifications for every successful SSH login.
 
 1.  **PAM Module**: Uses `pam_exec.so` to trigger a script on login.
 2.  **Micro-script**: A lightweight bash script (`ssh-alert.sh`) gathers session info (User, IP).
-3.  **Internal API**: The script sends a POST request to `http://127.0.0.1:3000/api/webhooks/ssh-login`.
-4.  **Security**: The request is signed with a short-lived internal token to prevent spoofing.
+3.  **Internal API**: The script sends a POST request to `http://127.0.0.1:3000/api/internal/ssh-login`.
+4.  **Security**: The request is signed with an internal token generated at Mini-Ops startup.
 
 ## Automatic Installation
 
@@ -32,7 +32,14 @@ In `.env`:
 # Required for alerts
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+
+# Optional; bootstrap_server.sh writes this automatically
+MINI_OPS_INTERNAL_TOKEN_FILE=/opt/mini-ops/mini-ops-internal.token
 ```
+
+The token file is written with `0600` permissions. By default the deployed PAM
+hook reads it from `/opt/mini-ops/mini-ops-internal.token`; custom deployments
+can set `MINI_OPS_INTERNAL_TOKEN_FILE` before running `setup_ssh_alerts.sh`.
 
 ## Troubleshooting
 

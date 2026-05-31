@@ -10,21 +10,25 @@ static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// Инициализирует токен аутентификации. Вызывается один раз из main до старта сервера.
 pub fn init_token(token: String) {
-    AUTH_TOKEN.set(token).expect("CRITICAL: AUTH_TOKEN already initialized");
+    AUTH_TOKEN
+        .set(token)
+        .expect("CRITICAL: AUTH_TOKEN already initialized");
 }
 
-pub async fn auth_middleware(
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let token = AUTH_TOKEN.get().expect("CRITICAL: AUTH_TOKEN not initialized — call auth::init_token() before serving");
+pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let token = AUTH_TOKEN
+        .get()
+        .expect("CRITICAL: AUTH_TOKEN not initialized — call auth::init_token() before serving");
 
-    let auth_header = request.headers()
+    let auth_header = request
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok());
 
     match auth_header {
-        Some(auth_header) if auth_header_is_valid(auth_header, &token) => Ok(next.run(request).await),
+        Some(auth_header) if auth_header_is_valid(auth_header, token) => {
+            Ok(next.run(request).await)
+        }
         _ => {
             let uri = request.uri();
             if uri.path().contains("/logs") {
