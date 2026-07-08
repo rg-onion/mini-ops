@@ -118,7 +118,7 @@ export default function Layout({ children }: LayoutProps) {
             </aside>
 
             {/* ── Content column ───────────────────────────────────────── */}
-            <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+            <div className="flex flex-col flex-1 min-w-0 min-h-0 overflow-hidden">
 
                 {/* Mobile header */}
                 <header className="md:hidden shrink-0 h-14 border-b bg-background flex items-center px-4 justify-between">
@@ -147,14 +147,14 @@ export default function Layout({ children }: LayoutProps) {
                 </header>
 
                 {/* Scrollable main content */}
-                <main className="flex-1 overflow-y-auto pb-16 md:pb-0">
+                <main className="flex-1 min-h-0 overflow-y-auto pb-4 md:pb-0">
                     <div className="container py-6 px-4 md:py-8 md:px-8 max-w-7xl mx-auto">
                         {children}
                     </div>
                 </main>
 
-                {/* Mobile bottom navigation — fixed so it's always visible */}
-                <nav className="md:hidden fixed bottom-0 left-0 right-0 z-50 border-t bg-background">
+                {/* Mobile bottom navigation */}
+                <nav className="md:hidden shrink-0 border-t bg-background">
                     <div className="flex h-16 gap-1 px-1 items-center">
                         {navItems.map(({ path, icon: Icon, label }) => {
                             const active = isActive(path);
