@@ -156,6 +156,7 @@ async fn main() {
     let ssh_alerts_service = Arc::new(SshAlertsService::new(
         pool.clone(),
         notifications.clone(),
+        security_events.clone(),
         retention_config.ssh_logins_retention_days,
     ));
     

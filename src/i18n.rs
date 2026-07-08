@@ -40,6 +40,8 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.resolved" => "✅ Проблема безопасности решена".to_string(),
             "security.check" => "Проверка".to_string(),
             "security.message" => "Описание".to_string(),
+            "security.ssh_source_ip.title" => "SSH-вход с недоверенного IP-источника".to_string(),
+            "security.ssh_source_ip.message" => "SSH-вход не совпадает с baseline доверенных IP".to_string(),
 
             "audit.ssh_root.name" => "Доступ root через SSH".to_string(),
             "audit.ssh_root.fail" => "Root-доступ разрешен по паролю/ключам (небезопасно)".to_string(),
@@ -106,6 +108,8 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.resolved" => "✅ Security Issue Resolved".to_string(),
             "security.check" => "Check".to_string(),
             "security.message" => "Message".to_string(),
+            "security.ssh_source_ip.title" => "SSH login from untrusted source IP".to_string(),
+            "security.ssh_source_ip.message" => "SSH login does not match the trusted IP baseline".to_string(),
 
             "audit.ssh_root.name" => "SSH Root Login".to_string(),
             "audit.ssh_root.fail" => "Root login is permitted via SSH via password/keys".to_string(),

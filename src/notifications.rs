@@ -40,6 +40,18 @@ impl NotificationService {
         }
     }
 
+    #[cfg(test)]
+    pub fn disabled_for_tests() -> Self {
+        Self {
+            client: Client::new(),
+            token: None,
+            chat_id: None,
+            server_name: "test".to_string(),
+            last_sent: Mutex::new(None),
+            alert_history: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub async fn send_alert(&self, message: &str) {
         let (token, chat_id) = match (&self.token, &self.chat_id) {
             (Some(t), Some(c)) => (t, c),

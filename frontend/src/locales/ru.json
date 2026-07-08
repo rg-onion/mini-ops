@@ -177,8 +177,8 @@
             "confirm_description": "Это установит или обновит интеграцию SSH-уведомлений на этом хосте."
         },
         "trusted": {
-            "title": "Доверенные IP",
-            "added": "IP добавлен в белый список",
+            "title": "Доверенные SSH source IP",
+            "added": "IP добавлен в baseline",
             "add_error": "Не удалось добавить IP: {{error}}",
             "deleted": "Доверенный IP удален",
             "delete_error": "Не удалось удалить IP: {{error}}",

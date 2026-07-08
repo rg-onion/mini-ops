@@ -1,4 +1,5 @@
 use crate::notifications::NotificationService;
+use crate::security_events::SecurityEventService;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -49,6 +50,7 @@ pub struct SshLoginLog {
 pub struct SshAlertsService {
     db: SqlitePool,
     notifier: Arc<NotificationService>,
+    security_events: Arc<SecurityEventService>,
     retention_days: i64,
     internal_token: Mutex<String>,
     // IP -> last_alert_time
@@ -56,10 +58,16 @@ pub struct SshAlertsService {
 }
 
 impl SshAlertsService {
-    pub fn new(db: SqlitePool, notifier: Arc<NotificationService>, retention_days: i64) -> Self {
+    pub fn new(
+        db: SqlitePool,
+        notifier: Arc<NotificationService>,
+        security_events: Arc<SecurityEventService>,
+        retention_days: i64,
+    ) -> Self {
         Self {
             db,
             notifier,
+            security_events,
             retention_days,
             internal_token: Mutex::new(String::new()),
             rate_limiter: Mutex::new(HashMap::new()),
@@ -72,8 +80,8 @@ impl SshAlertsService {
     }
 
     /// Обрабатывает событие успешного входа по SSH.
-    /// Проверяет токен, применяет rate limiting и проверяет белый список перед отправкой уведомления.
-    pub async fn handle_login(&self, event: SshLoginEvent, token: &str) -> Result<(), String> {
+    /// Проверяет токен, baseline доверенных IP и применяет rate limiting к уведомлению.
+    pub async fn handle_login(&self, mut event: SshLoginEvent, token: &str) -> Result<(), String> {
         {
             let t = self.internal_token.lock().unwrap();
             if t.is_empty() {
@@ -85,36 +93,43 @@ impl SshAlertsService {
         }
 
         validate_login_event(&event)?;
+        event.ip = normalize_ip(&event.ip)?;
 
-        // Rate limiting (10s per IP)
-        {
-            let mut limiter = self.rate_limiter.lock().unwrap();
-            if let Some(last) = limiter.get(&event.ip)
-                && last.elapsed() < Duration::from_secs(10)
-            {
-                tracing::info!("Rate limiting SSH alert for IP: {}", event.ip);
-                return Ok(()); // Silently skip
+        let is_trusted = match self.is_trusted_ip(&event.ip).await {
+            Ok(is_trusted) => is_trusted,
+            Err(e) => {
+                tracing::warn!("Failed to check trusted SSH source IP baseline: {}", e);
+                false
             }
-            limiter.insert(event.ip.clone(), Instant::now());
-        }
+        };
 
-        // Check whitelist
-        // We use a simplified query here.
-        // Note: 'trusted_ips' table MUST expect IP string.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trusted_ips WHERE ip = ?")
-            .bind(&event.ip)
-            .fetch_one(&self.db)
-            .await
-            .unwrap_or(0);
-
-        if count > 0 {
+        if is_trusted {
             tracing::info!("Skipping notification for trusted IP: {}", event.ip);
+            if let Err(e) = self
+                .security_events
+                .resolve_ssh_source_ip_event(&event.ip)
+                .await
+            {
+                tracing::warn!("Failed to resolve SSH source IP security event: {}", e);
+            }
             self.log_to_db(&event, false).await;
             return Ok(());
         }
 
-        // Save to DB
-        self.log_to_db(&event, true).await;
+        let rate_limited = self.is_rate_limited(&event.ip);
+        self.log_to_db(&event, !rate_limited).await;
+        if let Err(e) = self
+            .security_events
+            .raise_ssh_source_ip_event(&event.user, &event.ip, &event.method, event.timestamp)
+            .await
+        {
+            tracing::warn!("Failed to raise SSH source IP security event: {}", e);
+        }
+
+        if rate_limited {
+            tracing::info!("Rate limiting SSH alert for IP: {}", event.ip);
+            return Ok(());
+        }
 
         // Send Notification
         let date_str = DateTime::from_timestamp(event.timestamp, 0)
@@ -133,6 +148,26 @@ impl SshAlertsService {
         self.notifier.send_alert(&msg_tg).await;
 
         Ok(())
+    }
+
+    fn is_rate_limited(&self, ip: &str) -> bool {
+        let mut limiter = self.rate_limiter.lock().unwrap();
+        if let Some(last) = limiter.get(ip)
+            && last.elapsed() < Duration::from_secs(10)
+        {
+            return true;
+        }
+        limiter.insert(ip.to_string(), Instant::now());
+        false
+    }
+
+    async fn is_trusted_ip(&self, ip: &str) -> Result<bool, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trusted_ips WHERE ip = ?")
+            .bind(ip)
+            .fetch_one(&self.db)
+            .await?;
+
+        Ok(count > 0)
     }
 
     async fn log_to_db(&self, event: &SshLoginEvent, notified: bool) {
@@ -197,14 +232,16 @@ impl SshAlertsService {
         ip: String,
         description: Option<String>,
     ) -> Result<(), sqlx::Error> {
-        // Validate IP before storing
-        validate_ip(&ip).map_err(sqlx::Error::Protocol)?;
+        let ip = normalize_ip(&ip).map_err(sqlx::Error::Protocol)?;
 
         sqlx::query("INSERT INTO trusted_ips (ip, description, added_at) VALUES (?, ?, ?)")
-            .bind(ip)
+            .bind(&ip)
             .bind(description)
             .bind(Utc::now().timestamp())
             .execute(&self.db)
+            .await?;
+        self.security_events
+            .resolve_ssh_source_ip_event(&ip)
             .await?;
         Ok(())
     }
@@ -253,9 +290,65 @@ fn escape_markdown_code(value: &str) -> String {
     value.replace('\\', "\\\\").replace('`', "\\`")
 }
 
+fn normalize_ip(ip: &str) -> Result<String, String> {
+    ip.parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| format!("Invalid IP address: '{}'", ip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_service() -> (SshAlertsService, Arc<SecurityEventService>) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite should connect");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ssh_logins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                method TEXT NOT NULL,
+                notified BOOLEAN DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("ssh_logins schema should initialize");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS trusted_ips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT UNIQUE NOT NULL,
+                description TEXT,
+                added_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("trusted_ips schema should initialize");
+
+        SecurityEventService::init_schema(&pool)
+            .await
+            .expect("security event schema should initialize");
+
+        let events = Arc::new(SecurityEventService::new(pool.clone()));
+        let service = SshAlertsService::new(
+            pool,
+            Arc::new(NotificationService::disabled_for_tests()),
+            events.clone(),
+            90,
+        );
+        service.set_token("test-token".to_string());
+
+        (service, events)
+    }
 
     #[test]
     fn test_validate_ip_valid_ipv4() {
@@ -318,5 +411,134 @@ mod tests {
     #[test]
     fn test_escape_markdown_code() {
         assert_eq!(escape_markdown_code("a`b\\c"), "a\\`b\\\\c");
+    }
+
+    #[test]
+    fn test_normalize_ip_normalizes_ipv6() {
+        assert_eq!(normalize_ip("0:0:0:0:0:0:0:1").unwrap(), "::1");
+    }
+
+    #[tokio::test]
+    async fn untrusted_login_creates_security_event() {
+        let (service, events) = test_service().await;
+        let event = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.20".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+
+        service.handle_login(event, "test-token").await.unwrap();
+
+        let logs = service.get_logs().await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].ip, "203.0.113.20");
+        assert!(logs[0].notified);
+
+        let active = events.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].event_key, "ssh:source_ip:203.0.113.20");
+        assert_eq!(active[0].event_type, "ssh.untrusted_source_ip");
+    }
+
+    #[tokio::test]
+    async fn trusted_login_does_not_create_active_security_event() {
+        let (service, events) = test_service().await;
+        service
+            .add_trusted_ip("203.0.113.21".to_string(), Some("office".to_string()))
+            .await
+            .unwrap();
+        let event = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.21".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+
+        service.handle_login(event, "test-token").await.unwrap();
+
+        let logs = service.get_logs().await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].ip, "203.0.113.21");
+        assert!(!logs[0].notified);
+        assert!(events.list(Some("active"), 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_limited_untrusted_login_still_records_history() {
+        let (service, events) = test_service().await;
+        let first = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.23".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+        let second = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.23".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+
+        service.handle_login(first, "test-token").await.unwrap();
+        service.handle_login(second, "test-token").await.unwrap();
+
+        let logs = service.get_logs().await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| log.ip == "203.0.113.23"));
+        assert_eq!(logs.iter().filter(|log| log.notified).count(), 1);
+        assert_eq!(logs.iter().filter(|log| !log.notified).count(), 1);
+
+        let active = events.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].event_key, "ssh:source_ip:203.0.113.23");
+    }
+
+    #[tokio::test]
+    async fn repeated_trusted_login_still_records_history_without_notification() {
+        let (service, _events) = test_service().await;
+        service
+            .add_trusted_ip("203.0.113.24".to_string(), Some("office".to_string()))
+            .await
+            .unwrap();
+        let first = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.24".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+        let second = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.24".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+
+        service.handle_login(first, "test-token").await.unwrap();
+        service.handle_login(second, "test-token").await.unwrap();
+
+        let logs = service.get_logs().await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| log.ip == "203.0.113.24"));
+        assert!(logs.iter().all(|log| !log.notified));
+    }
+
+    #[tokio::test]
+    async fn adding_trusted_ip_resolves_existing_source_event() {
+        let (service, events) = test_service().await;
+        events
+            .raise_ssh_source_ip_event("root", "203.0.113.22", "publickey", Utc::now().timestamp())
+            .await
+            .unwrap();
+
+        service
+            .add_trusted_ip("203.0.113.22".to_string(), Some("office".to_string()))
+            .await
+            .unwrap();
+
+        assert!(events.list(Some("active"), 10).await.unwrap().is_empty());
+        let resolved = events.list(Some("resolved"), 10).await.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].event_key, "ssh:source_ip:203.0.113.22");
     }
 }

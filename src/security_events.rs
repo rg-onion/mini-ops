@@ -201,6 +201,105 @@ impl SecurityEventService {
         Ok(should_alert)
     }
 
+    pub async fn raise_ssh_source_ip_event(
+        &self,
+        user: &str,
+        ip: &str,
+        method: &str,
+        timestamp: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let event_key = Self::ssh_source_ip_event_key(ip);
+        let previous_state = self.get_state_by_key(&event_key).await?;
+        let should_alert = matches!(
+            previous_state.as_ref().map(|(status, _)| status.as_str()),
+            None | Some("resolved")
+        );
+        let now = Utc::now().timestamp();
+        let lang = crate::i18n::Lang::from_headers(&crate::i18n::HeaderMap::new());
+        let title = crate::i18n::t("security.ssh_source_ip.title", &lang);
+        let message = format!(
+            "{}: user={}, ip={}, method={}",
+            crate::i18n::t("security.ssh_source_ip.message", &lang),
+            user,
+            ip,
+            method
+        );
+        let evidence_json = serde_json::to_string(&serde_json::json!({
+            "user": user,
+            "ip": ip,
+            "method": method,
+            "timestamp": timestamp,
+            "baseline": "trusted_ips",
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO security_events (
+                event_key, event_type, severity, title, message, evidence_json,
+                status, first_seen, last_seen, acknowledged_at, resolved_at
+            )
+            VALUES (?, 'ssh.untrusted_source_ip', 'high', ?, ?, ?, 'open', ?, ?, NULL, NULL)
+            ON CONFLICT(event_key) DO UPDATE SET
+                event_type = excluded.event_type,
+                severity = excluded.severity,
+                title = excluded.title,
+                message = excluded.message,
+                evidence_json = excluded.evidence_json,
+                status = CASE
+                    WHEN security_events.status = 'resolved' THEN 'open'
+                    ELSE security_events.status
+                END,
+                first_seen = CASE
+                    WHEN security_events.status = 'resolved' THEN excluded.first_seen
+                    ELSE security_events.first_seen
+                END,
+                last_seen = excluded.last_seen,
+                acknowledged_at = CASE
+                    WHEN security_events.status = 'resolved' THEN NULL
+                    ELSE security_events.acknowledged_at
+                END,
+                resolved_at = CASE
+                    WHEN security_events.status = 'resolved' THEN NULL
+                    ELSE security_events.resolved_at
+                END",
+        )
+        .bind(&event_key)
+        .bind(title)
+        .bind(message)
+        .bind(evidence_json)
+        .bind(now)
+        .bind(now)
+        .execute(&self.db)
+        .await?;
+
+        Ok(should_alert)
+    }
+
+    pub async fn resolve_ssh_source_ip_event(&self, ip: &str) -> Result<bool, sqlx::Error> {
+        let event_key = Self::ssh_source_ip_event_key(ip);
+        let previous_state = self.get_state_by_key(&event_key).await?;
+        let should_resolve = matches!(
+            previous_state.as_ref().map(|(status, _)| status.as_str()),
+            Some("open") | Some("acknowledged")
+        );
+
+        if should_resolve {
+            let now = Utc::now().timestamp();
+            sqlx::query(
+                "UPDATE security_events
+                SET status = 'resolved', last_seen = ?, resolved_at = ?
+                WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(event_key)
+            .execute(&self.db)
+            .await?;
+        }
+
+        Ok(should_resolve)
+    }
+
     pub async fn acknowledge(&self, id: i64) -> Result<bool, sqlx::Error> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
@@ -294,6 +393,10 @@ impl SecurityEventService {
 
     fn audit_event_key(check_id: &str) -> String {
         format!("audit:{}", check_id)
+    }
+
+    fn ssh_source_ip_event_key(ip: &str) -> String {
+        format!("ssh:source_ip:{}", ip)
     }
 
     fn audit_evidence_json(check: &SecurityCheck) -> String {
@@ -550,5 +653,89 @@ mod tests {
         assert_eq!(active[0].status, "open");
         assert_eq!(active[0].event_type, "audit.check_failed");
         assert!(active[0].acknowledged_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_source_ip_event_alerts_once_until_resolved() {
+        let service = test_service().await;
+
+        assert!(
+            service
+                .raise_ssh_source_ip_event("root", "203.0.113.10", "publickey", 1_700_000_000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .raise_ssh_source_ip_event("root", "203.0.113.10", "publickey", 1_700_000_010)
+                .await
+                .unwrap()
+        );
+
+        let active = service.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].event_key, "ssh:source_ip:203.0.113.10");
+        assert_eq!(active[0].event_type, "ssh.untrusted_source_ip");
+        assert_eq!(active[0].severity, "high");
+
+        assert!(
+            service
+                .resolve_ssh_source_ip_event("203.0.113.10")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .resolve_ssh_source_ip_event("203.0.113.10")
+                .await
+                .unwrap()
+        );
+
+        let resolved = service.list(Some("resolved"), 10).await.unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_ssh_source_ip_event_reopens_with_new_first_seen() {
+        let service = test_service().await;
+
+        assert!(
+            service
+                .raise_ssh_source_ip_event("root", "203.0.113.11", "publickey", 1_700_000_000)
+                .await
+                .unwrap()
+        );
+        assert!(
+            service
+                .resolve_ssh_source_ip_event("203.0.113.11")
+                .await
+                .unwrap()
+        );
+
+        sqlx::query(
+            "UPDATE security_events
+            SET first_seen = 1, last_seen = 2, resolved_at = 2
+            WHERE event_key = ?",
+        )
+        .bind(SecurityEventService::ssh_source_ip_event_key(
+            "203.0.113.11",
+        ))
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        assert!(
+            service
+                .raise_ssh_source_ip_event("root", "203.0.113.11", "publickey", 1_700_000_100)
+                .await
+                .unwrap()
+        );
+
+        let active = service.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, "open");
+        assert_eq!(active[0].first_seen, active[0].last_seen);
+        assert!(active[0].first_seen > 1);
+        assert!(active[0].resolved_at.is_none());
     }
 }

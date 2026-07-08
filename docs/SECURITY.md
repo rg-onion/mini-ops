@@ -76,6 +76,9 @@ remains active, and resolved when the check returns to `PASS`.
 
 - Active events are shown on the Security page.
 - Operators can acknowledge open events to reduce noise while keeping evidence.
+- SSH logins from source IPs outside the trusted SSH IP baseline create
+  `ssh.untrusted_source_ip` events; adding the IP to the trusted list resolves
+  the matching event.
 - Resolved events are retained for `SECURITY_EVENTS_RETENTION_HOURS` hours
   (`168` by default).
 - Telegram notifications are sent only when a failed check first opens/reopens

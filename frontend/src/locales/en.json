@@ -177,8 +177,8 @@
             "confirm_description": "This will install or update SSH alert integration on this host."
         },
         "trusted": {
-            "title": "Trusted IPs",
-            "added": "IP added to whitelist",
+            "title": "Trusted SSH source IPs",
+            "added": "IP added to baseline",
             "add_error": "Failed to add IP: {{error}}",
             "deleted": "Trusted IP deleted",
             "delete_error": "Failed to delete IP: {{error}}",
