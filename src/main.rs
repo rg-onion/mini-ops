@@ -10,8 +10,11 @@ mod i18n;
 mod ssh_alerts;
 mod cloud_payload;
 mod cloud_push;
+mod security_events;
+mod retention;
 
-use security::{SecurityAuditor, SecurityCheck, SecurityMonitor};
+use security::{SecurityAuditCache, SecurityCheck, SecurityMonitor};
+use security_events::{SecurityEvent, SecurityEventService};
 use ssh_alerts::{SshAlertsService, SshLoginEvent};
 
 use rand::Rng;
@@ -46,29 +49,11 @@ struct Asset;
 async fn main() {
     dotenvy::dotenv().ok();
 
-    // Resolve AUTH_TOKEN: from env (loaded by dotenv) or generate a new one
-    let auth_token = match std::env::var("AUTH_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            let token: String = (0..32)
-                .map(|_| {
-                    let idx = rand::rng().random_range(0..62);
-                    let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                    chars[idx] as char
-                })
-                .collect();
-
-            let preview = format!("{}***", &token.chars().take(6).collect::<String>());
-            println!("\n\n WARNING: AUTH_TOKEN not found. Generated and persisted to .env.");
-            println!(" Token preview: {}", preview);
-            println!(" Please rotate it for production use.\n\n");
-
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".env") {
-                writeln!(file, "AUTH_TOKEN={}", token).ok();
-            }
-
-            token
+    let auth_token = match resolve_auth_token() {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("CRITICAL: {}", e);
+            std::process::exit(1);
         }
     };
 
@@ -134,9 +119,20 @@ async fn main() {
     .await
     .expect("Could not initialize SSH alerts schema");
 
+    SecurityEventService::init_schema(&pool)
+        .await
+        .expect("Could not initialize security events schema");
+
+    retention::init_indexes(&pool)
+        .await
+        .expect("Could not initialize retention indexes");
+
     // 2. Setup Services
     let metrics_state = Arc::new(MetricsState::new());
     let notifications = Arc::new(NotificationService::new());
+    let retention_config = retention::RetentionConfig::from_env();
+    let security_audit_cache = SecurityAuditCache::from_env();
+    let security_events = Arc::new(SecurityEventService::new(pool.clone()));
 
     let docker_service = match DockerService::new() {
         Ok(s) => Some(Arc::new(s)),
@@ -150,13 +146,18 @@ async fn main() {
     let security_monitor = Arc::new(SecurityMonitor::new(
         notifications.clone(),
         docker_service.clone(),
+        security_events.clone(),
     ));
     tokio::spawn(async move {
         security_monitor.run_loop().await;
     });
 
     // Setup SSH Alerts
-    let ssh_alerts_service = Arc::new(SshAlertsService::new(pool.clone(), notifications.clone()));
+    let ssh_alerts_service = Arc::new(SshAlertsService::new(
+        pool.clone(),
+        notifications.clone(),
+        retention_config.ssh_logins_retention_days,
+    ));
     
     // Generate and save internal token
     let internal_token = uuid::Uuid::new_v4().to_string();
@@ -218,8 +219,10 @@ async fn main() {
     let metrics_clone = Arc::clone(&metrics_state);
     let notifier_clone = Arc::clone(&notifications);
     let pool_clone = pool.clone();
+    let metrics_retention_hours = retention_config.metrics_retention_hours;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut next_metrics_cleanup_at = 0_i64;
         loop {
             interval.tick().await;
             metrics_clone.refresh();
@@ -246,6 +249,25 @@ async fn main() {
             .bind(stats.timestamp)
             .execute(&pool_clone)
             .await;
+
+            if stats.timestamp >= next_metrics_cleanup_at {
+                match retention::prune_metrics(
+                    &pool_clone,
+                    stats.timestamp,
+                    metrics_retention_hours,
+                )
+                .await
+                {
+                    Ok(rows) if rows > 0 => {
+                        tracing::info!("Pruned {} old metrics rows", rows);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to prune old metrics rows: {}", e);
+                    }
+                }
+                next_metrics_cleanup_at = stats.timestamp.saturating_add(3600);
+            }
         }
     });
 
@@ -263,6 +285,8 @@ async fn main() {
         .route("/deploy/webhook", post(trigger_update_handler))
         .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
+        .route("/security/events", get(get_security_events_handler))
+        .route("/security/events/{id}/ack", post(ack_security_event_handler))
         .route("/ssh/logs", get(get_ssh_logs_handler))
         .route("/ssh/trusted-ips", get(get_trusted_ips_handler))
         .route("/ssh/trusted-ips", post(add_trusted_ip_handler))
@@ -291,6 +315,8 @@ async fn main() {
             deployment: deployment_service,
             history: history_manager,
             ssh_alerts: ssh_alerts_service,
+            security_events,
+            security_audit_cache,
         });
 
     let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -332,6 +358,120 @@ fn write_internal_token(path: &str, token: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn resolve_auth_token() -> Result<String, String> {
+    match std::env::var("AUTH_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => {
+            let token = token.trim().to_string();
+            validate_auth_token(&token)?;
+            Ok(token)
+        }
+        _ => {
+            let token = generate_auth_token();
+            persist_auth_token_to_env(".env", &token)
+                .map_err(|e| format!("AUTH_TOKEN is missing and could not be persisted to .env: {}", e))?;
+            eprintln!(
+                "WARNING: AUTH_TOKEN was missing. Generated a strong token and persisted it to .env with 0600 permissions."
+            );
+            Ok(token)
+        }
+    }
+}
+
+fn validate_auth_token(token: &str) -> Result<(), String> {
+    if auth_token_is_placeholder(token) {
+        return Err(
+            "AUTH_TOKEN is set to a known placeholder. Generate a strong token with `openssl rand -hex 32`."
+                .to_string(),
+        );
+    }
+
+    if token.len() < 32
+        && std::env::var("MINI_OPS_ALLOW_WEAK_AUTH_TOKEN").as_deref() != Ok("true")
+    {
+        return Err(
+            "AUTH_TOKEN must be at least 32 characters. Set MINI_OPS_ALLOW_WEAK_AUTH_TOKEN=true only for local testing."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn auth_token_is_placeholder(token: &str) -> bool {
+    let normalized = token.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "your_secret_token_here"
+            | "your_secret_token"
+            | "your_strong_token"
+            | "change-me"
+            | "change-me-strong-random-token"
+            | "your-random-secure-string-at-least-32-chars"
+            | "your_auth_token"
+            | "auth_token"
+            | "token"
+    )
+}
+
+fn generate_auth_token() -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    (0..64)
+        .map(|_| {
+            let idx = rand::rng().random_range(0..CHARS.len());
+            CHARS[idx] as char
+        })
+        .collect()
+}
+
+fn persist_auth_token_to_env(path: &str, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = std::path::Path::new(path);
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(std::io::Error::other("refusing to write AUTH_TOKEN through symlink"));
+    }
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in existing.lines() {
+        if line.starts_with("AUTH_TOKEN=") {
+            if !replaced {
+                lines.push(format!("AUTH_TOKEN={}", token));
+                replaced = true;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !replaced {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("AUTH_TOKEN={}", token));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(lines.join("\n").as_bytes())?;
+    file.write_all(b"\n")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AppState {
     metrics: Arc<MetricsState>,
@@ -341,6 +481,8 @@ struct AppState {
     deployment: Arc<DeploymentService>,
     history: Arc<HistoryManager>,
     ssh_alerts: Arc<SshAlertsService>,
+    security_events: Arc<SecurityEventService>,
+    security_audit_cache: SecurityAuditCache,
 }
 
 impl FromRef<AppState> for Arc<DeploymentService> {
@@ -547,7 +689,42 @@ async fn get_security_audit_handler(
     headers: header::HeaderMap,
 ) -> Json<Vec<SecurityCheck>> {
     let lang = i18n::Lang::from_headers(&headers);
-    Json(SecurityAuditor::run_audit(&lang, state.docker.as_deref()).await)
+    Json(
+        state
+            .security_audit_cache
+            .get_or_run(lang, state.docker.as_deref())
+            .await,
+    )
+}
+
+#[derive(Deserialize)]
+struct SecurityEventsParams {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn get_security_events_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SecurityEventsParams>,
+) -> Response {
+    let status = params.status.as_deref();
+    let limit = params.limit.unwrap_or(100);
+
+    match state.security_events.list(status, limit).await {
+        Ok(events) => Json::<Vec<SecurityEvent>>(events).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn ack_security_event_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Response {
+    match state.security_events.acknowledge(id).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn get_version_handler() -> &'static str {
@@ -616,6 +793,14 @@ async fn delete_trusted_ip_handler(
 async fn setup_ssh_alerts_handler() -> Response {
     use std::process::{Command, Output};
 
+    if std::env::var("MINI_OPS_ALLOW_SYSTEM_SETUP").as_deref() != Ok("true") {
+        return (
+            StatusCode::FORBIDDEN,
+            "System setup from the web UI is disabled. Set MINI_OPS_ALLOW_SYSTEM_SETUP=true to enable it explicitly.",
+        )
+            .into_response();
+    }
+
     let script_path = std::env::current_dir()
         .map(|d| d.join("scripts/setup_ssh_alerts.sh"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/opt/mini-ops/scripts/setup_ssh_alerts.sh"));
@@ -623,7 +808,7 @@ async fn setup_ssh_alerts_handler() -> Response {
     let direct_output = Command::new(&script_path).output();
     let output: Result<Output, std::io::Error> = match direct_output {
         Ok(output) if output.status.success() => Ok(output),
-        _ => Command::new("/usr/bin/sudo").arg(&script_path).output(),
+        _ => Command::new("/usr/bin/sudo").arg("-n").arg(&script_path).output(),
     };
 
     match output {

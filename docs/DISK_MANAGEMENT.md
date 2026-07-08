@@ -16,12 +16,13 @@ In the "Disk Management" section, you can clean:
     - **Impact**: Safe to delete if you are not actively developing on the server. `npm install` will restore them.
 
 3.  **Docker System**:
-    - **Action**: Equivalent to `docker system prune -a`.
+    - **Action**: Equivalent to `docker system prune -af`.
     - **Impact**: Removes stopped containers, unused networks, and dangling images.
     - **Warning**: Make sure you don't need stopped containers!
 
 4.  **System Logs**:
-    - **Action**: Vacuum journald logs (keep last 2 days / 500MB).
+    - **Action**: Vacuum journald logs with `journalctl --vacuum-time=1d`
+      (keep roughly the last 24 hours).
     - **Requirement**: Requires `root` or `sudo` privileges.
 
 ## ⚠️ Notes for Non-Root Users

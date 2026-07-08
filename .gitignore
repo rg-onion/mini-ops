@@ -26,8 +26,14 @@ mini-ops-*.service
 
 # Agent Skills & Workflows (local dev tooling)
 .agent/
+.agents/
+.codex/
+.codexignore
+AGENTS.md
+CODEX.md
 CLAUDE.md
 .claude/
+GEMINI.md
 
 # Internal planning & audit docs (not for public repo)
 docs/planning/

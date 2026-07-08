@@ -14,7 +14,9 @@ DEPLOY_TARGET_DIR="${DEPLOY_TARGET_DIR:-/opt/mini-ops}"
 DEPLOY_APP_USER="${DEPLOY_APP_USER:-root}"
 DEPLOY_MODE="${DEPLOY_MODE:-test}"                       # test | production
 DEPLOY_INSTALL_DOCKER="${DEPLOY_INSTALL_DOCKER:-1}"      # 1 | 0
+DEPLOY_SETUP_NGINX_WAS_SET="${DEPLOY_SETUP_NGINX+x}"
 DEPLOY_SETUP_NGINX="${DEPLOY_SETUP_NGINX:-1}"            # 1 | 0
+DEPLOY_EXPOSE_HTTP="${DEPLOY_EXPOSE_HTTP:-}"             # 1 | 0 (default: test=1, production=0)
 DEPLOY_NGINX_PORT="${DEPLOY_NGINX_PORT:-8090}"
 DEPLOY_APP_PORT="${DEPLOY_APP_PORT:-3000}"               # internal app port
 DEPLOY_ENABLE_SSH_ALERTS="${DEPLOY_ENABLE_SSH_ALERTS:-1}" # 1 | 0
@@ -42,10 +44,78 @@ if [ "$DEPLOY_MODE" != "test" ] && [ "$DEPLOY_MODE" != "production" ]; then
   exit 1
 fi
 
+if [ "$DEPLOY_MODE" = "production" ] && [ -z "$DEPLOY_SETUP_NGINX_WAS_SET" ]; then
+  DEPLOY_SETUP_NGINX=0
+fi
+
+if [ -z "$DEPLOY_EXPOSE_HTTP" ]; then
+  if [ "$DEPLOY_MODE" = "test" ]; then
+    DEPLOY_EXPOSE_HTTP=1
+  else
+    DEPLOY_EXPOSE_HTTP=0
+  fi
+fi
+
 if [ "$DEPLOY_SYSTEMD_ONLY" = "1" ] && [ "$DEPLOY_MINIMAL" = "1" ]; then
   echo "DEPLOY_SYSTEMD_ONLY=1 is incompatible with DEPLOY_MINIMAL=1"
   exit 1
 fi
+
+is_placeholder_auth_token() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    your_secret_token_here|your_secret_token|your_strong_token|change-me|change-me-strong-random-token|your-random-secure-string-at-least-32-chars|your_auth_token|auth_token|token)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+generate_auth_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  elif command -v od >/dev/null 2>&1; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  else
+    echo "Missing openssl or od; cannot generate AUTH_TOKEN" >&2
+    return 1
+  fi
+}
+
+upsert_env_var() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s#^${key}=.*#${key}=${value}#" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+ensure_auth_token_in_env() {
+  local file="$1"
+  local current
+  current="$(grep '^AUTH_TOKEN=' "$file" | tail -n 1 | cut -d= -f2- || true)"
+
+  if [ -n "$current" ] && is_placeholder_auth_token "$current"; then
+    echo "Refusing to deploy with placeholder AUTH_TOKEN in $file" >&2
+    exit 1
+  fi
+
+  if [ -n "$current" ] && [ "${#current}" -lt 32 ]; then
+    echo "Refusing to deploy with weak AUTH_TOKEN shorter than 32 characters in $file" >&2
+    exit 1
+  fi
+
+  if [ -z "$current" ]; then
+    current="$(generate_auth_token)"
+    upsert_env_var "$file" "AUTH_TOKEN" "$current"
+    echo "Generated a strong AUTH_TOKEN for remote .env"
+  fi
+}
 
 require_cmd() {
   local cmd="$1"
@@ -206,7 +276,7 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
     echo "Found local .env file. Syncing to target..."
     cp .env "$_TMP_ENV"
   elif [ -f ".env.example" ]; then
-    echo "No local .env found. Uploading .env.example as fallback..."
+    echo "No local .env found. Using .env.example as a template..."
     cp .env.example "$_TMP_ENV"
   fi
 
@@ -223,6 +293,9 @@ elif [ "$DEPLOY_MINIMAL" != "1" ] || [ "$DEPLOY_WRITE_ENV" = "1" ]; then
     sed -i '/^TELEGRAM_CHAT_ID=/d' "$_TMP_ENV"
     echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$_TMP_ENV"
   fi
+
+  ensure_auth_token_in_env "$_TMP_ENV"
+  chmod 0600 "$_TMP_ENV"
 
   "${REMOTE_SCP[@]}" "$_TMP_ENV" "$REMOTE:/tmp/mini-ops-env.new"
   rm -f "$_TMP_ENV"
@@ -249,6 +322,13 @@ fi
 grep -q '^RUST_LOG=' "$DEPLOY_TARGET_DIR/.env" || echo "RUST_LOG=$RUST_LOG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^AGENT_LANG=' "$DEPLOY_TARGET_DIR/.env" || echo "AGENT_LANG=$AGENT_LANG" >> "$DEPLOY_TARGET_DIR/.env"
 grep -q '^SERVER_NAME=' "$DEPLOY_TARGET_DIR/.env" || echo "SERVER_NAME=${SERVER_NAME:-$(hostname)}" >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^MINI_OPS_ALLOW_WEB_UPDATE=' "$DEPLOY_TARGET_DIR/.env" || echo 'MINI_OPS_ALLOW_WEB_UPDATE=false' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^METRICS_RETENTION_HOURS=' "$DEPLOY_TARGET_DIR/.env" || echo 'METRICS_RETENTION_HOURS=168' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^SSH_LOGINS_RETENTION_DAYS=' "$DEPLOY_TARGET_DIR/.env" || echo 'SSH_LOGINS_RETENTION_DAYS=90' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^SECURITY_EVENTS_RETENTION_HOURS=' "$DEPLOY_TARGET_DIR/.env" || echo 'SECURITY_EVENTS_RETENTION_HOURS=168' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^SECURITY_AUDIT_INTERVAL_SECS=' "$DEPLOY_TARGET_DIR/.env" || echo 'SECURITY_AUDIT_INTERVAL_SECS=300' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^SECURITY_AUDIT_CACHE_TTL_SECS=' "$DEPLOY_TARGET_DIR/.env" || echo 'SECURITY_AUDIT_CACHE_TTL_SECS=30' >> "$DEPLOY_TARGET_DIR/.env"
+grep -q '^SECURITY_AUDIT_DOCKER_TIMEOUT_SECS=' "$DEPLOY_TARGET_DIR/.env" || echo 'SECURITY_AUDIT_DOCKER_TIMEOUT_SECS=10' >> "$DEPLOY_TARGET_DIR/.env"
 
 chown root:"$DEPLOY_APP_USER" "$DEPLOY_TARGET_DIR/.env"
 chmod 0640 "$DEPLOY_TARGET_DIR/.env"
@@ -293,6 +373,10 @@ server {
     listen $DEPLOY_NGINX_PORT;
     server_name _;
 
+    location /api/internal/ {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:$DEPLOY_APP_PORT;
         proxy_http_version 1.1;
@@ -319,14 +403,14 @@ if [ "$DEPLOY_SYSTEMD_ONLY" = "1" ]; then
   echo "[7/7] Systemd-only mode: skipping firewall and SSH alerts"
 elif [ "$DEPLOY_MINIMAL" != "1" ] && { [ "$DEPLOY_HARDENING" = "1" ] || [ "$DEPLOY_ENABLE_SSH_ALERTS" = "1" ]; }; then
   echo "[7/7] Applying firewall (if enabled) and optional SSH alerts hook..."
-  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_HARDENING='$DEPLOY_HARDENING' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' bash -s" <<'EOF'
+  "${REMOTE_SSH[@]}" "$REMOTE" "$REMOTE_SUDO env DEPLOY_MODE='$DEPLOY_MODE' DEPLOY_APP_PORT='$DEPLOY_APP_PORT' DEPLOY_ENABLE_SSH_ALERTS='$DEPLOY_ENABLE_SSH_ALERTS' DEPLOY_HARDENING='$DEPLOY_HARDENING' DEPLOY_TARGET_DIR='$DEPLOY_TARGET_DIR' DEPLOY_NGINX_PORT='$DEPLOY_NGINX_PORT' DEPLOY_SETUP_NGINX='$DEPLOY_SETUP_NGINX' DEPLOY_EXPOSE_HTTP='$DEPLOY_EXPOSE_HTTP' bash -s" <<'EOF'
 set -euo pipefail
 
 if [ "$DEPLOY_HARDENING" = "1" ]; then
   ufw allow OpenSSH
-  if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+  if [ "$DEPLOY_SETUP_NGINX" = "1" ] && [ "$DEPLOY_EXPOSE_HTTP" = "1" ]; then
     ufw allow "$DEPLOY_NGINX_PORT/tcp"
-  elif [ "$DEPLOY_MODE" = "test" ]; then
+  elif [ "$DEPLOY_SETUP_NGINX" != "1" ] && [ "$DEPLOY_MODE" = "test" ] && [ "$DEPLOY_EXPOSE_HTTP" = "1" ]; then
     ufw allow 3000/tcp
   fi
   ufw --force enable
@@ -344,8 +428,10 @@ echo
 echo "Bootstrap complete."
 echo "Host: $DEPLOY_HOST"
 echo "Mode: $DEPLOY_MODE"
-if [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+if [ "$DEPLOY_SETUP_NGINX" = "1" ] && [ "$DEPLOY_EXPOSE_HTTP" = "1" ]; then
   echo "Dashboard: http://$DEPLOY_HOST:$DEPLOY_NGINX_PORT"
+elif [ "$DEPLOY_SETUP_NGINX" = "1" ]; then
+  echo "Dashboard proxy installed on port $DEPLOY_NGINX_PORT, but DEPLOY_EXPOSE_HTTP=0 did not open it in UFW."
 elif [ "$DEPLOY_MODE" = "test" ]; then
   echo "Dashboard: http://$DEPLOY_HOST:3000"
 else

@@ -1,20 +1,21 @@
 # Cloud Push - Transparency Document
 
-**Feature status:** Optional, opt-in MVP client.
-**Data destination:** A Hub-compatible endpoint you control or fully trust.
+**Feature status:** Optional, opt-in client. Disabled by default.
+**Data destination:** The HTTPS endpoint configured in `CLOUD_HUB_URL`.
 
-Mini-Ops does not include a Hub implementation in this repository today. Cloud
-Push is the local agent contract for a future self-hosted or hosted multi-server
-Hub. The standalone open-source VPS panel remains the primary product surface.
+Mini-Ops does not send Cloud Push traffic unless the operator explicitly enables
+it and provides a destination URL, agent id, and agent token.
 
 ---
 
 ## What is Cloud Push?
 
 Cloud Push is an optional background task that periodically sends server metrics
-from a Mini-Ops agent to a central Hub-compatible API. Its purpose is to support
-a future multi-server dashboard while keeping the local single-server app useful
-without any external service.
+from a Mini-Ops agent to the configured API endpoint:
+
+```text
+{CLOUD_HUB_URL}/api/v1/agents/push
+```
 
 The module is compiled into the open-source binary, but it is completely dormant
 by default.
@@ -47,7 +48,7 @@ Each push is a JSON payload containing:
 | `system` | CPU %, RAM, disk usage, load average, OS/kernel version, uptime | Core server health metrics |
 | `docker` | Container names, images, running/stopped state | Container fleet overview |
 | `security.ssh_hardening_score` | Severity-aware local security score, 0-100 | Security posture summary |
-| `security.fail2ban_active` | bool | Intrusion prevention status |
+| `security.fail2ban_active` | bool | `systemctl is-active fail2ban` result summarized as a boolean |
 | `security.ufw_enabled` | bool | Firewall status |
 | `security.open_ports` | List of local listening TCP ports detected by the security audit | Exposure overview |
 | `security.last_ssh_login` | Username + source IP + timestamp + `is_trusted` flag | Login activity across servers |
@@ -57,9 +58,8 @@ Each push is a JSON payload containing:
 ### Sensitive fields note
 
 `last_ssh_login.ip`, `trusted_ips`, `hostname`, `server_name`, and `open_ports`
-can reveal operational details about your infrastructure. This is intentional
-for the multi-server use case, but it means the destination must be trustworthy.
-Only point `CLOUD_HUB_URL` at an endpoint you control or fully trust.
+can reveal operational details about your infrastructure. Only point
+`CLOUD_HUB_URL` at an endpoint you control or fully trust.
 
 ---
 
@@ -107,15 +107,11 @@ Do not set `CLOUD_PUSH_ENABLED=true`. You can also remove or comment out all
 
 ---
 
-## Current Scope And Future Hub
+## Current Behavior
 
-| | Open-source repo today | Future Hub path |
-|-|------------------------|-----------------|
-| Local VPS dashboard | Yes | Yes, agent remains local-first |
-| Cloud Push client | Yes, dormant by default | Yes, opt-in |
-| Data leaves server | Never without opt-in | Only to the configured Hub endpoint |
-| Multi-server dashboard | Not implemented in this repo | Planned MVP direction |
-| Hub source code | Not present in this repo | To be decided separately |
-
-Commercial or hosted Hub work should not weaken the local-first behavior of the
-open-source agent.
+- Cloud Push is compiled in but inactive unless `CLOUD_PUSH_ENABLED=true`.
+- If any required Cloud Push setting is missing, the push loop does not start.
+- No data is sent to any Mini-Ops-operated service by default.
+- Payloads are sent only to the configured `CLOUD_HUB_URL`.
+- HTTPS is required by default; `CLOUD_PUSH_ALLOW_HTTP=true` is only for local
+  testing.

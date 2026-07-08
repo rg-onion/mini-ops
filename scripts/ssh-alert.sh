@@ -23,6 +23,10 @@ TIMESTAMP=$(date +%s)
 API_URL="${MINI_OPS_API_URL:-http://127.0.0.1:3000/api/internal/ssh-login}"
 TOKEN_FILE="${MINI_OPS_INTERNAL_TOKEN_FILE:-/opt/mini-ops/mini-ops-internal.token}"
 
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 # Read internal token
 INTERNAL_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null || echo "")
 
@@ -37,7 +41,7 @@ fi
 curl -sS --connect-timeout 1 --max-time 3 -X POST "$API_URL" \
     -H "Authorization: Bearer $INTERNAL_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "{\"user\":\"$USER\",\"ip\":\"$IP\",\"method\":\"$METHOD\",\"timestamp\":$TIMESTAMP}" \
+    -d "{\"user\":\"$(json_escape "$USER")\",\"ip\":\"$(json_escape "$IP")\",\"method\":\"$(json_escape "$METHOD")\",\"timestamp\":$TIMESTAMP}" \
     >> /var/log/ssh-alert.log 2>&1 &
 
 exit 0

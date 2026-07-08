@@ -4,11 +4,22 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useTranslation } from "react-i18next";
 import { Pause, Play, Clock, Trash2, X, Download } from "lucide-react";
-import { BASE_URL, getAuthHeaders } from "@/api";
+import { BASE_URL, getAuthHeaders, handleUnauthorizedResponse } from "@/api";
 
 interface LogViewerProps {
     containerId: string;
     onClose: () => void;
+}
+
+const MAX_LOG_LINES = 10000;
+const MAX_PENDING_LOG_LINES = 2000;
+
+function capLogs(logs: string[]) {
+    return logs.length > MAX_LOG_LINES ? logs.slice(-MAX_LOG_LINES) : logs;
+}
+
+function currentUnixSeconds() {
+    return Math.floor(Date.now() / 1000);
 }
 
 export function LogViewer({ containerId, onClose }: LogViewerProps) {
@@ -18,18 +29,49 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
     const [isPaused, setIsPaused] = useState(false);
     const [timeRange, setTimeRange] = useState<{ tail?: string, since?: number, labelKey: string }>({ tail: "1000", labelKey: "last_1000" });
     const [searchTerm, setSearchTerm] = useState("");
+    const [pendingCount, setPendingCount] = useState(0);
+    const [droppedPendingCount, setDroppedPendingCount] = useState(0);
 
     const scrollRef = useRef<HTMLDivElement>(null);
     const abortRef = useRef<AbortController | null>(null);
     const isPausedRef = useRef(false);
     const pendingLogsRef = useRef<string[]>([]);
+    const droppedPendingRef = useRef(0);
+    const hasAuthToken = Boolean(getAuthHeaders()["Authorization"]);
+    const authErrorLog = `--- ${t('common.error')}: ${t('containers.logs_control.no_auth_token')} ---`;
+    const displayedStatus = hasAuthToken ? status : "error";
+    const displayedLogs = useMemo(
+        () => (hasAuthToken ? logs : [authErrorLog]),
+        [authErrorLog, hasAuthToken, logs]
+    );
+
+    const resetPendingRefs = () => {
+        pendingLogsRef.current = [];
+        droppedPendingRef.current = 0;
+    };
+
+    const resetPendingBuffer = () => {
+        resetPendingRefs();
+        setPendingCount(0);
+        setDroppedPendingCount(0);
+    };
+
+    const queuePendingLog = (payload: string) => {
+        pendingLogsRef.current.push(payload);
+
+        const overflow = pendingLogsRef.current.length - MAX_PENDING_LOG_LINES;
+        if (overflow <= 0) return 0;
+
+        pendingLogsRef.current.splice(0, overflow);
+        droppedPendingRef.current += overflow;
+        return overflow;
+    };
 
     useEffect(() => {
+        resetPendingRefs();
         const authHeaders = getAuthHeaders();
 
         if (!authHeaders["Authorization"]) {
-            setLogs([`--- ${t('common.error')}: No Auth Token Found ---`]);
-            setStatus("error");
             return;
         }
 
@@ -47,6 +89,11 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                     signal: controller.signal,
                 });
 
+                if (handleUnauthorizedResponse(response)) {
+                    setStatus("error");
+                    return;
+                }
+
                 if (!response.ok || !response.body) {
                     setStatus("error");
                     setLogs([`--- ${t('common.error')}: ${response.statusText} ---`]);
@@ -54,7 +101,7 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                 }
 
                 setStatus("connected");
-                setLogs(["--- Log Stream Started (SSE) ---"]);
+                setLogs([`--- ${t('containers.logs_control.stream_started')} ---`]);
 
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
@@ -67,6 +114,8 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                     buffer += decoder.decode(value, { stream: true });
                     const lines = buffer.split("\n");
                     buffer = lines.pop() ?? "";
+                    let queuedWhilePaused = false;
+                    let droppedThisChunk = 0;
 
                     for (const line of lines) {
                         const normalized = line.replace(/\r$/, "");
@@ -75,22 +124,29 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         if (!payload) continue;
 
                         if (isPausedRef.current) {
-                            pendingLogsRef.current.push(payload);
+                            queuedWhilePaused = true;
+                            droppedThisChunk += queuePendingLog(payload);
                         } else {
                             setLogs((prev: string[]) => {
-                                const newLogs = [...prev, payload];
-                                return newLogs.length > 10000 ? newLogs.slice(-10000) : newLogs;
+                                return capLogs([...prev, payload]);
                             });
                         }
+                    }
+
+                    if (queuedWhilePaused) {
+                        setPendingCount(pendingLogsRef.current.length);
+                    }
+                    if (droppedThisChunk > 0) {
+                        setDroppedPendingCount(droppedPendingRef.current);
                     }
                 }
 
                 setStatus("closed");
-                setLogs((prev: string[]) => [...prev, "--- Stream Closed ---"]);
-            } catch (e: any) {
-                if (e?.name === "AbortError") return;
+                setLogs((prev: string[]) => capLogs([...prev, `--- ${t('containers.logs_control.stream_closed')} ---`]));
+            } catch (e: unknown) {
+                if (e instanceof DOMException && e.name === "AbortError") return;
                 setStatus("error");
-                setLogs((prev: string[]) => [...prev, `--- ${t('common.error')} (See Console) ---`]);
+                setLogs((prev: string[]) => capLogs([...prev, `--- ${t('common.error')} (${t('containers.logs_control.see_console')}) ---`]));
             }
         };
 
@@ -99,13 +155,13 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
         return () => {
             controller.abort();
         };
-    }, [containerId, t, timeRange]);
+    }, [containerId, hasAuthToken, t, timeRange]);
 
     const filteredLogs = useMemo(() => {
-        if (!searchTerm) return logs;
+        if (!searchTerm) return displayedLogs;
         const lowerTerm = searchTerm.toLowerCase();
-        return logs.filter(log => log.toLowerCase().includes(lowerTerm));
-    }, [logs, searchTerm]);
+        return displayedLogs.filter(log => log.toLowerCase().includes(lowerTerm));
+    }, [displayedLogs, searchTerm]);
 
     useEffect(() => {
         if (!isPaused && scrollRef.current && !searchTerm) {
@@ -113,12 +169,16 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
         }
     }, [logs, isPaused, searchTerm]);
 
-    const clearLogs = () => setLogs([]);
+    const clearLogs = () => {
+        setLogs([]);
+        resetPendingBuffer();
+    };
 
     const handleTimeSelect = (labelKey: string, tail?: string, minutes?: number) => {
         setLogs([]);
+        resetPendingBuffer();
         if (minutes) {
-            const since = Math.floor(Date.now() / 1000) - (minutes * 60);
+            const since = currentUnixSeconds() - (minutes * 60);
             setTimeRange({ since, labelKey });
         } else {
             setTimeRange({ tail, labelKey });
@@ -177,8 +237,8 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                     <h3 className="font-semibold flex items-center gap-2 min-w-0">
                         <Clock className="w-4 h-4 text-muted-foreground shrink-0" />
                         <span className="truncate">{containerId.substring(0, 12)}</span>
-                        <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded shrink-0 ${statusColors[status]}`}>
-                            {t(`common.status.${status}`)}
+                        <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded shrink-0 ${statusColors[displayedStatus]}`}>
+                            {t(`common.status.${displayedStatus}`)}
                         </span>
                     </h3>
 
@@ -222,18 +282,37 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                                 const next = !isPaused;
                                 setIsPaused(next);
                                 isPausedRef.current = next;
+                                if (next) {
+                                    resetPendingBuffer();
+                                }
                                 if (!next && pendingLogsRef.current.length > 0) {
                                     const pending = pendingLogsRef.current;
+                                    const dropped = droppedPendingRef.current;
                                     pendingLogsRef.current = [];
+                                    droppedPendingRef.current = 0;
+                                    setPendingCount(0);
+                                    setDroppedPendingCount(0);
                                     setLogs((prev) => {
-                                        const merged = [...prev, ...pending];
-                                        return merged.length > 10000 ? merged.slice(-10000) : merged;
+                                        const droppedNotice = dropped > 0
+                                            ? [`--- ${t('containers.logs_control.dropped_pending', { count: dropped })} ---`]
+                                            : [];
+                                        return capLogs([...prev, ...droppedNotice, ...pending]);
                                     });
                                 }
                             }}
+                            title={isPaused ? t('containers.logs_control.resume') : t('containers.logs_control.pause')}
                         >
                             {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
                         </Button>
+
+                        {isPaused && (pendingCount > 0 || droppedPendingCount > 0) && (
+                            <span className="hidden md:inline-flex items-center rounded bg-amber-500/10 px-2 py-1 text-[10px] text-amber-300">
+                                {t('containers.logs_control.pending_count', { count: pendingCount })}
+                                {droppedPendingCount > 0
+                                    ? ` / ${t('containers.logs_control.dropped_count', { count: droppedPendingCount })}`
+                                    : ""}
+                            </span>
+                        )}
 
                         <Button
                             variant="ghost"
@@ -299,7 +378,9 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
 
                 {/* ── Row 3: quick filters ──────────────────────────────── */}
                 <div className="flex items-center gap-2 px-3 pb-2 overflow-x-auto">
-                    <span className="text-[10px] text-white/40 uppercase font-medium shrink-0">Quick Filter:</span>
+                    <span className="text-[10px] text-white/40 uppercase font-medium shrink-0">
+                        {t('containers.logs_control.quick_filter')}
+                    </span>
                     {(["ERROR", "WARN", "INFO"] as const).map((level) => (
                         <button
                             key={level}
@@ -317,7 +398,7 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                     ))}
                     {searchTerm && !["ERROR", "WARN", "INFO"].includes(searchTerm) && (
                         <span className="text-[10px] text-white/70 bg-white/10 px-2 py-0.5 rounded shrink-0">
-                            Searching: "{searchTerm}" ({filteredLogs.length} matches)
+                            {t('containers.logs_control.searching', { term: searchTerm, count: filteredLogs.length })}
                         </span>
                     )}
                 </div>
@@ -337,7 +418,9 @@ export function LogViewer({ containerId, onClose }: LogViewerProps) {
                         ))
                     ) : (
                         <div className="text-white/30 italic text-center py-10">
-                            {logs.length > 0 ? "No matches found." : "Waiting for logs..."}
+                            {displayedLogs.length > 0
+                                ? t('containers.logs_control.no_matches')
+                                : t('containers.logs_control.waiting')}
                         </div>
                     )}
                     <div ref={scrollRef} className="h-px" />

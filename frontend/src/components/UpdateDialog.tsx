@@ -1,13 +1,15 @@
-import { useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Terminal } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { BASE_URL, getAuthHeaders } from "@/api";
+import { BASE_URL, getAuthHeaders, handleUnauthorizedResponse } from "@/api";
 
 interface UpdateDialogProps {
     open: boolean;
     onOpenChange: (open: boolean) => void;
 }
+
+const MAX_UPDATE_LOGS = 500;
 
 export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
     const { t } = useTranslation();
@@ -15,35 +17,21 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
     const [status, setStatus] = useState<"idle" | "connecting" | "connected" | "error" | "complete">("idle");
     const abortRef = useRef<AbortController | null>(null);
     const bottomRef = useRef<HTMLDivElement>(null);
+    const startedRef = useRef(false);
 
-    useEffect(() => {
-        if (open && status === "idle") {
-            startUpdate();
-        }
+    const appendLog = useCallback((message: string) => {
+        setLogs(prev => {
+            const next = [...prev, message];
+            return next.length > MAX_UPDATE_LOGS ? next.slice(-MAX_UPDATE_LOGS) : next;
+        });
+    }, []);
 
-        return () => {
-            if (abortRef.current) {
-                abortRef.current.abort();
-                abortRef.current = null;
-            }
-        };
-    }, [open]);
-
-    useEffect(() => {
-        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [logs]);
-
-    useEffect(() => {
-        if (status !== "complete") return;
-        const timer = window.setTimeout(() => window.location.reload(), 5000);
-        return () => window.clearTimeout(timer);
-    }, [status]);
-
-    const startUpdate = async () => {
+    const startUpdate = useCallback(async () => {
+        setLogs([]);
         try {
             const authHeaders = getAuthHeaders();
             if (!authHeaders["Authorization"]) {
-                setLogs(prev => [...prev, `❌ ${t('common.error')}: No auth token`]);
+                appendLog(`❌ ${t('common.error')}: No auth token`);
                 setStatus("error");
                 return;
             }
@@ -52,13 +40,16 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
                 headers: authHeaders,
             });
 
+            if (handleUnauthorizedResponse(res)) return;
+
             if (!res.ok) {
-                setLogs(prev => [...prev, `❌ ${t('common.error')}: ${res.statusText}`]);
+                const detail = (await res.text()).trim() || res.statusText;
+                appendLog(`❌ ${t('common.error')}: ${detail}`);
                 setStatus("error");
                 return;
             }
 
-            setLogs(prev => [...prev, `✅ ${t('update.success_trigger')}`]);
+            appendLog(`✅ ${t('update.success_trigger')}`);
             setStatus("connecting");
 
             const controller = new AbortController();
@@ -69,14 +60,17 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
                 signal: controller.signal,
             });
 
+            if (handleUnauthorizedResponse(streamResp)) return;
+
             if (!streamResp.ok || !streamResp.body) {
-                setLogs(prev => [...prev, `❌ ${t('update.ws_error')}`]);
+                const detail = (await streamResp.text()).trim() || t('update.ws_error');
+                appendLog(`❌ ${detail}`);
                 setStatus("error");
                 return;
             }
 
             setStatus("connected");
-            setLogs(prev => [...prev, `📡 ${t('update.ws_connected')}`]);
+            appendLog(`📡 ${t('update.ws_connected')}`);
 
             const reader = streamResp.body.getReader();
             const decoder = new TextDecoder();
@@ -97,26 +91,77 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
                     const eventData = normalized.slice(5).trimStart();
                     if (!eventData) continue;
 
-                    setLogs(prev => [...prev, eventData]);
+                    appendLog(eventData);
                     if (eventData.includes("Update complete!")) {
                         setStatus("complete");
+                        controller.abort();
+                        return;
+                    }
+                    if (eventData.includes("Update failed")) {
+                        setStatus("error");
                         controller.abort();
                         return;
                     }
                 }
             }
 
-            setLogs(prev => [...prev, `🔌 ${t('update.ws_closed')}`]);
+            appendLog(`🔌 ${t('update.ws_closed')}`);
 
-        } catch (e: any) {
-            if (e?.name === "AbortError") return;
-            setLogs(prev => [...prev, `❌ Exception: ${e.message}`]);
+        } catch (e: unknown) {
+            if (e instanceof DOMException && e.name === "AbortError") return;
+            const message = e instanceof Error ? e.message : String(e);
+            appendLog(`❌ Exception: ${message}`);
             setStatus("error");
         }
+    }, [appendLog, t]);
+
+    useEffect(() => {
+        if (!open) {
+            if (abortRef.current) {
+                abortRef.current.abort();
+                abortRef.current = null;
+            }
+            startedRef.current = false;
+            return;
+        }
+
+        if (!startedRef.current) {
+            startedRef.current = true;
+            const startTimer = window.setTimeout(() => {
+                startUpdate();
+            }, 0);
+            return () => window.clearTimeout(startTimer);
+        }
+    }, [open, startUpdate]);
+
+    useEffect(() => {
+        return () => {
+            if (abortRef.current) {
+                abortRef.current.abort();
+                abortRef.current = null;
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [logs]);
+
+    useEffect(() => {
+        if (status !== "complete") return;
+        const timer = window.setTimeout(() => window.location.reload(), 5000);
+        return () => window.clearTimeout(timer);
+    }, [status]);
+
+    const handleOpenChange = (nextOpen: boolean) => {
+        if (!nextOpen) {
+            setStatus("idle");
+        }
+        onOpenChange(nextOpen);
     };
 
     return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
+        <Dialog open={open} onOpenChange={handleOpenChange}>
             <DialogContent className="sm:max-w-[600px] bg-background">
                 <DialogHeader>
                     <DialogTitle className="flex items-center gap-2">

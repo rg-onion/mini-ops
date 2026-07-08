@@ -1,10 +1,15 @@
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import type { SystemStats } from "@/types";
+
+type StatsChartPoint = SystemStats & {
+    ram_percent?: number;
+};
 
 interface StatsChartProps {
-    data: any[];
+    data: StatsChartPoint[];
     title: string;
-    dataKey: string;
+    dataKey: keyof StatsChartPoint;
     color: string;
 }
 

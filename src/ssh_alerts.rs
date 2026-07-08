@@ -49,16 +49,18 @@ pub struct SshLoginLog {
 pub struct SshAlertsService {
     db: SqlitePool,
     notifier: Arc<NotificationService>,
+    retention_days: i64,
     internal_token: Mutex<String>,
     // IP -> last_alert_time
     rate_limiter: Mutex<HashMap<String, Instant>>,
 }
 
 impl SshAlertsService {
-    pub fn new(db: SqlitePool, notifier: Arc<NotificationService>) -> Self {
+    pub fn new(db: SqlitePool, notifier: Arc<NotificationService>, retention_days: i64) -> Self {
         Self {
             db,
             notifier,
+            retention_days,
             internal_token: Mutex::new(String::new()),
             rate_limiter: Mutex::new(HashMap::new()),
         }
@@ -77,13 +79,12 @@ impl SshAlertsService {
             if t.is_empty() {
                 return Err("Internal token not configured".to_string());
             }
-            if token != *t {
+            if !crate::auth::constant_time_eq(token, &t) {
                 return Err("Invalid internal token".to_string());
             }
         }
 
-        // Validate IP address format to prevent storage of arbitrary values
-        validate_ip(&event.ip)?;
+        validate_login_event(&event)?;
 
         // Rate limiting (10s per IP)
         {
@@ -123,7 +124,10 @@ impl SshAlertsService {
 
         let msg_tg = format!(
             "🔐 *SSH Login Detected*\n\n*User:* `{}`\n*IP:* `{}`\n*Method:* `{}`\n*Time:* `{}`",
-            event.user, event.ip, event.method, date_str
+            escape_markdown_code(&event.user),
+            escape_markdown_code(&event.ip),
+            escape_markdown_code(&event.method),
+            escape_markdown_code(&date_str)
         );
 
         self.notifier.send_alert(&msg_tg).await;
@@ -143,6 +147,18 @@ impl SshAlertsService {
         .execute(&self.db)
         .await
         .map_err(|e| tracing::error!("Failed to save SSH log: {}", e));
+
+        match crate::retention::prune_ssh_logins(
+            &self.db,
+            Utc::now().timestamp(),
+            self.retention_days,
+        )
+        .await
+        {
+            Ok(rows) if rows > 0 => tracing::info!("Pruned {} old SSH login rows", rows),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to prune old SSH login rows: {}", e),
+        }
     }
 
     pub async fn get_logs(&self) -> Result<Vec<SshLoginLog>, sqlx::Error> {
@@ -202,6 +218,41 @@ impl SshAlertsService {
     }
 }
 
+fn validate_login_event(event: &SshLoginEvent) -> Result<(), String> {
+    validate_ip(&event.ip)?;
+    validate_bounded_field("user", &event.user, 64)?;
+    validate_bounded_field("method", &event.method, 32)?;
+
+    match event.method.as_str() {
+        "ssh" | "password" | "publickey" | "keyboard-interactive" | "unknown" => {}
+        _ => return Err(format!("Invalid SSH auth method: '{}'", event.method)),
+    }
+
+    let now = Utc::now().timestamp();
+    if event.timestamp < 0 || event.timestamp > now + 300 {
+        return Err("Invalid SSH login timestamp".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_bounded_field(name: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{} cannot be empty", name));
+    }
+    if value.len() > max_len {
+        return Err(format!("{} is too long", name));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{} contains control characters", name));
+    }
+    Ok(())
+}
+
+fn escape_markdown_code(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('`', "\\`")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +295,28 @@ mod tests {
         assert!(validate_ip("1.2.3").is_err());
         assert!(validate_ip("not_an_ip").is_err());
         assert!(validate_ip("192.168.1.1; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn test_validate_login_event_rejects_bad_method_and_future_time() {
+        let event = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "192.168.1.1".to_string(),
+            timestamp: Utc::now().timestamp() + 600,
+            method: "ssh".to_string(),
+        };
+        assert!(validate_login_event(&event).is_err());
+
+        let event = SshLoginEvent {
+            timestamp: Utc::now().timestamp(),
+            method: "bad method".to_string(),
+            ..event
+        };
+        assert!(validate_login_event(&event).is_err());
+    }
+
+    #[test]
+    fn test_escape_markdown_code() {
+        assert_eq!(escape_markdown_code("a`b\\c"), "a\\`b\\\\c");
     }
 }

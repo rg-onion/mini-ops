@@ -4,7 +4,14 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -18,15 +25,22 @@ import { LogViewer } from "./LogViewer";
 import { apiFetch } from "@/api";
 import { useTranslation } from "react-i18next";
 
+type ContainerAction = "start" | "stop" | "restart";
+type PendingContainerAction = {
+    id: string;
+    name: string;
+    action: ContainerAction;
+};
+
 async function fetchContainers(): Promise<ContainerInfo[]> {
     const res = await apiFetch("/docker/containers");
     if (!res.ok) throw new Error("Failed to fetch containers");
     return res.json();
 }
 
-async function containerAction({ id, action }: { id: string; action: string }) {
+async function containerAction({ id, action }: { id: string; action: ContainerAction }) {
     const res = await apiFetch(`/docker/containers/${id}/${action}`, { method: "POST" });
-    if (!res.ok) throw new Error(`Failed to ${action} container`);
+    if (!res.ok) throw new Error((await res.text()) || res.statusText || `HTTP ${res.status}`);
     return res;
 }
 
@@ -34,6 +48,7 @@ export default function ContainerList() {
     const { t } = useTranslation();
     const queryClient = useQueryClient();
     const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+    const [pendingAction, setPendingAction] = useState<PendingContainerAction | null>(null);
 
     const { data: containers, isLoading, error } = useQuery({
         queryKey: ["containers"],
@@ -44,13 +59,28 @@ export default function ContainerList() {
     const mutation = useMutation({
         mutationFn: containerAction,
         onSuccess: (_data, variables) => {
-            toast.success(t('containers.success_action', { action: variables.action }));
+            toast.success(t('containers.success_action', { action: t(`containers.${variables.action}`) }));
             queryClient.invalidateQueries({ queryKey: ["containers"] });
         },
         onError: (error) => {
             toast.error(t('containers.error_action', { error: error.message }));
         }
     });
+
+    const requestAction = (container: ContainerInfo, action: ContainerAction) => {
+        setPendingAction({
+            id: container.id,
+            name: container.name.replace(/^\//, ''),
+            action,
+        });
+    };
+
+    const confirmAction = () => {
+        if (!pendingAction) return;
+
+        mutation.mutate({ id: pendingAction.id, action: pendingAction.action });
+        setPendingAction(null);
+    };
 
     if (isLoading) return <div className="p-8">{t('containers.loading')}</div>;
     if (error) return <div className="p-8 text-destructive">{t('containers.error_loading')}</div>;
@@ -117,7 +147,7 @@ export default function ContainerList() {
                                         <DropdownMenu>
                                             <DropdownMenuTrigger asChild>
                                                 <Button variant="ghost" className="h-8 w-8 p-0 ring-offset-background outline-none">
-                                                    <span className="sr-only">Open menu</span>
+                                                    <span className="sr-only">{t('common.open_menu')}</span>
                                                     <MoreHorizontal className="h-4 w-4" />
                                                 </Button>
                                             </DropdownMenuTrigger>
@@ -125,15 +155,15 @@ export default function ContainerList() {
                                                 <DropdownMenuLabel>{t('containers.actions')}</DropdownMenuLabel>
                                                 {c.state === "running" ? (
                                                     <>
-                                                        <DropdownMenuItem onClick={() => mutation.mutate({ id: c.id, action: "stop" })}>
+                                                        <DropdownMenuItem onClick={() => requestAction(c, "stop")}>
                                                             <Square className="mr-2 h-4 w-4 text-destructive" /> {t('containers.stop')}
                                                         </DropdownMenuItem>
-                                                        <DropdownMenuItem onClick={() => mutation.mutate({ id: c.id, action: "restart" })}>
+                                                        <DropdownMenuItem onClick={() => requestAction(c, "restart")}>
                                                             <RefreshCcw className="mr-2 h-4 w-4" /> {t('containers.restart')}
                                                         </DropdownMenuItem>
                                                     </>
                                                 ) : (
-                                                    <DropdownMenuItem onClick={() => mutation.mutate({ id: c.id, action: "start" })}>
+                                                    <DropdownMenuItem onClick={() => requestAction(c, "start")}>
                                                         <Play className="mr-2 h-4 w-4 text-emerald-500" /> {t('containers.start')}
                                                     </DropdownMenuItem>
                                                 )}
@@ -149,10 +179,42 @@ export default function ContainerList() {
 
             <Dialog open={!!selectedLogId} onOpenChange={(open) => !open && setSelectedLogId(null)}>
                 <DialogContent className="flex flex-col p-0 gap-0 h-[100dvh] rounded-none sm:h-[80vh] sm:max-w-[800px] sm:rounded-lg [&>button]:hidden">
-                    <DialogTitle className="sr-only">Container Logs</DialogTitle>
-                    <DialogDescription className="sr-only">Real-time logs for the selected container</DialogDescription>
+                    <DialogTitle className="sr-only">{t('containers.logs_dialog_title')}</DialogTitle>
+                    <DialogDescription className="sr-only">{t('containers.logs_dialog_description')}</DialogDescription>
                     {selectedLogId && <LogViewer containerId={selectedLogId} onClose={() => setSelectedLogId(null)} />}
                 </DialogContent>
+            </Dialog>
+
+            <Dialog open={!!pendingAction} onOpenChange={(open) => !open && setPendingAction(null)}>
+                {pendingAction && (
+                    <DialogContent>
+                        <DialogHeader>
+                            <DialogTitle>
+                                {t('containers.confirm_action_title', { action: t(`containers.${pendingAction.action}`) })}
+                            </DialogTitle>
+                            <DialogDescription>
+                                {t('containers.confirm_action_description', {
+                                    action: t(`containers.${pendingAction.action}`),
+                                    name: pendingAction.name,
+                                })}
+                            </DialogDescription>
+                        </DialogHeader>
+                        <DialogFooter>
+                            <Button variant="outline" onClick={() => setPendingAction(null)}>
+                                {t('common.cancel')}
+                            </Button>
+                            <Button
+                                variant={pendingAction.action === "start" ? "default" : "destructive"}
+                                onClick={confirmAction}
+                                disabled={mutation.isPending}
+                            >
+                                {t('containers.confirm_action_button', {
+                                    action: t(`containers.${pendingAction.action}`),
+                                })}
+                            </Button>
+                        </DialogFooter>
+                    </DialogContent>
+                )}
             </Dialog>
         </div>
     );

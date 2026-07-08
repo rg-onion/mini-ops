@@ -27,14 +27,6 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 
 ---
 
-## 📸 Скриншоты
-
-| Дашборд | Аудит безопасности |
-|---------|--------------------|
-| *Добавить ссылку на скриншот* | *Добавить ссылку на скриншот* |
-
----
-
 ## 🚀 Быстрый старт
 
 ### 1. Установка
@@ -58,10 +50,12 @@ cp .env.example .env
 ```
 
 Минимально необходимые переменные:
-```env
-AUTH_TOKEN=change-me-strong-random-token
+```bash
+AUTH_TOKEN="$(openssl rand -hex 32)"
+```
 
-# Опционально:
+Опционально:
+```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 DATABASE_URL=sqlite:mini-ops.db
@@ -91,12 +85,17 @@ EOF
 sudo systemctl enable --now mini-ops
 ```
 
-Доступ к дашборду: **http://your-server-ip:8090**
+В этом ручном примере Mini-Ops по умолчанию слушает
+**http://127.0.0.1:3000**. Перед внешней публикацией настройте reverse proxy
+или явно задайте `APP_HOST`/`APP_PORT`.
 
 **Автоматическая установка (Ubuntu, рекомендуется):**
 ```bash
 DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 ```
+Доступ при bootstrap-настройках по умолчанию:
+**http://your-server-ip:8090** через сгенерированный plain-HTTP Nginx reverse
+proxy.
 
 Подробнее см. [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
 
@@ -104,8 +103,12 @@ DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 
 ## 🌐 Сетевые режимы
 
-- **Test mode (без SSL)**: прямой доступ к `http://server-ip:8090` для тестов.
-- **Production mode (SSL)**: запускайте Mini-Ops за Nginx/Caddy/Cloudflare Tunnel и используйте только HTTPS.
+- **Bootstrap test access по умолчанию**: `http://server-ip:8090` через
+  сгенерированный Nginx config. Это plain HTTP для lab/internal тестов.
+- **Production mode**: `DEPLOY_MODE=production` не включает сгенерированный
+  plain-HTTP Nginx proxy, если явно не задать `DEPLOY_SETUP_NGINX=1`.
+- **Production exposure**: добавьте TLS через Nginx/Caddy/Cloudflare Tunnel
+  или ограничьте доступ private network/VPN. Не публикуйте `3000` напрямую.
 
 ---
 
@@ -137,14 +140,18 @@ DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 ## 🔒 Безопасность
 
 Mini-Ops разработан с учетом безопасности:
-- **Внутренние токены**: Интеграция с PAM использует безопасные, эфемерные токены.
-- **Rate Limiting**: Защита от перебора паролей.
+- **Внутренний PAM-токен**: SSH alerts используют случайный токен,
+  сгенерированный при старте и прочитанный localhost PAM hook.
+- **Throttling SSH alerts**: повторные уведомления о SSH-входах ограничиваются
+  по source IP.
 - **Защищенный API**: все публичные ручки требуют `AUTH_TOKEN`.
 
 Рекомендации для продакшена:
 - Используйте HTTPS reverse proxy.
-- Не открывайте порт `3000` публично без TLS.
+- Не открывайте порты `3000` или `8090` публично без TLS/сетевого ограничения.
 - Запускайте сервис от отдельного пользователя (non-root).
+- Держите update из dashboard выключенным, если он явно не нужен
+  (`MINI_OPS_ALLOW_WEB_UPDATE=false` по умолчанию).
 
 Подробнее: [docs/SECURITY.ru.md](docs/SECURITY.ru.md).
 

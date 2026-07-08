@@ -31,14 +31,6 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 
 ---
 
-## 📸 Screenshots
-
-| Dashboard | Security Audit |
-|-----------|----------------|
-| *Add screenshot link here* | *Add screenshot link here* |
-
----
-
 ## 🚀 Quick Start
 
 ### 1. Installation
@@ -62,10 +54,12 @@ cp .env.example .env
 ```
 
 Minimal required variable:
-```env
-AUTH_TOKEN=change-me-strong-random-token
+```bash
+AUTH_TOKEN="$(openssl rand -hex 32)"
+```
 
-# Optional:
+Optional:
+```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 DATABASE_URL=sqlite:mini-ops.db
@@ -95,15 +89,25 @@ EOF
 sudo systemctl enable --now mini-ops
 ```
 
-Access dashboard at: **http://your-server-ip:8090**
+With this manual service example, Mini-Ops listens on
+**http://127.0.0.1:3000** by default. Put it behind a reverse proxy or set
+`APP_HOST`/`APP_PORT` intentionally before exposing it.
 
 Automated Ubuntu bootstrap (recommended for fast demo):
 ```bash
 DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
 ```
-Safe mode (no firewall or package changes):
+Default bootstrap access: **http://your-server-ip:8090** through the generated
+plain-HTTP Nginx reverse proxy.
+
+Reduced mutation mode (skip UFW/Fail2Ban, PAM hook, Nginx, and Docker automation):
 ```bash
-DEPLOY_HOST=your-server-ip DEPLOY_HARDENING=0 ./scripts/bootstrap_server.sh
+DEPLOY_HOST=your-server-ip \
+DEPLOY_HARDENING=0 \
+DEPLOY_ENABLE_SSH_ALERTS=0 \
+DEPLOY_SETUP_NGINX=0 \
+DEPLOY_INSTALL_DOCKER=0 \
+./scripts/bootstrap_server.sh
 ```
 Minimal mode (only uploads binary, no user/systemd/.env changes):
 ```bash
@@ -111,7 +115,7 @@ DEPLOY_HOST=your-server-ip DEPLOY_MINIMAL=1 ./scripts/bootstrap_server.sh
 ```
 Minimal + .env:
 ```bash
-DEPLOY_HOST=your-server-ip DEPLOY_MINIMAL=1 DEPLOY_WRITE_ENV=1 AUTH_TOKEN=your_strong_token ./scripts/bootstrap_server.sh
+DEPLOY_HOST=your-server-ip DEPLOY_MINIMAL=1 DEPLOY_WRITE_ENV=1 AUTH_TOKEN="$(openssl rand -hex 32)" ./scripts/bootstrap_server.sh
 ```
 Systemd only (rewrite unit + restart):
 ```bash
@@ -123,8 +127,12 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for full options.
 
 ## 🌐 Networking Modes
 
-- **Test mode (no SSL)**: direct access to `http://server-ip:8090` for lab/internal testing.
-- **Production mode (SSL)**: run Mini-Ops behind Nginx/Caddy/Cloudflare Tunnel and expose only HTTPS.
+- **Default bootstrap test access**: `http://server-ip:8090` via generated
+  Nginx config. This is plain HTTP and intended for lab/internal testing.
+- **Production mode**: `DEPLOY_MODE=production` does not enable the generated
+  plain-HTTP Nginx proxy unless you explicitly set `DEPLOY_SETUP_NGINX=1`.
+- **Production exposure**: add TLS with Nginx/Caddy/Cloudflare Tunnel or
+  restrict access to a private network/VPN. Do not expose `3000` directly.
 
 ---
 
@@ -156,14 +164,18 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for full options.
 ## 🔒 Security
 
 Mini-Ops is designed with security in mind:
-- **Internal Tokens**: PAM integration uses secure, ephemeral tokens generated at startup.
-- **Rate Limiting**: Brute-force protection for alerts.
+- **Internal PAM Token**: SSH alert integration uses a random token generated
+  at startup and read by the localhost PAM hook.
+- **SSH Alert Throttling**: repeated SSH login alerts are throttled per source
+  IP.
 - **Protected API**: all user-facing API routes require `AUTH_TOKEN`.
 
 Production recommendations:
 - Put Mini-Ops behind HTTPS reverse proxy (Nginx/Caddy/Cloudflare Tunnel).
 - Avoid exposing port `8090` publicly without TLS.
 - Run service as dedicated non-root user whenever possible.
+- Keep dashboard-triggered updates disabled unless explicitly needed
+  (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default).
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
 

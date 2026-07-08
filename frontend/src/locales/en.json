@@ -19,6 +19,8 @@
         "security_audit": "Security Audit",
         "refresh": "Refresh",
         "close": "Close",
+        "cancel": "Cancel",
+        "open_menu": "Open menu",
         "status": {
             "connecting": "Connecting",
             "connected": "Connected",
@@ -30,7 +32,9 @@
         "title": "Mini-Ops Login",
         "password_placeholder": "Enter Auth Token",
         "button": "Login",
-        "error": "Invalid token"
+        "error": "Invalid token",
+        "verify_error": "Could not verify token",
+        "verifying": "Verifying..."
     },
     "containers": {
         "title": "Containers",
@@ -49,9 +53,14 @@
         "state": "State",
         "ports": "Ports",
         "view_logs": "View Logs",
+        "logs_dialog_title": "Container Logs",
+        "logs_dialog_description": "Real-time logs for the selected container",
         "snapshots": "Snapshots",
-        "success_action": "Container {{action}}ed successfully",
+        "success_action": "{{action}} request sent successfully",
         "error_action": "Action failed: {{error}}",
+        "confirm_action_title": "Confirm {{action}}",
+        "confirm_action_description": "Run {{action}} for container {{name}}?",
+        "confirm_action_button": "{{action}}",
         "logs_control": {
             "pause": "Pause",
             "resume": "Resume",
@@ -65,6 +74,17 @@
             "last_24h": "Last 24 hours",
             "download": "Download Logs",
             "download_selection": "Download Selection",
+            "stream_started": "Log stream started",
+            "stream_closed": "Stream closed",
+            "no_auth_token": "No auth token found",
+            "see_console": "see console",
+            "quick_filter": "Quick filter:",
+            "searching": "Searching: \"{{term}}\" ({{count}} matches)",
+            "no_matches": "No matches found.",
+            "waiting": "Waiting for logs...",
+            "pending_count": "{{count}} pending",
+            "dropped_count": "{{count}} dropped",
+            "dropped_pending": "{{count}} paused log lines were dropped",
             "btn_100": "100",
             "btn_1k": "1k",
             "btn_15m": "15m",
@@ -107,6 +127,18 @@
         "check": "Check",
         "risk": "Risk",
         "message": "Message",
+        "events_title": "Security Events",
+        "event": "Event",
+        "last_seen": "Last seen",
+        "ack": "Ack",
+        "no_events": "No active security events",
+        "event_ack_success": "Security event acknowledged",
+        "event_ack_error": "Failed to acknowledge event",
+        "event_status": {
+            "open": "Open",
+            "acknowledged": "Acknowledged",
+            "resolved": "Resolved"
+        },
         "test_sent": "Test notification sent!",
         "test_fail": "Failed to send notification",
         "test_error": "Error sending notification"
@@ -130,19 +162,33 @@
         "title": "System Update",
         "success_trigger": "Update triggered. Connecting to log stream...",
         "success_complete": "Update complete. The page will reload in 5 seconds.",
-        "ws_connected": "WebSocket Connected.",
+        "ws_connected": "Log stream connected.",
         "ws_closed": "Connection closed.",
-        "ws_error": "WebSocket Error."
+        "ws_error": "Log stream error."
     },
     "ssh": {
+        "title": "SSH Security",
         "setup": {
             "btn": "Setup SSH",
             "success": "Setup successful",
-            "error": "Setup error"
+            "error": "Setup failed: {{error}}",
+            "confirm_title": "Setup SSH alerts?",
+            "confirm_description": "This will install or update SSH alert integration on this host."
         },
         "trusted": {
             "title": "Trusted IPs",
-            "added": "IP added to whitelist"
+            "added": "IP added to whitelist",
+            "add_error": "Failed to add IP: {{error}}",
+            "deleted": "Trusted IP deleted",
+            "delete_error": "Failed to delete IP: {{error}}",
+            "ip": "IP",
+            "description": "Description",
+            "ip_placeholder": "IP",
+            "description_placeholder": "Description",
+            "add": "Add trusted IP",
+            "delete": "Delete trusted IP",
+            "confirm_delete_title": "Delete trusted IP?",
+            "confirm_delete_description": "Remove {{ip}} from the trusted IP list?"
         },
         "logs": {
             "title": "SSH Logs"

@@ -19,6 +19,8 @@
         "security_audit": "Аудит безопасности",
         "refresh": "Обновить",
         "close": "Закрыть",
+        "cancel": "Отмена",
+        "open_menu": "Открыть меню",
         "status": {
             "connecting": "Подключение",
             "connected": "Подключено",
@@ -30,7 +32,9 @@
         "title": "Вход в Mini-Ops",
         "password_placeholder": "Введите Auth Token",
         "button": "Войти",
-        "error": "Неверный токен"
+        "error": "Неверный токен",
+        "verify_error": "Не удалось проверить токен",
+        "verifying": "Проверка..."
     },
     "containers": {
         "title": "Контейнеры",
@@ -49,9 +53,14 @@
         "state": "Статус",
         "ports": "Порты",
         "view_logs": "Логи",
+        "logs_dialog_title": "Логи контейнера",
+        "logs_dialog_description": "Логи выбранного контейнера в реальном времени",
         "snapshots": "Снапшоты",
-        "success_action": "Контейнер {{action}} успешно",
+        "success_action": "Запрос «{{action}}» отправлен",
         "error_action": "Ошибка: {{error}}",
+        "confirm_action_title": "Подтвердите: {{action}}",
+        "confirm_action_description": "Выполнить «{{action}}» для контейнера {{name}}?",
+        "confirm_action_button": "{{action}}",
         "logs_control": {
             "pause": "Пауза",
             "resume": "Продолжить",
@@ -65,6 +74,17 @@
             "last_24h": "За 24 часа",
             "download": "Скачать логи",
             "download_selection": "Скачать выделенное",
+            "stream_started": "Поток логов запущен",
+            "stream_closed": "Поток закрыт",
+            "no_auth_token": "Auth token не найден",
+            "see_console": "см. консоль",
+            "quick_filter": "Быстрый фильтр:",
+            "searching": "Поиск: \"{{term}}\" (совпадений: {{count}})",
+            "no_matches": "Совпадений нет.",
+            "waiting": "Ожидание логов...",
+            "pending_count": "в очереди: {{count}}",
+            "dropped_count": "сброшено: {{count}}",
+            "dropped_pending": "Сброшено строк во время паузы: {{count}}",
             "btn_100": "100",
             "btn_1k": "1k",
             "btn_15m": "15м",
@@ -107,6 +127,18 @@
         "check": "Проверка",
         "risk": "Риск",
         "message": "Описание",
+        "events_title": "События безопасности",
+        "event": "Событие",
+        "last_seen": "Последнее обнаружение",
+        "ack": "Принять",
+        "no_events": "Активных событий безопасности нет",
+        "event_ack_success": "Событие безопасности принято",
+        "event_ack_error": "Не удалось принять событие",
+        "event_status": {
+            "open": "Открыто",
+            "acknowledged": "Принято",
+            "resolved": "Решено"
+        },
         "test_sent": "Тестовое уведомление отправлено!",
         "test_fail": "Не удалось отправить уведомление",
         "test_error": "Ошибка при отправке уведомления"
@@ -130,19 +162,33 @@
         "title": "Обновление системы",
         "success_trigger": "Обновление запущено. Подключение к потоку логов...",
         "success_complete": "Обновление завершено. Страница перезагрузится через 5 секунд.",
-        "ws_connected": "WebSocket подключен.",
+        "ws_connected": "Поток логов подключен.",
         "ws_closed": "Соединение закрыто.",
-        "ws_error": "Ошибка WebSocket."
+        "ws_error": "Ошибка потока логов."
     },
     "ssh": {
+        "title": "Безопасность SSH",
         "setup": {
             "btn": "Настроить SSH",
             "success": "Успешно настроено",
-            "error": "Ошибка настройки"
+            "error": "Ошибка настройки: {{error}}",
+            "confirm_title": "Настроить SSH-уведомления?",
+            "confirm_description": "Это установит или обновит интеграцию SSH-уведомлений на этом хосте."
         },
         "trusted": {
             "title": "Доверенные IP",
-            "added": "IP добавлен в белый список"
+            "added": "IP добавлен в белый список",
+            "add_error": "Не удалось добавить IP: {{error}}",
+            "deleted": "Доверенный IP удален",
+            "delete_error": "Не удалось удалить IP: {{error}}",
+            "ip": "IP",
+            "description": "Описание",
+            "ip_placeholder": "IP",
+            "description_placeholder": "Описание",
+            "add": "Добавить доверенный IP",
+            "delete": "Удалить доверенный IP",
+            "confirm_delete_title": "Удалить доверенный IP?",
+            "confirm_delete_description": "Удалить {{ip}} из списка доверенных IP?"
         },
         "logs": {
             "title": "SSH Логи"

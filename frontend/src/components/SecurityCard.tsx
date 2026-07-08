@@ -47,7 +47,7 @@ export function SecurityCard() {
             } else {
                 toast.error(t('security.test_fail'));
             }
-        } catch (e) {
+        } catch {
             toast.error(t('security.test_error'));
         } finally {
             setSending(false);
@@ -87,7 +87,7 @@ export function SecurityCard() {
                     <Button variant="outline" size="sm" className="h-8 gap-1" asChild>
                         <Link to="/ssh">
                             <Shield className="h-3.5 w-3.5" />
-                            SSH Setup
+                            {t('ssh.setup.btn')}
                         </Link>
                     </Button>
                     <Button

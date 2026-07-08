@@ -4,12 +4,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::docker::DockerService;
 use crate::i18n::Lang;
 use crate::notifications::NotificationService;
+use crate::security_events::SecurityEventService;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SecurityCheck {
@@ -85,6 +87,75 @@ struct PortScanResult {
 }
 
 pub struct SecurityAuditor;
+
+#[derive(Clone)]
+pub struct SecurityAuditCache {
+    ttl: Duration,
+    cached: Arc<Mutex<Option<CachedSecurityAudit>>>,
+}
+
+#[derive(Clone)]
+struct CachedSecurityAudit {
+    lang: Lang,
+    created_at: Instant,
+    checks: Vec<SecurityCheck>,
+}
+
+impl SecurityAuditCache {
+    pub fn from_env() -> Self {
+        Self {
+            ttl: env_duration_secs("SECURITY_AUDIT_CACHE_TTL_SECS", 30, 0, 3600),
+            cached: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn get_or_run(
+        &self,
+        lang: Lang,
+        docker: Option<&DockerService>,
+    ) -> Vec<SecurityCheck> {
+        if self.ttl.as_secs() > 0 {
+            let cached = self.cached.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.lang == lang
+                && cached.created_at.elapsed() < self.ttl
+            {
+                return cached.checks.clone();
+            }
+        }
+
+        let checks = SecurityAuditor::run_audit(&lang, docker).await;
+
+        if self.ttl.as_secs() > 0 {
+            let mut cached = self.cached.lock().await;
+            *cached = Some(CachedSecurityAudit {
+                lang,
+                created_at: Instant::now(),
+                checks: checks.clone(),
+            });
+        }
+
+        checks
+    }
+}
+
+fn env_duration_secs(key: &str, default: u64, min: u64, max: u64) -> Duration {
+    parse_duration_secs(
+        std::env::var(key).ok().as_deref(),
+        default,
+        min,
+        max,
+    )
+}
+
+fn parse_duration_secs(value: Option<&str>, default: u64, min: u64, max: u64) -> Duration {
+    let seconds = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default);
+
+    Duration::from_secs(seconds)
+}
 
 impl SecurityAuditor {
     pub async fn run_audit(lang: &Lang, docker: Option<&DockerService>) -> Vec<SecurityCheck> {
@@ -727,8 +798,24 @@ impl SecurityAuditor {
             );
         };
 
-        match docker.audit_security_risks().await {
-            Ok(risks) if risks.is_empty() => SecurityCheck::new(
+        let docker_timeout = env_duration_secs("SECURITY_AUDIT_DOCKER_TIMEOUT_SECS", 10, 1, 120);
+        let audit_result = tokio::time::timeout(docker_timeout, docker.audit_security_risks()).await;
+
+        match audit_result {
+            Err(_) => SecurityCheck::new(
+                "docker.container_hardening",
+                name,
+                "docker",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.docker_containers.timeout", lang),
+                remediation,
+            )
+            .with_evidence(vec![format!(
+                "timeout_secs={}",
+                docker_timeout.as_secs()
+            )]),
+            Ok(Ok(risks)) if risks.is_empty() => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
                 "docker",
@@ -738,7 +825,7 @@ impl SecurityAuditor {
                 remediation,
             )
             .with_references(vec!["https://docs.docker.com/engine/security/"]),
-            Ok(risks) => {
+            Ok(Ok(risks)) => {
                 let has_critical = risks.iter().any(|risk| risk.severity == "critical");
                 let has_high = risks.iter().any(|risk| risk.severity == "high");
                 let severity = if has_critical {
@@ -788,7 +875,7 @@ impl SecurityAuditor {
 
                 check
             }
-            Err(e) => SecurityCheck::new(
+            Ok(Err(e)) => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
                 "docker",
@@ -805,21 +892,30 @@ impl SecurityAuditor {
 pub struct SecurityMonitor {
     notifier: Arc<NotificationService>,
     docker: Option<Arc<DockerService>>,
-    last_states: Mutex<HashMap<String, String>>,
+    events: Arc<SecurityEventService>,
+    interval: Duration,
 }
 
 impl SecurityMonitor {
-    pub fn new(notifier: Arc<NotificationService>, docker: Option<Arc<DockerService>>) -> Self {
+    pub fn new(
+        notifier: Arc<NotificationService>,
+        docker: Option<Arc<DockerService>>,
+        events: Arc<SecurityEventService>,
+    ) -> Self {
         Self {
             notifier,
             docker,
-            last_states: Mutex::new(HashMap::new()),
+            events,
+            interval: env_duration_secs("SECURITY_AUDIT_INTERVAL_SECS", 300, 60, 86_400),
         }
     }
 
     pub async fn run_loop(self: Arc<Self>) {
-        tracing::info!("Starting Security Monitor Loop...");
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        tracing::info!(
+            "Starting Security Monitor Loop with interval={}s",
+            self.interval.as_secs()
+        );
+        let mut interval = tokio::time::interval(self.interval);
 
         loop {
             interval.tick().await;
@@ -832,34 +928,52 @@ impl SecurityMonitor {
         let checks = SecurityAuditor::run_audit(&default_lang, self.docker.as_deref()).await;
 
         let mut alerts = Vec::new();
-        {
-            let mut states = self.last_states.lock().unwrap();
-            for check in &checks {
-                let old_status = states
-                    .get(&check.id)
-                    .cloned()
-                    .unwrap_or_else(|| "UNKNOWN".to_string());
-
-                if check.status == "FAIL" && old_status != "FAIL" {
-                    alerts.push(format!(
+        for check in &checks {
+            if check.status == "FAIL" {
+                match self.events.raise_audit_event(check).await {
+                    Ok(true) => alerts.push(format!(
                         "{}\n\n{}: {}\n{}: {}",
                         crate::i18n::t("security.detected", &default_lang),
                         crate::i18n::t("security.check", &default_lang),
                         check.name,
                         crate::i18n::t("security.message", &default_lang),
                         check.message
-                    ));
-                } else if check.status == "PASS" && old_status == "FAIL" {
-                    alerts.push(format!(
+                    )),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "Failed to persist security event for check {}: {}",
+                        check.id,
+                        e
+                    ),
+                }
+            } else if check.status == "WARN" {
+                if let Err(e) = self.events.raise_audit_event(check).await {
+                    tracing::warn!(
+                        "Failed to persist warning security event for check {}: {}",
+                        check.id,
+                        e
+                    );
+                }
+            } else if check.status == "PASS" {
+                match self.events.resolve_audit_event(check).await {
+                    Ok(true) => alerts.push(format!(
                         "{}\n\n{}: {}",
                         crate::i18n::t("security.resolved", &default_lang),
                         crate::i18n::t("security.check", &default_lang),
                         check.name
-                    ));
+                    )),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "Failed to resolve security event for check {}: {}",
+                        check.id,
+                        e
+                    ),
                 }
-
-                states.insert(check.id.clone(), check.status.clone());
             }
+        }
+
+        if let Err(e) = self.events.cleanup_if_due().await {
+            tracing::warn!("Failed to clean up old security events: {}", e);
         }
 
         for alert in alerts {
@@ -940,5 +1054,20 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
         ];
 
         assert_eq!(SecurityAuditor::calculate_score(&checks), 18);
+    }
+
+    #[test]
+    fn test_parse_duration_secs_uses_default_and_clamps_bounds() {
+        assert_eq!(parse_duration_secs(None, 30, 0, 120).as_secs(), 30);
+        assert_eq!(
+            parse_duration_secs(Some("not-a-number"), 30, 0, 120).as_secs(),
+            30
+        );
+        assert_eq!(parse_duration_secs(Some("0"), 30, 5, 120).as_secs(), 5);
+        assert_eq!(
+            parse_duration_secs(Some("999"), 30, 5, 120).as_secs(),
+            120
+        );
+        assert_eq!(parse_duration_secs(Some("60"), 30, 5, 120).as_secs(), 60);
     }
 }

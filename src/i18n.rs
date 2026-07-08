@@ -1,7 +1,7 @@
 pub use axum::http::HeaderMap;
 use std::env;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     EN,
     RU,
@@ -69,6 +69,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.docker_containers.pass" => "Опасных настроек контейнеров не найдено".to_string(),
             "audit.docker_containers.fail" => "Найдены рискованные настройки контейнеров".to_string(),
             "audit.docker_containers.error" => "Не удалось проверить настройки контейнеров".to_string(),
+            "audit.docker_containers.timeout" => "Проверка Docker контейнеров превысила лимит времени".to_string(),
             "audit.docker_containers.no_runtime" => "Docker runtime не обнаружен".to_string(),
             "audit.docker_containers.unavailable" => "Docker socket есть, но inspection недоступен".to_string(),
             "audit.docker_containers.remediation" => "Уберите privileged, host namespaces, опасные capabilities и чувствительные host mounts".to_string(),
@@ -134,6 +135,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.docker_containers.pass" => "No dangerous container settings found".to_string(),
             "audit.docker_containers.fail" => "Risky container settings found".to_string(),
             "audit.docker_containers.error" => "Could not inspect container settings".to_string(),
+            "audit.docker_containers.timeout" => "Docker container inspection timed out".to_string(),
             "audit.docker_containers.no_runtime" => "Docker runtime was not detected".to_string(),
             "audit.docker_containers.unavailable" => "Docker socket exists, but inspection is unavailable".to_string(),
             "audit.docker_containers.remediation" => "Remove privileged mode, host namespaces, dangerous capabilities, and sensitive host mounts".to_string(),
