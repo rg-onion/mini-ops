@@ -6,6 +6,9 @@ use tokio::sync::Mutex;
 
 use crate::security::SecurityCheck;
 
+const DEFAULT_SECURITY_EVENTS_RETENTION_HOURS: i64 = 168;
+const MAX_SECURITY_EVENTS_RETENTION_HOURS: i64 = 24 * 365 * 5;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityEvent {
     pub id: i64,
@@ -31,11 +34,11 @@ pub struct SecurityEventService {
 
 impl SecurityEventService {
     pub fn new(db: SqlitePool) -> Self {
-        let retention_hours = std::env::var("SECURITY_EVENTS_RETENTION_HOURS")
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(168);
+        let retention_hours = parse_security_events_retention_hours(
+            std::env::var("SECURITY_EVENTS_RETENTION_HOURS")
+                .ok()
+                .as_deref(),
+        );
 
         Self {
             db,
@@ -130,6 +133,10 @@ impl SecurityEventService {
                         AND excluded.event_type = 'audit.check_failed'
                     THEN 'open'
                     ELSE security_events.status
+                END,
+                first_seen = CASE
+                    WHEN security_events.status = 'resolved' THEN excluded.first_seen
+                    ELSE security_events.first_seen
                 END,
                 last_seen = excluded.last_seen,
                 acknowledged_at = CASE
@@ -261,7 +268,7 @@ impl SecurityEventService {
             *last_cleanup = Some(Instant::now());
         }
 
-        let cutoff = Utc::now().timestamp() - (self.retention_hours * 3600);
+        let cutoff = retention_cutoff(Utc::now().timestamp(), self.retention_hours);
         sqlx::query(
             "DELETE FROM security_events
             WHERE status = 'resolved' AND last_seen < ?",
@@ -319,6 +326,26 @@ impl SecurityEventService {
     }
 }
 
+fn parse_security_events_retention_hours(value: Option<&str>) -> i64 {
+    parse_bounded_i64(
+        value,
+        DEFAULT_SECURITY_EVENTS_RETENTION_HOURS,
+        1,
+        MAX_SECURITY_EVENTS_RETENTION_HOURS,
+    )
+}
+
+fn parse_bounded_i64(value: Option<&str>, default: i64, min: i64, max: i64) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn retention_cutoff(now: i64, retention_hours: i64) -> i64 {
+    now.saturating_sub(retention_hours.saturating_mul(3600))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +394,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn security_events_retention_hours_uses_default_and_bounds() {
+        assert_eq!(parse_security_events_retention_hours(None), 168);
+        assert_eq!(
+            parse_security_events_retention_hours(Some("not-a-number")),
+            168
+        );
+        assert_eq!(parse_security_events_retention_hours(Some("0")), 1);
+        assert_eq!(parse_security_events_retention_hours(Some("-42")), 1);
+        assert_eq!(parse_security_events_retention_hours(Some(" 24 ")), 24);
+        assert_eq!(
+            parse_security_events_retention_hours(Some("43801")),
+            MAX_SECURITY_EVENTS_RETENTION_HOURS
+        );
+    }
+
+    #[test]
+    fn security_events_retention_cutoff_uses_saturating_math() {
+        assert_eq!(
+            retention_cutoff(1_000, i64::MAX),
+            1_000_i64.saturating_sub(i64::MAX)
+        );
+    }
+
     #[tokio::test]
     async fn audit_event_alerts_once_until_resolved() {
         let service = test_service().await;
@@ -386,6 +437,35 @@ mod tests {
         assert_eq!(resolved[0].status, "resolved");
 
         assert!(service.raise_audit_event(&failed_check()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolved_audit_event_resets_first_seen_when_reopened() {
+        let service = test_service().await;
+        let check = failed_check();
+        let event_key = SecurityEventService::audit_event_key(&check.id);
+
+        assert!(service.raise_audit_event(&check).await.unwrap());
+        assert!(service.resolve_audit_event(&passed_check()).await.unwrap());
+
+        sqlx::query(
+            "UPDATE security_events
+            SET first_seen = 1, last_seen = 2, resolved_at = 2
+            WHERE event_key = ?",
+        )
+        .bind(&event_key)
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        assert!(service.raise_audit_event(&check).await.unwrap());
+
+        let active = service.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, "open");
+        assert_eq!(active[0].first_seen, active[0].last_seen);
+        assert!(active[0].first_seen > 1);
+        assert!(active[0].resolved_at.is_none());
     }
 
     #[tokio::test]

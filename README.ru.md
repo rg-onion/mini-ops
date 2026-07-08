@@ -50,8 +50,14 @@ cp .env.example .env
 ```
 
 Минимально необходимые переменные:
+```env
+AUTH_TOKEN=
+```
+
+Оставьте значение пустым, чтобы Mini-Ops/bootstrap сгенерировал сильный токен,
+или сгенерируйте токен в shell и вставьте готовое значение в `.env`:
 ```bash
-AUTH_TOKEN="$(openssl rand -hex 32)"
+openssl rand -hex 32
 ```
 
 Опционально:

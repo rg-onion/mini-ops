@@ -33,7 +33,8 @@ script refuses non-git directories and tracked local changes, uses
 `git pull --ff-only`, installs frontend dependencies from the lockfile when
 available, and builds the backend with `cargo build --release --locked`. Only
 one update can run at a time, and `/api/deploy/logs` streams recent update logs
-over SSE.
+over SSE. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS` bounds each web-triggered update
+(`1800` seconds by default).
 
 ## 📝 SSH Monitoring
 
@@ -110,6 +111,30 @@ Security audit work is bounded with local runtime controls:
 
 If Docker inspection times out, the Docker container hardening check returns
 `WARN` with timeout evidence instead of blocking the whole audit.
+
+## Listening Port Baseline
+
+Mini-Ops reports listening sockets that are not part of the local expected-port
+baseline. It distinguishes public/wildcard listeners from loopback-only
+listeners, and it does not change firewall rules or close ports.
+
+The built-in baseline includes:
+
+- `22`
+- `80`
+- `443`
+- public/wildcard: `22`, `80`, `443`, `DEPLOY_NGINX_PORT` (`8090` by default)
+- loopback-only: `APP_PORT` (`3000` by default)
+
+Add site-specific expected ports with separate public and loopback baselines:
+
+```env
+SECURITY_ALLOWED_PUBLIC_PORTS=81,82,86
+SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
+```
+
+Invalid entries are ignored and included as audit evidence so the operator can
+fix the environment value.
 
 ## 🌐 Network & Deployment Security
 

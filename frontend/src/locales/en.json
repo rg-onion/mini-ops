@@ -132,6 +132,7 @@
         "last_seen": "Last seen",
         "ack": "Acknowledge",
         "no_events": "No active security events",
+        "events_load_error": "Failed to load security events",
         "event_ack_success": "Security event acknowledged",
         "event_ack_error": "Failed to acknowledge event",
         "event_status": {

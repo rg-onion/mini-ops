@@ -92,10 +92,10 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.ssh_passwd.remediation" => "Установите PasswordAuthentication no и используйте SSH-ключи".to_string(),
 
             "audit.ports.name" => "Открытые порты".to_string(),
-            "audit.ports.pass" => "Подозрительных портов не найдено".to_string(),
-            "audit.ports.warn" => "Найдены лишние порты".to_string(),
+            "audit.ports.pass" => "Найдены только ожидаемые listening ports".to_string(),
+            "audit.ports.warn" => "Найдены неожиданные listening ports".to_string(),
             "audit.ports.error" => "Ошибка сканирования портов".to_string(),
-            "audit.ports.remediation" => "Закройте лишние listening ports или явно защитите их firewall-правилами".to_string(),
+            "audit.ports.remediation" => "Закройте неожиданные listening ports, привяжите приватные сервисы к loopback, защитите их firewall-правилами или добавьте ожидаемые public/loopback порты в SECURITY_ALLOWED_PUBLIC_PORTS и SECURITY_ALLOWED_LOOPBACK_PORTS".to_string(),
             _ => key.to_string(),
         },
         Lang::EN => match key {
@@ -158,10 +158,10 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.ssh_passwd.remediation" => "Set PasswordAuthentication no and use SSH keys".to_string(),
 
             "audit.ports.name" => "Listening Ports".to_string(),
-            "audit.ports.pass" => "No suspicious ports found".to_string(),
-            "audit.ports.warn" => "Unnecessary ports found".to_string(),
+            "audit.ports.pass" => "Only expected listening ports found".to_string(),
+            "audit.ports.warn" => "Unexpected listening ports found".to_string(),
             "audit.ports.error" => "Error scanning ports".to_string(),
-            "audit.ports.remediation" => "Close unnecessary listening ports or protect them with firewall rules".to_string(),
+            "audit.ports.remediation" => "Close unexpected listening ports, bind private services to loopback, protect them with firewall rules, or add expected public/loopback ports to SECURITY_ALLOWED_PUBLIC_PORTS and SECURITY_ALLOWED_LOOPBACK_PORTS".to_string(),
             _ => key.to_string(),
         }
     }

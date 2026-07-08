@@ -86,6 +86,19 @@ struct PortScanResult {
     open_ports: Vec<u16>,
 }
 
+struct ListeningSocket {
+    protocol: String,
+    address: String,
+    port: u16,
+    is_loopback: bool,
+}
+
+struct ListeningPortBaseline {
+    allowed_public_ports: Vec<u16>,
+    allowed_loopback_ports: Vec<u16>,
+    invalid_tokens: Vec<String>,
+}
+
 pub struct SecurityAuditor;
 
 #[derive(Clone)]
@@ -140,12 +153,7 @@ impl SecurityAuditCache {
 }
 
 fn env_duration_secs(key: &str, default: u64, min: u64, max: u64) -> Duration {
-    parse_duration_secs(
-        std::env::var(key).ok().as_deref(),
-        default,
-        min,
-        max,
-    )
+    parse_duration_secs(std::env::var(key).ok().as_deref(), default, min, max)
 }
 
 fn parse_duration_secs(value: Option<&str>, default: u64, min: u64, max: u64) -> Duration {
@@ -631,7 +639,18 @@ impl SecurityAuditor {
 
         if let Ok(output) = Command::new(&ss_path).args(["-H", "-tuln"]).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut open_ports = Self::parse_listening_ports(&stdout);
+            let mut listening_sockets = Self::parse_listening_sockets(&stdout);
+            listening_sockets.sort_by(|a, b| {
+                a.port
+                    .cmp(&b.port)
+                    .then_with(|| a.protocol.cmp(&b.protocol))
+                    .then_with(|| a.address.cmp(&b.address))
+            });
+
+            let mut open_ports = listening_sockets
+                .iter()
+                .map(|socket| socket.port)
+                .collect::<Vec<_>>();
             open_ports.sort_unstable();
             open_ports.dedup();
 
@@ -643,20 +662,57 @@ impl SecurityAuditor {
                 .ok()
                 .and_then(|port| port.parse::<u16>().ok())
                 .unwrap_or(3000);
-            let allowed_ports = [22, 80, 443, app_port, nginx_port];
+            let baseline = Self::listening_port_baseline(
+                app_port,
+                nginx_port,
+                std::env::var("SECURITY_ALLOWED_PUBLIC_PORTS")
+                    .ok()
+                    .as_deref(),
+                std::env::var("SECURITY_ALLOWED_LOOPBACK_PORTS")
+                    .ok()
+                    .as_deref(),
+            );
 
-            let mut suspicious = open_ports
+            let mut unexpected_listeners = listening_sockets
                 .iter()
-                .copied()
-                .filter(|port| !allowed_ports.contains(port))
+                .filter(|socket| {
+                    if baseline.allowed_public_ports.contains(&socket.port) {
+                        return false;
+                    }
+                    !(socket.is_loopback && baseline.allowed_loopback_ports.contains(&socket.port))
+                })
+                .map(Self::format_listening_socket)
+                .collect::<Vec<_>>();
+            unexpected_listeners.sort();
+            unexpected_listeners.dedup();
+
+            let mut suspicious = listening_sockets
+                .iter()
+                .filter(|socket| {
+                    if baseline.allowed_public_ports.contains(&socket.port) {
+                        return false;
+                    }
+                    !(socket.is_loopback && baseline.allowed_loopback_ports.contains(&socket.port))
+                })
+                .map(|socket| socket.port)
                 .collect::<Vec<_>>();
             suspicious.sort_unstable();
             suspicious.dedup();
 
             let open_port_strings = open_ports.iter().map(u16::to_string).collect::<Vec<_>>();
             let suspicious_strings = suspicious.iter().map(u16::to_string).collect::<Vec<_>>();
+            let allowed_public_port_strings = baseline
+                .allowed_public_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>();
+            let allowed_loopback_port_strings = baseline
+                .allowed_loopback_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>();
 
-            let check = if suspicious.is_empty() {
+            let mut check = if suspicious.is_empty() {
                 SecurityCheck::new(
                     "network.listening_ports",
                     name,
@@ -681,8 +737,23 @@ impl SecurityAuditor {
                     remediation,
                 )
                 .with_metadata("suspicious_ports", suspicious_strings)
+                .with_metadata("unexpected_listeners", unexpected_listeners)
             }
-            .with_metadata("open_ports", open_port_strings);
+            .with_metadata("open_ports", open_port_strings)
+            .with_metadata("allowed_public_ports", allowed_public_port_strings)
+            .with_metadata("allowed_loopback_ports", allowed_loopback_port_strings);
+
+            if !baseline.invalid_tokens.is_empty() {
+                check = check
+                    .with_metadata("invalid_allowed_ports", baseline.invalid_tokens.clone())
+                    .with_evidence(
+                        baseline
+                            .invalid_tokens
+                            .iter()
+                            .map(|token| format!("ignored_allowed_port={}", token))
+                            .collect(),
+                    );
+            }
 
             PortScanResult { check, open_ports }
         } else {
@@ -701,21 +772,101 @@ impl SecurityAuditor {
         }
     }
 
-    fn parse_listening_ports(ss_output: &str) -> Vec<u16> {
+    fn listening_port_baseline(
+        app_port: u16,
+        nginx_port: u16,
+        extra_public_ports: Option<&str>,
+        extra_loopback_ports: Option<&str>,
+    ) -> ListeningPortBaseline {
+        let mut invalid_tokens = Vec::new();
+        let mut allowed_public_ports = vec![22, 80, 443, nginx_port];
+        let mut allowed_loopback_ports = vec![app_port];
+
+        Self::extend_ports_from_env(
+            &mut allowed_public_ports,
+            &mut invalid_tokens,
+            extra_public_ports,
+        );
+        Self::extend_ports_from_env(
+            &mut allowed_loopback_ports,
+            &mut invalid_tokens,
+            extra_loopback_ports,
+        );
+
+        allowed_public_ports.sort_unstable();
+        allowed_public_ports.dedup();
+        allowed_loopback_ports.sort_unstable();
+        allowed_loopback_ports.dedup();
+        invalid_tokens.sort();
+        invalid_tokens.dedup();
+
+        ListeningPortBaseline {
+            allowed_public_ports,
+            allowed_loopback_ports,
+            invalid_tokens,
+        }
+    }
+
+    fn extend_ports_from_env(
+        ports: &mut Vec<u16>,
+        invalid_tokens: &mut Vec<String>,
+        value: Option<&str>,
+    ) {
+        for token in value
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace())
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            match token.parse::<u16>() {
+                Ok(port) => ports.push(port),
+                Err(_) => invalid_tokens.push(token.to_string()),
+            }
+        }
+    }
+
+    fn parse_listening_sockets(ss_output: &str) -> Vec<ListeningSocket> {
         ss_output
             .lines()
             .filter(|line| line.contains("LISTEN") || line.contains("UNCONN"))
-            .filter_map(|line| line.split_whitespace().nth(4))
-            .filter_map(Self::parse_port_from_local_address)
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let protocol = parts.next()?.to_string();
+                let local_address = parts.nth(3)?;
+                let (address, port) = Self::parse_local_address(local_address)?;
+                Some(ListeningSocket {
+                    protocol,
+                    is_loopback: Self::is_loopback_address(&address),
+                    address,
+                    port,
+                })
+            })
             .collect()
     }
 
-    fn parse_port_from_local_address(local_address: &str) -> Option<u16> {
-        local_address
-            .rsplit(':')
+    fn parse_local_address(local_address: &str) -> Option<(String, u16)> {
+        if let Some(rest) = local_address.strip_prefix('[') {
+            let (address, rest) = rest.split_once(']')?;
+            let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
+            return Some((address.to_string(), port));
+        }
+
+        let (address, port) = local_address.rsplit_once(':')?;
+        Some((address.to_string(), port.parse::<u16>().ok()?))
+    }
+
+    fn is_loopback_address(address: &str) -> bool {
+        let address = address
+            .trim_matches(['[', ']'])
+            .split('%')
             .next()
-            .map(|port| port.trim_matches(['[', ']']))
-            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(address);
+
+        address == "localhost" || address == "::1" || address.starts_with("127.")
+    }
+
+    fn format_listening_socket(socket: &ListeningSocket) -> String {
+        format!("{}://{}:{}", socket.protocol, socket.address, socket.port)
     }
 
     fn check_docker_tcp_api_ports(lang: &Lang, open_ports: &[u16]) -> SecurityCheck {
@@ -799,7 +950,8 @@ impl SecurityAuditor {
         };
 
         let docker_timeout = env_duration_secs("SECURITY_AUDIT_DOCKER_TIMEOUT_SECS", 10, 1, 120);
-        let audit_result = tokio::time::timeout(docker_timeout, docker.audit_security_risks()).await;
+        let audit_result =
+            tokio::time::timeout(docker_timeout, docker.audit_security_risks()).await;
 
         match audit_result {
             Err(_) => SecurityCheck::new(
@@ -811,10 +963,7 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_containers.timeout", lang),
                 remediation,
             )
-            .with_evidence(vec![format!(
-                "timeout_secs={}",
-                docker_timeout.as_secs()
-            )]),
+            .with_evidence(vec![format!("timeout_secs={}", docker_timeout.as_secs())]),
             Ok(Ok(risks)) if risks.is_empty() => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
@@ -1018,16 +1167,74 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_listening_ports() {
+    fn test_parse_listening_sockets_extracts_ports() {
         let output = "\
 tcp LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:*
 tcp LISTEN 0 128 [::]:22 [::]:*
 udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
 ";
 
-        let mut ports = SecurityAuditor::parse_listening_ports(output);
+        let mut ports = SecurityAuditor::parse_listening_sockets(output)
+            .into_iter()
+            .map(|socket| socket.port)
+            .collect::<Vec<_>>();
         ports.sort_unstable();
         assert_eq!(ports, vec![22, 3000, 5353]);
+    }
+
+    #[test]
+    fn test_listening_port_baseline_adds_extra_ports_and_dedupes() {
+        let baseline = SecurityAuditor::listening_port_baseline(
+            3000,
+            8090,
+            Some("81;82\n22"),
+            Some("53, 9001,3000"),
+        );
+
+        assert_eq!(
+            baseline.allowed_public_ports,
+            vec![22, 80, 81, 82, 443, 8090]
+        );
+        assert_eq!(baseline.allowed_loopback_ports, vec![53, 3000, 9001]);
+        assert!(baseline.invalid_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_listening_port_baseline_keeps_invalid_tokens() {
+        let baseline = SecurityAuditor::listening_port_baseline(
+            3000,
+            8090,
+            Some("5435,bad"),
+            Some("70000,bad"),
+        );
+
+        assert_eq!(baseline.allowed_public_ports, vec![22, 80, 443, 5435, 8090]);
+        assert_eq!(baseline.allowed_loopback_ports, vec![3000]);
+        assert_eq!(baseline.invalid_tokens, vec!["70000", "bad"]);
+    }
+
+    #[test]
+    fn test_parse_listening_sockets_marks_loopback() {
+        let output = "\
+tcp LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:*
+tcp LISTEN 0 4096 0.0.0.0:5435 0.0.0.0:*
+tcp LISTEN 0 128 [::1]:9001 [::]:*
+";
+
+        let sockets = SecurityAuditor::parse_listening_sockets(output);
+        let loopback_ports = sockets
+            .iter()
+            .filter(|socket| socket.is_loopback)
+            .map(|socket| socket.port)
+            .collect::<Vec<_>>();
+        let public_ports = sockets
+            .iter()
+            .filter(|socket| !socket.is_loopback)
+            .map(|socket| socket.port)
+            .collect::<Vec<_>>();
+
+        assert_eq!(loopback_ports, vec![3000, 9001]);
+        assert_eq!(public_ports, vec![5435]);
     }
 
     #[test]
@@ -1064,10 +1271,7 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
             30
         );
         assert_eq!(parse_duration_secs(Some("0"), 30, 5, 120).as_secs(), 5);
-        assert_eq!(
-            parse_duration_secs(Some("999"), 30, 5, 120).as_secs(),
-            120
-        );
+        assert_eq!(parse_duration_secs(Some("999"), 30, 5, 120).as_secs(), 120);
         assert_eq!(parse_duration_secs(Some("60"), 30, 5, 120).as_secs(), 60);
     }
 }

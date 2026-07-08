@@ -76,7 +76,8 @@ checkout. Скрипт отказывается работать вне git chec
 changes, использует `git pull --ff-only`, ставит frontend dependencies из
 lockfile при наличии и собирает backend через `cargo build --release --locked`.
 Одновременно может идти только одно обновление, а `/api/deploy/logs` отдает
-последние строки update logs через SSE.
+последние строки update logs через SSE. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
+ограничивает runtime каждого web-triggered update (`1800` секунд по умолчанию).
 
 ## События безопасности
 
@@ -118,9 +119,32 @@ Mini-Ops ограничивает локальную operational history, что
 Если Docker inspection превышает timeout, check Docker container hardening
 возвращает `WARN` с evidence о timeout вместо блокировки всего audit.
 
+## Baseline listening ports
+
+Mini-Ops показывает listening sockets, которые не входят в локальный baseline
+ожидаемых портов. Он различает public/wildcard listeners и loopback-only
+listeners, не меняет firewall rules и не закрывает порты.
+
+Встроенный baseline включает:
+
+- public/wildcard: `22`, `80`, `443`, `DEPLOY_NGINX_PORT` (`8090` по умолчанию)
+- loopback-only: `APP_PORT` (`3000` по умолчанию)
+
+Добавляйте ожидаемые для конкретного сервера порты отдельно для public и
+loopback baseline:
+
+```env
+SECURITY_ALLOWED_PUBLIC_PORTS=81,82,86
+SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
+```
+
+Некорректные значения игнорируются и попадают в audit evidence, чтобы оператор
+мог исправить `.env`.
+
 ## 🔔 Alerting (Оповещения)
 
-Система работает в фоновом режиме (проверка раз в 60 секунд) и отправляет уведомления в Telegram.
+Система работает в фоновом режиме с interval из `SECURITY_AUDIT_INTERVAL_SECS`
+и отправляет уведомления в Telegram.
 
 ### Логика работы
 *   **Инцидент**: Если статус проверки меняется с `PASS` на `FAIL` -> Шлется уведомление 🚨.

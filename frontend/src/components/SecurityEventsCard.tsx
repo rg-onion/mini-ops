@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCheck, Clock3, ShieldAlert } from "lucide-react";
+import { AlertTriangle, CheckCheck, Clock3, Info, ShieldAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -44,7 +44,7 @@ function severityClass(severity: SecurityEvent["severity"]) {
 export function SecurityEventsCard() {
     const { t } = useTranslation();
     const queryClient = useQueryClient();
-    const { data: events, isLoading } = useQuery({
+    const { data: events, isError, isLoading } = useQuery({
         queryKey: ["security-events"],
         queryFn: fetchSecurityEvents,
         refetchInterval: 30000,
@@ -68,10 +68,18 @@ export function SecurityEventsCard() {
                     <CardTitle className="text-sm font-medium">{t("security.events_title")}</CardTitle>
                     <ShieldAlert className="h-4 w-4 text-muted-foreground" />
                 </div>
-                <Badge variant="outline">{events?.length || 0}</Badge>
+                <Badge variant="outline">{isError ? "!" : events?.length || 0}</Badge>
             </CardHeader>
             <CardContent>
-                {!events?.length ? (
+                {isError ? (
+                    <div
+                        role="alert"
+                        className="flex items-center justify-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-6 text-center text-sm text-red-700 dark:text-red-300"
+                    >
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span>{t("security.events_load_error")}</span>
+                    </div>
+                ) : !events?.length ? (
                     <div className="rounded-md border px-3 py-6 text-center text-sm text-muted-foreground">
                         {t("security.no_events")}
                     </div>
@@ -104,11 +112,21 @@ export function SecurityEventsCard() {
                                         <TableCell>
                                             <div className="flex items-center gap-2 whitespace-nowrap">
                                                 {event.status === "open" ? (
-                                                    <AlertTriangle className="h-4 w-4 text-amber-500" />
+                                                    <AlertTriangle className="h-4 w-4 text-red-500" />
+                                                ) : event.status === "acknowledged" ? (
+                                                    <Info className="h-4 w-4 text-amber-600 dark:text-amber-300" />
                                                 ) : (
                                                     <CheckCheck className="h-4 w-4 text-emerald-500" />
                                                 )}
-                                                <span>{t(`security.event_status.${event.status}`)}</span>
+                                                <span
+                                                    className={
+                                                        event.status === "acknowledged"
+                                                            ? "text-amber-700 dark:text-amber-300"
+                                                            : undefined
+                                                    }
+                                                >
+                                                    {t(`security.event_status.${event.status}`)}
+                                                </span>
                                             </div>
                                         </TableCell>
                                         <TableCell>

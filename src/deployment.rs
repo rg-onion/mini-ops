@@ -16,10 +16,15 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 const UPDATE_LOG_BUFFER_LIMIT: usize = 500;
 const WEB_UPDATE_ENV: &str = "MINI_OPS_ALLOW_WEB_UPDATE";
+const WEB_UPDATE_TIMEOUT_ENV: &str = "MINI_OPS_WEB_UPDATE_TIMEOUT_SECS";
+const DEFAULT_WEB_UPDATE_TIMEOUT_SECS: u64 = 1800;
+const MIN_WEB_UPDATE_TIMEOUT_SECS: u64 = 60;
+const MAX_WEB_UPDATE_TIMEOUT_SECS: u64 = 86_400;
 
 #[derive(Clone)]
 pub struct DeploymentService {
@@ -121,9 +126,20 @@ impl DeploymentService {
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut read_error = None;
+        let update_timeout = web_update_timeout();
+        let timeout = tokio::time::sleep(update_timeout);
+        tokio::pin!(timeout);
 
         while (!stdout_done || !stderr_done) && read_error.is_none() {
             tokio::select! {
+                _ = &mut timeout => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(format!(
+                        "Update timed out after {} seconds",
+                        update_timeout.as_secs()
+                    ));
+                }
                 result = stdout_reader.next_line(), if !stdout_done => {
                     match result {
                         Ok(Some(line)) => self.publish(format!("STDOUT: {}", line)).await,
@@ -147,10 +163,19 @@ impl DeploymentService {
             return Err(e);
         }
 
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("Failed to wait on update script: {}", e))?;
+        let status = tokio::select! {
+            _ = &mut timeout => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(format!(
+                    "Update timed out after {} seconds",
+                    update_timeout.as_secs()
+                ));
+            }
+            status = child.wait() => {
+                status.map_err(|e| format!("Failed to wait on update script: {}", e))?
+            }
+        };
 
         if status.success() {
             Ok(())
@@ -169,6 +194,20 @@ impl DeploymentService {
             buffer.pop_front();
         }
     }
+}
+
+fn web_update_timeout() -> Duration {
+    let seconds =
+        parse_web_update_timeout_secs(std::env::var(WEB_UPDATE_TIMEOUT_ENV).ok().as_deref());
+
+    Duration::from_secs(seconds)
+}
+
+fn parse_web_update_timeout_secs(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_WEB_UPDATE_TIMEOUT_SECS, MAX_WEB_UPDATE_TIMEOUT_SECS))
+        .unwrap_or(DEFAULT_WEB_UPDATE_TIMEOUT_SECS)
 }
 
 pub async fn trigger_update_handler(
@@ -205,6 +244,32 @@ pub async fn trigger_update_handler(
         Err(UpdateStartError::AlreadyRunning) => {
             (StatusCode::CONFLICT, "An update is already running.").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_update_timeout_parser_uses_default_and_bounds() {
+        assert_eq!(
+            parse_web_update_timeout_secs(None),
+            DEFAULT_WEB_UPDATE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            parse_web_update_timeout_secs(Some("not-a-number")),
+            DEFAULT_WEB_UPDATE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            parse_web_update_timeout_secs(Some("1")),
+            MIN_WEB_UPDATE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            parse_web_update_timeout_secs(Some("999999")),
+            MAX_WEB_UPDATE_TIMEOUT_SECS
+        );
+        assert_eq!(parse_web_update_timeout_secs(Some("120")), 120);
     }
 }
 
