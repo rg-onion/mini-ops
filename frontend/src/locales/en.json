@@ -130,7 +130,7 @@
         "events_title": "Security Events",
         "event": "Event",
         "last_seen": "Last seen",
-        "ack": "Ack",
+        "ack": "Acknowledge",
         "no_events": "No active security events",
         "event_ack_success": "Security event acknowledged",
         "event_ack_error": "Failed to acknowledge event",

@@ -81,9 +81,9 @@ export function SecurityEventsCard() {
                             <TableHeader>
                                 <TableRow>
                                     <TableHead>{t("security.event")}</TableHead>
-                                    <TableHead className="w-[150px]">{t("security.status")}</TableHead>
+                                    <TableHead className="w-[190px]">{t("security.status")}</TableHead>
                                     <TableHead className="w-[190px]">{t("security.last_seen")}</TableHead>
-                                    <TableHead className="w-[120px]"></TableHead>
+                                    <TableHead className="w-[190px]"></TableHead>
                                 </TableRow>
                             </TableHeader>
                             <TableBody>
@@ -102,7 +102,7 @@ export function SecurityEventsCard() {
                                             </div>
                                         </TableCell>
                                         <TableCell>
-                                            <div className="flex items-center gap-2">
+                                            <div className="flex items-center gap-2 whitespace-nowrap">
                                                 {event.status === "open" ? (
                                                     <AlertTriangle className="h-4 w-4 text-amber-500" />
                                                 ) : (
