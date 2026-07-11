@@ -9,9 +9,13 @@ Mini-Ops включает в себя встроенную систему ауд
 ### Проверки (Checks)
 
 1.  **SSH Root Login**:
-    *   **Проверяет**: файл `/etc/ssh/sshd_config`.
+    *   **Проверяет**: bounded effective output `sshd -T -C` для отдельного
+        root context с remote TEST-NET адресами. Evaluation context сохраняется
+        в evidence и не означает перебор всех возможных `Match`-веток.
     *   **Правило**: `PermitRootLogin` не должен быть `yes`.
     *   **Риск**: Разрешает прямой вход `root` по паролю, что уязвимо для брутфорса.
+    *   **Fallback**: чтение `/etc/ssh/sshd_config` без разрешения
+        `Include`/`Match` может дать только `WARN`, но не `PASS`.
 
 2.  **Firewall (UFW)**:
     *   **Проверяет**: наличие UFW в стандартных расположениях:
@@ -30,8 +34,12 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **Риск**: Любой пользователь с доступом к сокету получает права root на хосте.
 
 4.  **Disk Encryption**:
-    *   **Проверяет**: наличие разделов типа `crypt` через `lsblk`.
-    *   **Правило**: Наличие шифрования (LUKS).
+    *   **Проверяет**: bounded JSON tree `lsblk` для фактической backing chain
+        корневой файловой системы.
+    *   **Правило**: `PASS` возможен только если в ancestry root mount есть
+        устройство типа `crypt`; отдельный зашифрованный том этого не доказывает.
+    *   **Неизвестность**: отсутствующий/неоднозначный root mount или malformed
+        output даёт `WARN`.
     *   **Риск**: Физическая кража дисков.
 
 5.  **Fail2Ban Status**:
@@ -40,17 +48,24 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **Не проверяет**: состояние отдельных jail-правил.
 
 6.  **SSH Password Auth**:
-    *   **Проверяет**: файл `/etc/ssh/sshd_config`.
-    *   **Правило**: `PasswordAuthentication` должен быть установлен в `no`.
+    *   **Проверяет**: отдельный bounded non-root `sshd -T -C` context.
+    *   **Правило**: `PasswordAuthentication` и
+        `KbdInteractiveAuthentication` должны быть `no`; effective `UsePAM`
+        сохраняется в evidence.
     *   **Риск**: Вход по паролю менее безопасен, чем по SSH ключам.
 
 7.  **Listening Ports**:
     *   **Проверяет**: открытые TCP/UDP порты через `ss -H -tuln`.
+    *   **Сохраняет**: protocol, local address и
+        loopback/wildcard/non-loopback scope. Unknown или malformed output
+        всегда даёт `WARN`.
     *   **Правило**: Только ожидаемые порты `22`, `80`, `443`, `APP_PORT` (`3000` по умолчанию) и `DEPLOY_NGINX_PORT` (`8090` по умолчанию) должны быть открыты.
     *   **Риск**: Лишние открытые порты увеличивают поверхность атаки.
 
 8.  **Docker TCP API**:
-    *   **Проверяет**: открытые Docker API порты `2375`/`2376`.
+    *   **Проверяет**: TCP listeners `2375`/`2376` с учётом address scope.
+        Public/wildcard listener даёт `FAIL`, loopback-only — `WARN`, а UDP с
+        тем же номером порта не считается Docker TCP API.
     *   **Риск**: Открытый Docker API может дать контроль над хостом.
 
 9.  **Docker Container Hardening**:

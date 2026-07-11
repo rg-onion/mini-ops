@@ -63,21 +63,34 @@ Does not require exposing the API to the internet (communication happens via `lo
 
 The "Security Audit" section checks:
 - **SSH**:
+    - Bounded effective configuration via separate `sshd -T -C` root and
+      representative non-root remote contexts. The selected TEST-NET context
+      is included in evidence; it does not claim to enumerate every possible
+      `Match` branch.
     - Root login disabled (`PermitRootLogin no`).
-    - Password authentication disabled (`PasswordAuthentication no`).
+    - Password and keyboard-interactive authentication disabled, including the
+      effective PAM path. A fallback read of `sshd_config` can only produce
+      `WARN`, never `PASS`, because it cannot resolve `Include`/`Match` rules.
 - **Firewall (UFW)**:
     - Status (Active/Inactive).
 - **Fail2Ban**:
     - Service status via `systemctl is-active fail2ban`.
 - **Listening ports**:
     - Open TCP/UDP ports via `ss -H -tuln`.
+    - Protocol, local address, and loopback/wildcard/non-loopback scope are
+      preserved. An unknown or malformed socket result remains `WARN`.
     - Ports outside `22`, `80`, `443`, `APP_PORT` (default `3000`), and `DEPLOY_NGINX_PORT` (default `8090`) are reported as warnings.
 - **Docker**:
     - Docker socket world-writable permission check.
-    - Exposed Docker TCP API ports `2375`/`2376`.
+    - TCP API listeners on `2375`/`2376`: public or wildcard listeners fail,
+      loopback-only listeners warn, and UDP listeners with the same port
+      number do not count as the Docker TCP API.
     - Container hardening risks when Docker is available.
 - **Disk encryption**:
-    - Presence of `crypt` block devices via `lsblk`.
+    - A `PASS` requires a `crypt` device in the actual root filesystem backing
+      tree reported by bounded `lsblk` JSON. An unrelated encrypted volume,
+      missing root mount, or ambiguous output cannot prove encryption and is
+      reported as `WARN`.
 
 ## Security Events
 

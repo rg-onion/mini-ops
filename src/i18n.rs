@@ -49,11 +49,11 @@ pub fn t(key: &str, lang: &Lang) -> String {
 
             "audit.ssh_root.name" => "Доступ root через SSH".to_string(),
             "audit.ssh_root.fail" => "Root-доступ разрешен по паролю/ключам (небезопасно)".to_string(),
-            "audit.ssh_root.pass" => "Доступ для root ограничен или отключен".to_string(),
+            "audit.ssh_root.pass" => "Доступ root отключён в проверенном SSH context".to_string(),
             "audit.ssh_root.warn_restricted" => "Root-доступ ограничен, но не полностью отключен".to_string(),
             "audit.ssh_root.warn_unknown" => "Не удалось определить effective-значение PermitRootLogin".to_string(),
             "audit.ssh_root.remediation" => "Установите PermitRootLogin no и перезапустите sshd".to_string(),
-            "audit.ssh_config.warn" => "Не удалось прочитать конфиг sshd".to_string(),
+            "audit.ssh_config.warn" => "Не удалось подтвердить effective-конфигурацию sshd".to_string(),
 
             "audit.ufw.name" => "Файрвол (UFW)".to_string(),
             "audit.ufw.pass" => "UFW активен".to_string(),
@@ -81,9 +81,9 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.docker_containers.remediation" => "Уберите privileged, host namespaces, опасные capabilities и чувствительные host mounts".to_string(),
 
             "audit.disk_enc.name" => "Шифрование диска".to_string(),
-            "audit.disk_enc.pass" => "Найдены зашифрованные разделы".to_string(),
-            "audit.disk_enc.warn" => "Зашифрованные разделы LUKS не найдены".to_string(),
-            "audit.disk_enc.error" => "Не удалось запустить lsblk".to_string(),
+            "audit.disk_enc.pass" => "Подтверждена зашифрованная цепочка устройства корневого раздела".to_string(),
+            "audit.disk_enc.warn" => "Не удалось подтвердить шифрование цепочки устройства корневого раздела".to_string(),
+            "audit.disk_enc.error" => "Не удалось определить цепочку устройства корневого раздела через lsblk".to_string(),
             "audit.disk_enc.remediation" => "Для новых серверов используйте LUKS или шифрование диска у провайдера".to_string(),
 
             "audit.fail2ban.name" => "Fail2Ban".to_string(),
@@ -93,9 +93,9 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.fail2ban.remediation" => "Установите и включите Fail2Ban или аналогичную защиту от brute force".to_string(),
 
             "audit.ssh_passwd.name" => "SSH Password Auth".to_string(),
-            "audit.ssh_passwd.pass" => "Вход по паролю отключен".to_string(),
-            "audit.ssh_passwd.fail" => "Вход по паролю включен (небезопасно)".to_string(),
-            "audit.ssh_passwd.remediation" => "Установите PasswordAuthentication no и используйте SSH-ключи".to_string(),
+            "audit.ssh_passwd.pass" => "В проверенном SSH context отключены password и keyboard-interactive authentication".to_string(),
+            "audit.ssh_passwd.fail" => "В проверенном SSH context включён password или keyboard-interactive authentication".to_string(),
+            "audit.ssh_passwd.remediation" => "Установите PasswordAuthentication no и KbdInteractiveAuthentication no, затем используйте SSH-ключи".to_string(),
 
             "audit.ports.name" => "Открытые порты".to_string(),
             "audit.ports.pass" => "Найдены только ожидаемые listening ports".to_string(),
@@ -122,11 +122,11 @@ pub fn t(key: &str, lang: &Lang) -> String {
 
             "audit.ssh_root.name" => "SSH Root Login".to_string(),
             "audit.ssh_root.fail" => "Root login is permitted via SSH via password/keys".to_string(),
-            "audit.ssh_root.pass" => "Root login appears disabled or restricted".to_string(),
+            "audit.ssh_root.pass" => "Root login is disabled in the evaluated SSH context".to_string(),
             "audit.ssh_root.warn_restricted" => "Root login is restricted but not fully disabled".to_string(),
             "audit.ssh_root.warn_unknown" => "Could not determine effective PermitRootLogin value".to_string(),
             "audit.ssh_root.remediation" => "Set PermitRootLogin no and restart sshd".to_string(),
-            "audit.ssh_config.warn" => "Could not read /etc/ssh/sshd_config".to_string(),
+            "audit.ssh_config.warn" => "Could not establish the effective sshd configuration".to_string(),
 
             "audit.ufw.name" => "Firewall (UFW)".to_string(),
             "audit.ufw.pass" => "UFW is active".to_string(),
@@ -154,9 +154,9 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.docker_containers.remediation" => "Remove privileged mode, host namespaces, dangerous capabilities, and sensitive host mounts".to_string(),
 
             "audit.disk_enc.name" => "Disk Encryption".to_string(),
-            "audit.disk_enc.pass" => "Found encrypted partitions".to_string(),
-            "audit.disk_enc.warn" => "No LUKS encrypted partitions found".to_string(),
-            "audit.disk_enc.error" => "Could not run lsblk".to_string(),
+            "audit.disk_enc.pass" => "The root filesystem backing chain is proven encrypted".to_string(),
+            "audit.disk_enc.warn" => "Encryption could not be proven for the root filesystem backing chain".to_string(),
+            "audit.disk_enc.error" => "Could not determine the root filesystem backing chain with lsblk".to_string(),
             "audit.disk_enc.remediation" => "Use LUKS or provider-managed disk encryption for new servers".to_string(),
 
             "audit.fail2ban.name" => "Fail2Ban".to_string(),
@@ -166,9 +166,9 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.fail2ban.remediation" => "Install and enable Fail2Ban or equivalent brute-force protection".to_string(),
 
             "audit.ssh_passwd.name" => "SSH Password Auth".to_string(),
-            "audit.ssh_passwd.pass" => "Password authentication is disabled".to_string(),
-            "audit.ssh_passwd.fail" => "Password authentication is enabled (insecure)".to_string(),
-            "audit.ssh_passwd.remediation" => "Set PasswordAuthentication no and use SSH keys".to_string(),
+            "audit.ssh_passwd.pass" => "Password and keyboard-interactive authentication are disabled in the evaluated SSH context".to_string(),
+            "audit.ssh_passwd.fail" => "Password or keyboard-interactive authentication is enabled in the evaluated SSH context".to_string(),
+            "audit.ssh_passwd.remediation" => "Set PasswordAuthentication no and KbdInteractiveAuthentication no, then use SSH keys".to_string(),
 
             "audit.ports.name" => "Listening Ports".to_string(),
             "audit.ports.pass" => "Only expected listening ports found".to_string(),

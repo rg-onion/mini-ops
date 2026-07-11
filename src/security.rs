@@ -1,7 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
+use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +23,15 @@ use crate::security_events::SecurityEventService;
 
 const AUDIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const FILE_READ_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+// `sshd -T` needs concrete connection contexts to evaluate `Match` blocks.
+// Reserved non-loopback addresses deliberately avoid treating localhost-only
+// exceptions as representative remote SSH state. Root-login and ordinary-user
+// password checks must not share a root-only context.
+const SSHD_ROOT_EVALUATION_CONTEXT: &str =
+    "user=root,host=security-audit.invalid,addr=198.51.100.10,laddr=192.0.2.10,lport=22";
+const SSHD_PASSWORD_EVALUATION_CONTEXT: &str =
+    "user=nobody,host=security-audit.invalid,addr=198.51.100.10,laddr=192.0.2.10,lport=22";
+const SSHD_EFFECTIVE_SOURCE: &str = "sshd -T -C";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SecurityCheck {
@@ -161,6 +171,7 @@ async fn read_bounded_text_file(
 struct SshdConfig {
     values: HashMap<String, String>,
     source: String,
+    evaluation_context: Option<String>,
     effective: bool,
     probe_error: Option<UnknownReason>,
 }
@@ -175,15 +186,57 @@ impl SshdConfig {
 
 struct PortScanResult {
     check: SecurityCheck,
-    open_ports: Fact<Vec<u16>>,
+    listeners: Fact<Vec<ListeningSocket>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListenerScope {
+    Loopback,
+    Wildcard,
+    NonLoopback,
+}
+
+impl ListenerScope {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Wildcard => "wildcard",
+            Self::NonLoopback => "non_loopback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ListeningSocket {
     protocol: String,
     address: String,
     port: u16,
-    is_loopback: bool,
+    scope: ListenerScope,
+}
+
+impl ListeningSocket {
+    fn is_loopback(&self) -> bool {
+        self.scope == ListenerScope::Loopback
+    }
+
+    fn is_externally_reachable(&self) -> bool {
+        self.scope != ListenerScope::Loopback
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LsblkOutput {
+    blockdevices: Vec<LsblkDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LsblkDevice {
+    name: String,
+    #[serde(rename = "type")]
+    device_type: String,
+    mountpoints: Option<Vec<Option<String>>>,
+    #[serde(default)]
+    children: Vec<LsblkDevice>,
 }
 
 struct ListeningPortBaseline {
@@ -297,7 +350,8 @@ impl SecurityAuditor {
     ) -> Vec<SecurityCheck> {
         let mut checks = Vec::new();
         let (
-            sshd_config,
+            sshd_root_config,
+            sshd_password_config,
             ufw,
             docker_socket,
             disk_encryption,
@@ -305,7 +359,8 @@ impl SecurityAuditor {
             port_scan,
             docker_containers,
         ) = tokio::join!(
-            Self::load_effective_sshd_config(cancellation),
+            Self::load_effective_sshd_config(SSHD_ROOT_EVALUATION_CONTEXT, cancellation),
+            Self::load_effective_sshd_config(SSHD_PASSWORD_EVALUATION_CONTEXT, cancellation),
             Self::check_ufw_status(lang, cancellation),
             Self::check_docker_socket(lang),
             Self::check_disk_encryption(lang, cancellation),
@@ -314,15 +369,18 @@ impl SecurityAuditor {
             Self::check_docker_container_risks(lang, docker, cancellation),
         );
 
-        checks.push(Self::check_ssh_root_login(lang, sshd_config.as_ref()));
-        checks.push(Self::check_ssh_password_auth(lang, sshd_config.as_ref()));
+        checks.push(Self::check_ssh_root_login(lang, sshd_root_config.as_ref()));
+        checks.push(Self::check_ssh_password_auth(
+            lang,
+            sshd_password_config.as_ref(),
+        ));
         checks.push(ufw);
         checks.push(docker_socket);
         checks.push(disk_encryption);
         checks.push(fail2ban);
-        let open_ports = port_scan.open_ports.clone();
+        let listeners = port_scan.listeners.clone();
         checks.push(port_scan.check);
-        checks.push(Self::check_docker_tcp_api_ports(lang, &open_ports));
+        checks.push(Self::check_docker_tcp_api_ports(lang, &listeners));
         checks.push(docker_containers);
 
         checks
@@ -377,23 +435,19 @@ impl SecurityAuditor {
     }
 
     async fn load_effective_sshd_config(
+        evaluation_context: &'static str,
         cancellation: &ProbeCancellation,
     ) -> Result<SshdConfig, UnknownReason> {
         let outcome = ProbeRunner::run(
             ProbeProgram::Sshd,
-            &["-T"],
+            &["-T", "-C", evaluation_context],
             DEFAULT_PROBE_TIMEOUT,
             cancellation,
         )
         .await;
 
         match outcome.parse_stdout(|stdout| {
-            let config = Self::parse_sshd_config_output(stdout, "sshd -T");
-            if config.values.is_empty() {
-                Err(UnknownReason::MalformedOutput)
-            } else {
-                Ok(config)
-            }
+            Self::parse_effective_sshd_config_output(stdout, evaluation_context)
         }) {
             Fact::Known(config) => Ok(config),
             Fact::Unknown(probe_error) => {
@@ -430,9 +484,110 @@ impl SecurityAuditor {
         SshdConfig {
             values,
             source: source.to_string(),
-            effective: true,
+            evaluation_context: None,
+            effective: false,
             probe_error: None,
         }
+    }
+
+    fn parse_effective_sshd_config_output(
+        content: &str,
+        evaluation_context: &str,
+    ) -> Result<SshdConfig, UnknownReason> {
+        const REQUIRED_KEYS: [&str; 4] = [
+            "permitrootlogin",
+            "passwordauthentication",
+            "kbdinteractiveauthentication",
+            "usepam",
+        ];
+
+        let mut values = HashMap::new();
+        let mut required_key_counts = HashMap::new();
+
+        for line in content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut parts = line.split_whitespace();
+            let key = parts
+                .next()
+                .filter(|key| {
+                    key.chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+                })
+                .ok_or(UnknownReason::MalformedOutput)?
+                .to_ascii_lowercase();
+            let value = parts.collect::<Vec<_>>().join(" ");
+            if value.is_empty() {
+                return Err(UnknownReason::MalformedOutput);
+            }
+
+            if REQUIRED_KEYS.contains(&key.as_str()) {
+                let count = required_key_counts.entry(key.clone()).or_insert(0_usize);
+                *count = count.saturating_add(1);
+                if *count > 1 {
+                    return Err(UnknownReason::MalformedOutput);
+                }
+            }
+            values.entry(key).or_insert(value);
+        }
+
+        if values.is_empty()
+            || REQUIRED_KEYS
+                .iter()
+                .any(|key| required_key_counts.get(*key) != Some(&1))
+        {
+            return Err(UnknownReason::MalformedOutput);
+        }
+
+        let permit_root_login = values
+            .get("permitrootlogin")
+            .map(|value| value.to_ascii_lowercase())
+            .ok_or(UnknownReason::MalformedOutput)?;
+        if !matches!(
+            permit_root_login.as_str(),
+            "yes" | "no" | "prohibit-password" | "without-password" | "forced-commands-only"
+        ) {
+            return Err(UnknownReason::MalformedOutput);
+        }
+        for key in [
+            "passwordauthentication",
+            "kbdinteractiveauthentication",
+            "usepam",
+        ] {
+            if !matches!(
+                values.get(key).map(|value| value.to_ascii_lowercase()),
+                Some(value) if value == "yes" || value == "no"
+            ) {
+                return Err(UnknownReason::MalformedOutput);
+            }
+        }
+
+        Ok(SshdConfig {
+            values,
+            source: SSHD_EFFECTIVE_SOURCE.to_string(),
+            evaluation_context: Some(evaluation_context.to_string()),
+            effective: true,
+            probe_error: None,
+        })
+    }
+
+    fn sshd_config_evidence(config: &SshdConfig) -> Vec<String> {
+        let mut evidence = vec![format!("source={}", config.source)];
+        if let Some(context) = config.evaluation_context.as_deref() {
+            evidence.push(format!("evaluation_context={context}"));
+        }
+        evidence
+    }
+
+    fn fallback_sshd_evidence(config: &SshdConfig) -> Vec<String> {
+        let mut evidence = Self::sshd_config_evidence(config);
+        evidence.push("effective_config=false".to_string());
+        evidence.extend(unknown_evidence(
+            config.probe_error.unwrap_or(UnknownReason::MalformedOutput),
+        ));
+        evidence
     }
 
     fn check_ssh_root_login(
@@ -468,16 +623,12 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.ssh_config.warn", lang),
                 remediation,
             )
-            .with_evidence(unknown_evidence(
-                config.probe_error.unwrap_or(UnknownReason::MalformedOutput),
-            ));
+            .with_evidence(Self::fallback_sshd_evidence(config));
         }
 
         let value = config.get("permitrootlogin").unwrap_or("unknown");
-        let evidence = vec![
-            format!("source={}", config.source),
-            format!("permitrootlogin={}", value),
-        ];
+        let mut evidence = Self::sshd_config_evidence(config);
+        evidence.push(format!("permitrootlogin={value}"));
 
         match value {
             "no" => SecurityCheck::new(
@@ -558,18 +709,38 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.ssh_config.warn", lang),
                 remediation,
             )
-            .with_evidence(unknown_evidence(
-                config.probe_error.unwrap_or(UnknownReason::MalformedOutput),
-            ));
+            .with_evidence(Self::fallback_sshd_evidence(config));
         }
 
-        let value = config.get("passwordauthentication").unwrap_or("unknown");
-        let evidence = vec![
-            format!("source={}", config.source),
-            format!("passwordauthentication={}", value),
-        ];
+        let password_authentication = config.get("passwordauthentication").unwrap_or("unknown");
+        let keyboard_interactive = config
+            .get("kbdinteractiveauthentication")
+            .unwrap_or("unknown");
+        let use_pam = config.get("usepam").unwrap_or("unknown");
+        let mut evidence = Self::sshd_config_evidence(config);
+        evidence.extend([
+            format!("passwordauthentication={password_authentication}"),
+            format!("kbdinteractiveauthentication={keyboard_interactive}"),
+            format!("usepam={use_pam}"),
+        ]);
 
-        if value == "no" {
+        if !matches!(password_authentication, "yes" | "no")
+            || !matches!(keyboard_interactive, "yes" | "no")
+            || !matches!(use_pam, "yes" | "no")
+        {
+            return SecurityCheck::new(
+                "ssh.password_auth",
+                name,
+                "ssh",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.ssh_config.warn", lang),
+                remediation,
+            )
+            .with_evidence(evidence);
+        }
+
+        if password_authentication == "no" && keyboard_interactive == "no" {
             SecurityCheck::new(
                 "ssh.password_auth",
                 name,
@@ -700,21 +871,12 @@ impl SecurityAuditor {
         let remediation = crate::i18n::t("audit.disk_enc.remediation", lang);
         let outcome = ProbeRunner::run(
             ProbeProgram::Lsblk,
-            &["-o", "TYPE"],
+            &["--json", "--tree", "--output", "NAME,TYPE,MOUNTPOINTS"],
             DEFAULT_PROBE_TIMEOUT,
             cancellation,
         )
         .await;
-        let encrypted = outcome.parse_stdout(|stdout| {
-            let mut lines = stdout
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty());
-            if lines.next() != Some("TYPE") {
-                return Err(UnknownReason::MalformedOutput);
-            }
-            Ok(lines.any(|line| line == "crypt"))
-        });
+        let encrypted = outcome.parse_stdout(Self::parse_root_backing_encryption);
 
         match encrypted {
             Fact::Known(true) => SecurityCheck::new(
@@ -726,7 +888,7 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.disk_enc.pass", lang),
                 remediation,
             )
-            .with_evidence(vec!["lsblk_type=crypt".to_string()]),
+            .with_evidence(vec!["root_backing_chain=encrypted".to_string()]),
             Fact::Known(false) => SecurityCheck::new(
                 "system.disk_encryption",
                 name,
@@ -747,6 +909,48 @@ impl SecurityAuditor {
             )
             .with_evidence(unknown_evidence(reason)),
         }
+    }
+
+    fn parse_root_backing_encryption(stdout: &str) -> Result<bool, UnknownReason> {
+        let output = serde_json::from_str::<LsblkOutput>(stdout)
+            .map_err(|_| UnknownReason::MalformedOutput)?;
+        if output.blockdevices.is_empty() {
+            return Err(UnknownReason::MalformedOutput);
+        }
+
+        let mut root_mounts = Vec::new();
+        for device in &output.blockdevices {
+            Self::collect_root_mount_encryption(device, false, &mut root_mounts)?;
+        }
+
+        match root_mounts.as_slice() {
+            [encrypted] => Ok(*encrypted),
+            _ => Err(UnknownReason::MalformedOutput),
+        }
+    }
+
+    fn collect_root_mount_encryption(
+        device: &LsblkDevice,
+        encrypted_ancestor: bool,
+        root_mounts: &mut Vec<bool>,
+    ) -> Result<(), UnknownReason> {
+        if device.name.trim().is_empty() || device.device_type.trim().is_empty() {
+            return Err(UnknownReason::MalformedOutput);
+        }
+
+        let encrypted = encrypted_ancestor || device.device_type == "crypt";
+        if device.mountpoints.as_ref().is_some_and(|mountpoints| {
+            mountpoints
+                .iter()
+                .any(|mountpoint| mountpoint.as_deref() == Some("/"))
+        }) {
+            root_mounts.push(encrypted);
+        }
+
+        for child in &device.children {
+            Self::collect_root_mount_encryption(child, encrypted, root_mounts)?;
+        }
+        Ok(())
     }
 
     async fn check_fail2ban_status(lang: &Lang, cancellation: &ProbeCancellation) -> SecurityCheck {
@@ -813,6 +1017,7 @@ impl SecurityAuditor {
                         .cmp(&b.port)
                         .then_with(|| a.protocol.cmp(&b.protocol))
                         .then_with(|| a.address.cmp(&b.address))
+                        .then_with(|| a.scope.code().cmp(b.scope.code()))
                 });
 
                 let mut open_ports = listening_sockets
@@ -847,7 +1052,7 @@ impl SecurityAuditor {
                         if baseline.allowed_public_ports.contains(&socket.port) {
                             return false;
                         }
-                        !(socket.is_loopback
+                        !(socket.is_loopback()
                             && baseline.allowed_loopback_ports.contains(&socket.port))
                     })
                     .map(Self::format_listening_socket)
@@ -861,7 +1066,7 @@ impl SecurityAuditor {
                         if baseline.allowed_public_ports.contains(&socket.port) {
                             return false;
                         }
-                        !(socket.is_loopback
+                        !(socket.is_loopback()
                             && baseline.allowed_loopback_ports.contains(&socket.port))
                     })
                     .map(|socket| socket.port)
@@ -871,6 +1076,25 @@ impl SecurityAuditor {
 
                 let open_port_strings = open_ports.iter().map(u16::to_string).collect::<Vec<_>>();
                 let suspicious_strings = suspicious.iter().map(u16::to_string).collect::<Vec<_>>();
+                let listener_strings = listening_sockets
+                    .iter()
+                    .map(Self::format_listening_socket)
+                    .collect::<Vec<_>>();
+                let loopback_listener_strings = listening_sockets
+                    .iter()
+                    .filter(|socket| socket.is_loopback())
+                    .map(Self::format_listening_socket)
+                    .collect::<Vec<_>>();
+                let non_loopback_listener_strings = listening_sockets
+                    .iter()
+                    .filter(|socket| socket.is_externally_reachable())
+                    .map(Self::format_listening_socket)
+                    .collect::<Vec<_>>();
+                let wildcard_listener_strings = listening_sockets
+                    .iter()
+                    .filter(|socket| socket.scope == ListenerScope::Wildcard)
+                    .map(Self::format_listening_socket)
+                    .collect::<Vec<_>>();
                 let allowed_public_port_strings = baseline
                     .allowed_public_ports
                     .iter()
@@ -910,31 +1134,22 @@ impl SecurityAuditor {
                     .with_metadata("unexpected_listeners", unexpected_listeners)
                 }
                 .with_metadata("open_ports", open_port_strings)
+                .with_metadata("listeners", listener_strings)
+                .with_metadata("loopback_listeners", loopback_listener_strings)
+                .with_metadata("non_loopback_listeners", non_loopback_listener_strings)
+                .with_metadata("wildcard_listeners", wildcard_listener_strings)
                 .with_metadata("allowed_public_ports", allowed_public_port_strings)
                 .with_metadata("allowed_loopback_ports", allowed_loopback_port_strings);
 
-                if baseline.invalid_token_count > 0 {
-                    if check.status == "PASS" {
-                        check.status = "WARN".to_string();
-                        check.message = crate::i18n::t("audit.ports.config_error", lang);
-                    }
-                    check = check
-                        .with_metadata(
-                            "invalid_allowed_port_count",
-                            vec![baseline.invalid_token_count.to_string()],
-                        )
-                        .with_evidence(vec![
-                            "config_error=invalid_allowed_port".to_string(),
-                            format!(
-                                "invalid_allowed_port_count={}",
-                                baseline.invalid_token_count
-                            ),
-                        ]);
-                }
+                check = Self::apply_invalid_allowed_port_warning(
+                    lang,
+                    check,
+                    baseline.invalid_token_count,
+                );
 
                 PortScanResult {
                     check,
-                    open_ports: Fact::Known(open_ports),
+                    listeners: Fact::Known(listening_sockets),
                 }
             }
             Fact::Unknown(reason) => PortScanResult {
@@ -948,7 +1163,7 @@ impl SecurityAuditor {
                     remediation,
                 )
                 .with_evidence(unknown_evidence(reason)),
-                open_ports: Fact::Unknown(reason),
+                listeners: Fact::Unknown(reason),
             },
         }
     }
@@ -997,10 +1212,34 @@ impl SecurityAuditor {
             .filter(|token| !token.is_empty())
         {
             match token.parse::<u16>() {
-                Ok(port) => ports.push(port),
+                Ok(port) if port != 0 => ports.push(port),
                 Err(_) => *invalid_token_count = invalid_token_count.saturating_add(1),
+                Ok(_) => *invalid_token_count = invalid_token_count.saturating_add(1),
             }
         }
+    }
+
+    fn apply_invalid_allowed_port_warning(
+        lang: &Lang,
+        mut check: SecurityCheck,
+        invalid_token_count: usize,
+    ) -> SecurityCheck {
+        if invalid_token_count == 0 {
+            return check;
+        }
+        if check.status == "PASS" {
+            check.status = "WARN".to_string();
+            check.message = crate::i18n::t("audit.ports.config_error", lang);
+        }
+        check
+            .with_metadata(
+                "invalid_allowed_port_count",
+                vec![invalid_token_count.to_string()],
+            )
+            .with_evidence(vec![
+                "config_error=invalid_allowed_port".to_string(),
+                format!("invalid_allowed_port_count={invalid_token_count}"),
+            ])
     }
 
     fn parse_listening_sockets(ss_output: &str) -> Result<Vec<ListeningSocket>, UnknownReason> {
@@ -1013,22 +1252,36 @@ impl SecurityAuditor {
             let mut parts = line.split_whitespace();
             let protocol = parts
                 .next()
-                .filter(|value| !value.is_empty())
+                .filter(|value| matches!(*value, "tcp" | "udp"))
                 .ok_or(UnknownReason::MalformedOutput)?;
             let state = parts.next().ok_or(UnknownReason::MalformedOutput)?;
-            if state != "LISTEN" && state != "UNCONN" {
+            let valid_state = (protocol == "tcp" && state == "LISTEN")
+                || (protocol == "udp" && matches!(state, "UNCONN" | "LISTEN"));
+            if !valid_state {
                 return Err(UnknownReason::MalformedOutput);
             }
-            let _receive_queue = parts.next().ok_or(UnknownReason::MalformedOutput)?;
-            let _send_queue = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            parts
+                .next()
+                .and_then(|queue| queue.parse::<u64>().ok())
+                .ok_or(UnknownReason::MalformedOutput)?;
+            parts
+                .next()
+                .and_then(|queue| queue.parse::<u64>().ok())
+                .ok_or(UnknownReason::MalformedOutput)?;
             let local_address = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            parts
+                .next()
+                .filter(|peer_address| !peer_address.is_empty())
+                .ok_or(UnknownReason::MalformedOutput)?;
             let (address, port) =
                 Self::parse_local_address(local_address).ok_or(UnknownReason::MalformedOutput)?;
+            let scope =
+                Self::classify_listener_scope(&address).ok_or(UnknownReason::MalformedOutput)?;
             sockets.push(ListeningSocket {
                 protocol: protocol.to_string(),
-                is_loopback: Self::is_loopback_address(&address),
                 address,
                 port,
+                scope,
             });
         }
 
@@ -1050,25 +1303,46 @@ impl SecurityAuditor {
         Some((address.to_string(), port.parse::<u16>().ok()?))
     }
 
-    fn is_loopback_address(address: &str) -> bool {
-        let address = address
-            .trim_matches(['[', ']'])
-            .split('%')
-            .next()
-            .unwrap_or(address);
+    fn classify_listener_scope(address: &str) -> Option<ListenerScope> {
+        let address = address.trim_matches(['[', ']']);
+        if address == "*" {
+            return Some(ListenerScope::Wildcard);
+        }
 
-        address == "localhost" || address == "::1" || address.starts_with("127.")
+        let address_without_zone = address.split('%').next()?;
+        match address_without_zone.parse::<IpAddr>().ok()? {
+            IpAddr::V4(address) if address.is_unspecified() => Some(ListenerScope::Wildcard),
+            IpAddr::V6(address) if address.is_unspecified() => Some(ListenerScope::Wildcard),
+            IpAddr::V4(address) if address.is_loopback() => Some(ListenerScope::Loopback),
+            IpAddr::V6(address)
+                if address.is_loopback()
+                    || address
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback()) =>
+            {
+                Some(ListenerScope::Loopback)
+            }
+            _ => Some(ListenerScope::NonLoopback),
+        }
     }
 
     fn format_listening_socket(socket: &ListeningSocket) -> String {
-        format!("{}://{}:{}", socket.protocol, socket.address, socket.port)
+        let address = if socket.address.contains(':') {
+            format!("[{}]", socket.address)
+        } else {
+            socket.address.clone()
+        };
+        format!("{}://{}:{}", socket.protocol, address, socket.port)
     }
 
-    fn check_docker_tcp_api_ports(lang: &Lang, open_ports: &Fact<Vec<u16>>) -> SecurityCheck {
+    fn check_docker_tcp_api_ports(
+        lang: &Lang,
+        listeners: &Fact<Vec<ListeningSocket>>,
+    ) -> SecurityCheck {
         let name = crate::i18n::t("audit.docker_api.name", lang);
         let remediation = crate::i18n::t("audit.docker_api.remediation", lang);
-        let open_ports = match open_ports {
-            Fact::Known(open_ports) => open_ports,
+        let listeners = match listeners {
+            Fact::Known(listeners) => listeners,
             Fact::Unknown(reason) => {
                 return SecurityCheck::new(
                     "docker.tcp_api",
@@ -1082,12 +1356,23 @@ impl SecurityAuditor {
                 .with_evidence(unknown_evidence(*reason));
             }
         };
-        let exposed = open_ports
+
+        let docker_listeners = listeners
+            .iter()
+            .filter(|listener| listener.protocol == "tcp" && matches!(listener.port, 2375 | 2376))
+            .collect::<Vec<_>>();
+        let public_listeners = docker_listeners
             .iter()
             .copied()
-            .filter(|port| *port == 2375 || *port == 2376)
+            .filter(|listener| listener.is_externally_reachable())
             .collect::<Vec<_>>();
-        if exposed.is_empty() {
+        let loopback_listeners = docker_listeners
+            .iter()
+            .copied()
+            .filter(|listener| listener.is_loopback())
+            .collect::<Vec<_>>();
+
+        if docker_listeners.is_empty() {
             SecurityCheck::new(
                 "docker.tcp_api",
                 name,
@@ -1097,12 +1382,54 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_api.pass", lang),
                 remediation,
             )
-        } else {
+        } else if public_listeners.is_empty() {
+            let listener_strings = loopback_listeners
+                .iter()
+                .map(|listener| Self::format_listening_socket(listener))
+                .collect::<Vec<_>>();
             SecurityCheck::new(
                 "docker.tcp_api",
                 name,
                 "docker",
-                if exposed.contains(&2375) {
+                "medium",
+                "WARN",
+                crate::i18n::t("audit.docker_api.fail", lang),
+                remediation,
+            )
+            .with_evidence(
+                loopback_listeners
+                    .iter()
+                    .map(|listener| {
+                        format!(
+                            "docker_api_listener={} scope={}",
+                            Self::format_listening_socket(listener),
+                            listener.scope.code()
+                        )
+                    })
+                    .collect(),
+            )
+            .with_metadata("loopback_listeners", listener_strings)
+        } else {
+            let public_listener_strings = public_listeners
+                .iter()
+                .map(|listener| Self::format_listening_socket(listener))
+                .collect::<Vec<_>>();
+            let loopback_listener_strings = loopback_listeners
+                .iter()
+                .map(|listener| Self::format_listening_socket(listener))
+                .collect::<Vec<_>>();
+            let mut exposed_ports = public_listeners
+                .iter()
+                .map(|listener| listener.port)
+                .collect::<Vec<_>>();
+            exposed_ports.sort_unstable();
+            exposed_ports.dedup();
+
+            SecurityCheck::new(
+                "docker.tcp_api",
+                name,
+                "docker",
+                if exposed_ports.contains(&2375) {
                     "critical"
                 } else {
                     "high"
@@ -1111,7 +1438,7 @@ impl SecurityAuditor {
                 format!(
                     "{}: {}",
                     crate::i18n::t("audit.docker_api.fail", lang),
-                    exposed
+                    exposed_ports
                         .iter()
                         .map(u16::to_string)
                         .collect::<Vec<_>>()
@@ -1120,11 +1447,20 @@ impl SecurityAuditor {
                 remediation,
             )
             .with_evidence(
-                exposed
+                public_listeners
                     .iter()
-                    .map(|port| format!("docker_api_port={}", port))
+                    .map(|listener| {
+                        format!(
+                            "docker_api_port={} listener={} scope={}",
+                            listener.port,
+                            Self::format_listening_socket(listener),
+                            listener.scope.code()
+                        )
+                    })
                     .collect(),
             )
+            .with_metadata("public_listeners", public_listener_strings)
+            .with_metadata("loopback_listeners", loopback_listener_strings)
         }
     }
 
@@ -1399,6 +1735,233 @@ mod tests {
         assert_eq!(config.get("ignored"), None);
     }
 
+    fn effective_sshd_fixture(
+        permit_root_login: &str,
+        password_authentication: &str,
+        keyboard_interactive_authentication: &str,
+        use_pam: &str,
+    ) -> String {
+        format!(
+            "permitrootlogin {permit_root_login}\n\
+             passwordauthentication {password_authentication}\n\
+             kbdinteractiveauthentication {keyboard_interactive_authentication}\n\
+             usepam {use_pam}\n\
+             port 22\n"
+        )
+    }
+
+    #[test]
+    fn test_effective_sshd_config_requires_complete_valid_bounded_facts() {
+        let complete = effective_sshd_fixture("no", "no", "no", "yes");
+        let root_config = SecurityAuditor::parse_effective_sshd_config_output(
+            &complete,
+            SSHD_ROOT_EVALUATION_CONTEXT,
+        )
+        .expect("complete root-context sshd -T facts should parse");
+        let password_config = SecurityAuditor::parse_effective_sshd_config_output(
+            &complete,
+            SSHD_PASSWORD_EVALUATION_CONTEXT,
+        )
+        .expect("complete password-context sshd -T facts should parse");
+
+        assert!(root_config.effective);
+        assert_eq!(root_config.source, SSHD_EFFECTIVE_SOURCE);
+        assert_eq!(
+            root_config.evaluation_context.as_deref(),
+            Some(SSHD_ROOT_EVALUATION_CONTEXT)
+        );
+        assert_eq!(
+            SecurityAuditor::check_ssh_root_login(&Lang::EN, Ok(&root_config)).status,
+            "PASS"
+        );
+        let password_check =
+            SecurityAuditor::check_ssh_password_auth(&Lang::EN, Ok(&password_config));
+        assert_eq!(password_check.status, "PASS");
+        assert!(password_check.evidence.iter().any(|value| {
+            value == &format!("evaluation_context={SSHD_PASSWORD_EVALUATION_CONTEXT}")
+        }));
+        assert!(!SSHD_ROOT_EVALUATION_CONTEXT.contains("laddr=127."));
+        assert!(!SSHD_PASSWORD_EVALUATION_CONTEXT.contains("laddr=127."));
+
+        let missing_pam =
+            "permitrootlogin no\npasswordauthentication no\nkbdinteractiveauthentication no\n";
+        assert_eq!(
+            SecurityAuditor::parse_effective_sshd_config_output(
+                missing_pam,
+                SSHD_ROOT_EVALUATION_CONTEXT,
+            )
+            .expect_err("incomplete effective output must remain unknown"),
+            UnknownReason::MalformedOutput
+        );
+        let duplicate = format!("{complete}passwordauthentication no\n");
+        assert_eq!(
+            SecurityAuditor::parse_effective_sshd_config_output(
+                &duplicate,
+                SSHD_ROOT_EVALUATION_CONTEXT,
+            )
+            .expect_err("ambiguous effective output must remain unknown"),
+            UnknownReason::MalformedOutput
+        );
+    }
+
+    #[test]
+    fn test_password_check_does_not_reuse_root_only_match_context() {
+        let root_exception = effective_sshd_fixture("no", "no", "no", "yes");
+        let ordinary_user = effective_sshd_fixture("no", "yes", "yes", "yes");
+        let root_config = SecurityAuditor::parse_effective_sshd_config_output(
+            &root_exception,
+            SSHD_ROOT_EVALUATION_CONTEXT,
+        )
+        .expect("root-only effective config should parse");
+        let password_config = SecurityAuditor::parse_effective_sshd_config_output(
+            &ordinary_user,
+            SSHD_PASSWORD_EVALUATION_CONTEXT,
+        )
+        .expect("ordinary-user effective config should parse");
+
+        assert_eq!(
+            SecurityAuditor::check_ssh_root_login(&Lang::EN, Ok(&root_config)).status,
+            "PASS"
+        );
+        let password_check =
+            SecurityAuditor::check_ssh_password_auth(&Lang::EN, Ok(&password_config));
+        assert_eq!(password_check.status, "FAIL");
+        assert!(password_check.evidence.iter().any(|value| {
+            value == &format!("evaluation_context={SSHD_PASSWORD_EVALUATION_CONTEXT}")
+        }));
+    }
+
+    #[test]
+    fn test_sshd_fallback_config_never_proves_pass() {
+        let mut fallback = SecurityAuditor::parse_sshd_config_output(
+            "PermitRootLogin no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\n",
+            "/etc/ssh/sshd_config",
+        );
+        fallback.probe_error = Some(UnknownReason::MissingExecutable);
+
+        let root_check = SecurityAuditor::check_ssh_root_login(&Lang::EN, Ok(&fallback));
+        let password_check = SecurityAuditor::check_ssh_password_auth(&Lang::EN, Ok(&fallback));
+        assert_eq!(root_check.status, "WARN");
+        assert_eq!(password_check.status, "WARN");
+        assert!(
+            root_check
+                .evidence
+                .iter()
+                .any(|value| value == "effective_config=false")
+        );
+        assert!(
+            password_check
+                .evidence
+                .iter()
+                .any(|value| value == "probe_error=missing_executable")
+        );
+    }
+
+    #[test]
+    fn test_ssh_password_check_covers_keyboard_interactive_pam_path() {
+        let keyboard_interactive = effective_sshd_fixture("no", "no", "yes", "yes");
+        let config = SecurityAuditor::parse_effective_sshd_config_output(
+            &keyboard_interactive,
+            SSHD_PASSWORD_EVALUATION_CONTEXT,
+        )
+        .expect("effective keyboard-interactive config should parse");
+        let check = SecurityAuditor::check_ssh_password_auth(&Lang::EN, Ok(&config));
+
+        assert_eq!(check.status, "FAIL");
+        assert!(
+            check
+                .evidence
+                .iter()
+                .any(|value| value == "kbdinteractiveauthentication=yes")
+        );
+        assert!(check.evidence.iter().any(|value| value == "usepam=yes"));
+    }
+
+    #[test]
+    fn test_root_encryption_requires_crypt_in_root_backing_chain() {
+        let unrelated_encrypted_volume = r#"{
+            "blockdevices": [
+                {
+                    "name": "/dev/vda",
+                    "type": "disk",
+                    "mountpoints": [null],
+                    "children": [
+                        {"name": "/dev/vda1", "type": "part", "mountpoints": ["/"]}
+                    ]
+                },
+                {
+                    "name": "/dev/vdb",
+                    "type": "disk",
+                    "mountpoints": [null],
+                    "children": [
+                        {"name": "/dev/mapper/vault", "type": "crypt", "mountpoints": ["/srv"]}
+                    ]
+                }
+            ]
+        }"#;
+        assert!(
+            !SecurityAuditor::parse_root_backing_encryption(unrelated_encrypted_volume)
+                .expect("valid unencrypted root tree should be known")
+        );
+
+        let encrypted_root = r#"{
+            "blockdevices": [
+                {
+                    "name": "/dev/vda",
+                    "type": "disk",
+                    "mountpoints": [null],
+                    "children": [
+                        {
+                            "name": "/dev/vda2",
+                            "type": "part",
+                            "mountpoints": [null],
+                            "children": [
+                                {
+                                    "name": "/dev/mapper/cryptroot",
+                                    "type": "crypt",
+                                    "mountpoints": [null],
+                                    "children": [
+                                        {"name": "/dev/mapper/vg-root", "type": "lvm", "mountpoints": ["/"]}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        assert!(
+            SecurityAuditor::parse_root_backing_encryption(encrypted_root)
+                .expect("encrypted root backing tree should be proven")
+        );
+    }
+
+    #[test]
+    fn test_root_encryption_missing_or_ambiguous_root_is_unknown() {
+        let no_root = r#"{
+            "blockdevices": [
+                {"name": "/dev/vda", "type": "disk", "mountpoints": [null]}
+            ]
+        }"#;
+        assert_eq!(
+            SecurityAuditor::parse_root_backing_encryption(no_root)
+                .expect_err("missing root mount must remain unknown"),
+            UnknownReason::MalformedOutput
+        );
+
+        let two_roots = r#"{
+            "blockdevices": [
+                {"name": "/dev/vda1", "type": "part", "mountpoints": ["/"]},
+                {"name": "/dev/vdb1", "type": "crypt", "mountpoints": ["/"]}
+            ]
+        }"#;
+        assert_eq!(
+            SecurityAuditor::parse_root_backing_encryption(two_roots)
+                .expect_err("ambiguous root backing tree must remain unknown"),
+            UnknownReason::MalformedOutput
+        );
+    }
+
     #[test]
     fn test_parse_listening_sockets_extracts_ports() {
         let output = "\
@@ -1438,13 +2001,37 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
         let baseline = SecurityAuditor::listening_port_baseline(
             3000,
             8090,
-            Some("5435,bad"),
+            Some("5435,0,bad"),
             Some("70000,bad"),
         );
 
         assert_eq!(baseline.allowed_public_ports, vec![22, 80, 443, 5435, 8090]);
         assert_eq!(baseline.allowed_loopback_ports, vec![3000]);
-        assert_eq!(baseline.invalid_token_count, 3);
+        assert_eq!(baseline.invalid_token_count, 4);
+    }
+
+    #[test]
+    fn test_invalid_allowed_port_tokens_force_warn_without_raw_values() {
+        let pass = SecurityCheck::new(
+            "network.listening_ports",
+            "Listening ports".to_string(),
+            "network",
+            "medium",
+            "PASS",
+            "Expected listeners".to_string(),
+            "Review listeners".to_string(),
+        );
+        let check = SecurityAuditor::apply_invalid_allowed_port_warning(&Lang::EN, pass, 3);
+
+        assert_eq!(check.status, "WARN");
+        assert_eq!(check.evidence[0], "config_error=invalid_allowed_port");
+        assert_eq!(check.metadata["invalid_allowed_port_count"], vec!["3"]);
+        assert!(
+            check
+                .evidence
+                .iter()
+                .all(|value| !value.contains("bad") && !value.contains("70000"))
+        );
     }
 
     #[test]
@@ -1458,17 +2045,62 @@ tcp LISTEN 0 128 [::1]:9001 [::]:*
         let sockets = SecurityAuditor::parse_listening_sockets(output).expect("valid ss output");
         let loopback_ports = sockets
             .iter()
-            .filter(|socket| socket.is_loopback)
+            .filter(|socket| socket.is_loopback())
             .map(|socket| socket.port)
             .collect::<Vec<_>>();
         let public_ports = sockets
             .iter()
-            .filter(|socket| !socket.is_loopback)
+            .filter(|socket| !socket.is_loopback())
             .map(|socket| socket.port)
             .collect::<Vec<_>>();
 
         assert_eq!(loopback_ports, vec![3000, 9001]);
         assert_eq!(public_ports, vec![5435]);
+    }
+
+    #[test]
+    fn test_listener_facts_preserve_protocol_address_and_scope() {
+        let output = "\
+tcp LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:*\n\
+tcp LISTEN 0 4096 192.0.2.10:443 0.0.0.0:*\n\
+tcp LISTEN 0 4096 [::]:22 [::]:*\n\
+udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*\n";
+
+        let sockets = SecurityAuditor::parse_listening_sockets(output)
+            .expect("valid listener facts should parse");
+        assert_eq!(
+            sockets,
+            vec![
+                ListeningSocket {
+                    protocol: "tcp".to_string(),
+                    address: "127.0.0.1".to_string(),
+                    port: 3000,
+                    scope: ListenerScope::Loopback,
+                },
+                ListeningSocket {
+                    protocol: "tcp".to_string(),
+                    address: "192.0.2.10".to_string(),
+                    port: 443,
+                    scope: ListenerScope::NonLoopback,
+                },
+                ListeningSocket {
+                    protocol: "tcp".to_string(),
+                    address: "::".to_string(),
+                    port: 22,
+                    scope: ListenerScope::Wildcard,
+                },
+                ListeningSocket {
+                    protocol: "udp".to_string(),
+                    address: "0.0.0.0".to_string(),
+                    port: 5353,
+                    scope: ListenerScope::Wildcard,
+                },
+            ]
+        );
+        assert_eq!(
+            SecurityAuditor::format_listening_socket(&sockets[2]),
+            "tcp://[::]:22"
+        );
     }
 
     #[test]
@@ -1487,14 +2119,97 @@ this line is not valid ss output
 
     #[test]
     fn test_unknown_port_fact_keeps_dependent_docker_check_unknown() {
-        let lang = Lang::EN;
-        let check = SecurityAuditor::check_docker_tcp_api_ports(
-            &lang,
-            &Fact::Unknown(UnknownReason::Timeout),
+        for reason in [
+            UnknownReason::NonzeroExit,
+            UnknownReason::EmptyOutput,
+            UnknownReason::MalformedOutput,
+            UnknownReason::Timeout,
+        ] {
+            let check =
+                SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Unknown(reason));
+
+            assert_eq!(check.status, "WARN");
+            assert_eq!(
+                check.evidence,
+                vec![format!("probe_error={}", reason.code())]
+            );
+        }
+    }
+
+    #[test]
+    fn test_docker_tcp_api_distinguishes_public_wildcard_and_loopback_listeners() {
+        let public = SecurityAuditor::parse_listening_sockets(
+            "tcp LISTEN 0 4096 192.0.2.10:2375 0.0.0.0:*\n",
+        )
+        .expect("public Docker listener should parse");
+        let public_check =
+            SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Known(public));
+        assert_eq!(public_check.status, "FAIL");
+        assert_eq!(public_check.severity, "critical");
+        assert_eq!(
+            public_check.metadata["public_listeners"],
+            vec!["tcp://192.0.2.10:2375"]
+        );
+        assert!(
+            public_check
+                .evidence
+                .iter()
+                .any(|value| value.contains("scope=non_loopback"))
         );
 
-        assert_eq!(check.status, "WARN");
-        assert_eq!(check.evidence, vec!["probe_error=timeout"]);
+        let wildcard =
+            SecurityAuditor::parse_listening_sockets("tcp LISTEN 0 4096 [::]:2376 [::]:*\n")
+                .expect("wildcard Docker listener should parse");
+        let wildcard_check =
+            SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Known(wildcard));
+        assert_eq!(wildcard_check.status, "FAIL");
+        assert_eq!(wildcard_check.severity, "high");
+        assert!(
+            wildcard_check
+                .evidence
+                .iter()
+                .any(|value| value.contains("scope=wildcard"))
+        );
+
+        let loopback = SecurityAuditor::parse_listening_sockets(
+            "tcp LISTEN 0 4096 127.0.0.1:2375 0.0.0.0:*\n",
+        )
+        .expect("loopback Docker listener should parse");
+        let loopback_check =
+            SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Known(loopback));
+        assert_eq!(loopback_check.status, "WARN");
+        assert_eq!(loopback_check.severity, "medium");
+        assert_eq!(
+            loopback_check.metadata["loopback_listeners"],
+            vec!["tcp://127.0.0.1:2375"]
+        );
+    }
+
+    #[test]
+    fn test_docker_tcp_api_ignores_udp_port_number_and_has_stable_transitions() {
+        let udp_only =
+            SecurityAuditor::parse_listening_sockets("udp UNCONN 0 0 0.0.0.0:2375 0.0.0.0:*\n")
+                .expect("UDP listener should parse");
+        let pass = SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Known(udp_only));
+        let warn = SecurityAuditor::check_docker_tcp_api_ports(
+            &Lang::EN,
+            &Fact::Unknown(UnknownReason::Timeout),
+        );
+        let public =
+            SecurityAuditor::parse_listening_sockets("tcp LISTEN 0 4096 0.0.0.0:2375 0.0.0.0:*\n")
+                .expect("public listener should parse");
+        let fail = SecurityAuditor::check_docker_tcp_api_ports(&Lang::EN, &Fact::Known(public));
+
+        assert_eq!(
+            [
+                warn.status.as_str(),
+                fail.status.as_str(),
+                pass.status.as_str()
+            ],
+            ["WARN", "FAIL", "PASS"]
+        );
+        assert_eq!(warn.id, fail.id);
+        assert_eq!(fail.id, pass.id);
     }
 
     #[test]
