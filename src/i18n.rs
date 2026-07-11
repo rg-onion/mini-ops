@@ -47,6 +47,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
 
             "audit.collection.name" => "Сбор данных аудита".to_string(),
             "audit.collection.error" => "Сбор данных аудита превысил общий лимит времени".to_string(),
+            "audit.collection.degraded" => "Снимок аудита неполный или недоступен; одна или несколько проверок имеют неизвестное состояние".to_string(),
             "audit.collection.remediation" => "Проверьте доступность системных утилит и повторите аудит".to_string(),
 
             "audit.ssh_root.name" => "Доступ root через SSH".to_string(),
@@ -122,6 +123,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
 
             "audit.collection.name" => "Security Audit Collection".to_string(),
             "audit.collection.error" => "Security audit collection exceeded its overall deadline".to_string(),
+            "audit.collection.degraded" => "The security audit snapshot is incomplete or unavailable; one or more checks have unknown state".to_string(),
             "audit.collection.remediation" => "Verify that required system tools respond and run the audit again".to_string(),
 
             "audit.ssh_root.name" => "SSH Root Login".to_string(),

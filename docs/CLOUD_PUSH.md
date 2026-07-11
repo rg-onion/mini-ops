@@ -31,6 +31,8 @@ CLOUD_PUSH_ENABLED=true
 CLOUD_HUB_URL=https://your-hub.example.com
 CLOUD_AGENT_ID=your_agent_id_here
 CLOUD_AGENT_TOKEN=your_agent_token_here
+# Optional: unset defaults to 60; explicit values must be 60..86400.
+CLOUD_PUSH_INTERVAL=60
 ```
 
 If `CLOUD_PUSH_ENABLED` is absent, empty, or set to anything other than the exact
@@ -111,6 +113,14 @@ Do not set `CLOUD_PUSH_ENABLED=true`. You can also remove or comment out all
 
 - Cloud Push is compiled in but inactive unless `CLOUD_PUSH_ENABLED=true`.
 - If any required Cloud Push setting is missing, the push loop does not start.
+- An unset `CLOUD_PUSH_INTERVAL` defaults to `60` seconds. A blank, invalid, or
+  out-of-range explicit value disables the push loop instead of being clamped.
+- The first request is delayed by one validated interval after startup.
+- Security fields come from the latest shared local audit snapshot; Cloud Push
+  never starts security probes itself. The whole push is skipped when that
+  snapshot is missing, degraded, or older than twice the configured local audit
+  interval, because the current payload cannot represent unknown security
+  values safely.
 - No data is sent to any Mini-Ops-operated service by default.
 - Payloads are sent only to the configured `CLOUD_HUB_URL`.
 - HTTPS is required by default; `CLOUD_PUSH_ALLOW_HTTP=true` is only for local

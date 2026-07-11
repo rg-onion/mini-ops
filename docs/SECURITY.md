@@ -146,6 +146,22 @@ Security audit work is bounded with local runtime controls:
 If Docker inspection times out, the Docker container hardening check returns
 `WARN` with timeout evidence instead of blocking the whole audit.
 
+The API, background monitor, and optional Cloud Push consumer share one
+language-neutral, single-flight audit snapshot. Concurrent refreshes join one
+collection, and changing the API language does not run probes again. The
+existing `/api/security/audit` body remains an array; successful responses add
+`X-Security-Collector-Epoch`, `X-Security-Generation`,
+`X-Security-Collected-At`, and `X-Security-Collection-Status` headers. If no new
+publishable snapshot is available within the bounded collection window, the
+route returns `503` with error code `security_audit_unavailable` rather than a
+stale healthy result.
+
+Unknown or incomplete facts remain visible as `WARN` and mark the snapshot
+`degraded`. Cloud Push reads snapshots only; it skips a push when the snapshot
+is missing, degraded, or older than twice the audit interval, because its
+current security payload cannot express unknown values without misleading
+zero/healthy fields.
+
 ## Listening Port Baseline
 
 Mini-Ops reports listening sockets that are not part of the local expected-port

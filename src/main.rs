@@ -12,10 +12,14 @@ mod retention;
 mod runtime;
 mod security;
 mod security_events;
+mod security_snapshot;
 mod ssh_alerts;
 
-use security::{SecurityAuditCache, SecurityCheck, SecurityMonitor};
+use security::SecurityMonitor;
 use security_events::{SecurityEvent, SecurityEventService};
+use security_snapshot::{
+    SecurityAuditSnapshot, SecuritySnapshotService, SecuritySnapshotUnavailable,
+};
 use ssh_alerts::{SshAlertsService, SshLoginEvent};
 
 use rand::Rng;
@@ -172,7 +176,6 @@ async fn main() {
     let metrics_state = Arc::new(MetricsState::new());
     let notifications = Arc::new(NotificationService::new());
     let retention_config = retention::RetentionConfig::from_env();
-    let security_audit_cache = SecurityAuditCache::from_env();
     let security_events = Arc::new(SecurityEventService::new(pool.clone()));
     let notification_outbox =
         Arc::new(NotificationOutbox::new(pool.clone(), notifications.clone()));
@@ -184,6 +187,7 @@ async fn main() {
             None
         }
     };
+    let security_snapshots = SecuritySnapshotService::from_env(docker_service.clone());
 
     // Setup SSH Alerts
     let ssh_alerts_service = Arc::new(SshAlertsService::new(
@@ -213,7 +217,7 @@ async fn main() {
     let security_monitor = Arc::new(SecurityMonitor::new(
         notifications.clone(),
         notification_outbox.clone(),
-        docker_service.clone(),
+        Arc::clone(&security_snapshots),
         security_events.clone(),
     ));
     tokio::spawn(async move {
@@ -231,28 +235,42 @@ async fn main() {
             std::env::var("CLOUD_AGENT_TOKEN"),
         ) {
             (Ok(hub_url), Ok(agent_id), Ok(agent_token)) => {
-                let interval = std::env::var("CLOUD_PUSH_INTERVAL")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(60u64);
-                let config = cloud_push::CloudPushConfig {
-                    hub_url,
-                    agent_id,
-                    agent_token,
-                    push_interval_secs: interval,
+                let interval = match std::env::var_os("CLOUD_PUSH_INTERVAL") {
+                    None => cloud_push::parse_push_interval(None),
+                    Some(value) => value
+                        .to_str()
+                        .ok_or(cloud_push::CloudPushIntervalError::Invalid)
+                        .and_then(|value| cloud_push::parse_push_interval(Some(value))),
                 };
-                match cloud_push::CloudPushService::new(config) {
-                    Ok(svc) => {
-                        Arc::new(svc).start(
-                            Arc::clone(&metrics_state),
-                            docker_service.clone(),
-                            Arc::clone(&ssh_alerts_service),
-                        );
-                        tracing::info!("Cloud push enabled, interval={}s", interval);
+                match interval {
+                    Ok(interval) => {
+                        let config = cloud_push::CloudPushConfig {
+                            hub_url,
+                            agent_id,
+                            agent_token,
+                            push_interval_secs: interval,
+                        };
+                        match cloud_push::CloudPushService::new(
+                            config,
+                            Arc::clone(&security_snapshots),
+                        ) {
+                            Ok(svc) => {
+                                Arc::new(svc).start(
+                                    Arc::clone(&metrics_state),
+                                    docker_service.clone(),
+                                    Arc::clone(&ssh_alerts_service),
+                                );
+                                tracing::info!("Cloud push enabled, interval={}s", interval);
+                            }
+                            Err(e) => {
+                                tracing::error!("Cloud push disabled: {}", e);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("Cloud push disabled: {}", e);
-                    }
+                    Err(error) => tracing::warn!(
+                        configuration_error = error.code(),
+                        "Cloud push disabled: invalid CLOUD_PUSH_INTERVAL"
+                    ),
                 }
             }
             _ => tracing::warn!(
@@ -404,7 +422,7 @@ async fn main() {
             history: history_manager,
             ssh_alerts: ssh_alerts_service,
             security_events,
-            security_audit_cache,
+            security_snapshots,
         });
 
     let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -588,7 +606,7 @@ struct AppState {
     history: Arc<HistoryManager>,
     ssh_alerts: Arc<SshAlertsService>,
     security_events: Arc<SecurityEventService>,
-    security_audit_cache: SecurityAuditCache,
+    security_snapshots: Arc<SecuritySnapshotService>,
 }
 
 impl FromRef<AppState> for Arc<DeploymentService> {
@@ -846,14 +864,70 @@ fn serve_file(path: &str) -> Response {
 async fn get_security_audit_handler(
     State(state): State<AppState>,
     headers: header::HeaderMap,
-) -> Json<Vec<SecurityCheck>> {
+) -> Response {
     let lang = i18n::Lang::from_headers(&headers);
-    Json(
-        state
-            .security_audit_cache
-            .get_or_run(lang, state.docker.as_deref())
-            .await,
-    )
+    let result = state
+        .security_snapshots
+        .get_or_refresh(state.security_snapshots.api_cache_ttl())
+        .await;
+    security_audit_result_response(result, &lang)
+}
+
+fn security_audit_result_response(
+    result: Result<Arc<SecurityAuditSnapshot>, SecuritySnapshotUnavailable>,
+    lang: &i18n::Lang,
+) -> Response {
+    match result {
+        Ok(snapshot) => security_audit_snapshot_response(&snapshot, lang),
+        Err(_) => api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security_audit_unavailable",
+        ),
+    }
+}
+
+fn security_audit_snapshot_response(
+    snapshot: &SecurityAuditSnapshot,
+    lang: &i18n::Lang,
+) -> Response {
+    let identity = snapshot.identity();
+    let epoch = identity.collector_epoch().to_string();
+    let generation = identity.generation().to_string();
+    let collected_at = snapshot.collected_at().to_string();
+    let Ok(epoch) = header::HeaderValue::from_str(&epoch) else {
+        return api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security_audit_unavailable",
+        );
+    };
+    let Ok(generation) = header::HeaderValue::from_str(&generation) else {
+        return api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security_audit_unavailable",
+        );
+    };
+    let Ok(collected_at) = header::HeaderValue::from_str(&collected_at) else {
+        return api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "security_audit_unavailable",
+        );
+    };
+
+    let mut response = Json(snapshot.project(lang)).into_response();
+    response
+        .headers_mut()
+        .insert("x-security-collector-epoch", epoch);
+    response
+        .headers_mut()
+        .insert("x-security-generation", generation);
+    response
+        .headers_mut()
+        .insert("x-security-collected-at", collected_at);
+    response.headers_mut().insert(
+        "x-security-collection-status",
+        header::HeaderValue::from_static(snapshot.collection_status().code()),
+    );
+    response
 }
 
 #[derive(Deserialize)]
@@ -1117,5 +1191,49 @@ mod tests {
         assert_eq!(counters.command_calls.load(Ordering::SeqCst), 0);
         assert_eq!(counters.history_writes.load(Ordering::SeqCst), 0);
         assert_eq!(counters.file_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn security_audit_response_keeps_array_body_and_adds_snapshot_headers() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let snapshots = SecuritySnapshotService::test_service(counter);
+        snapshots
+            .publish_test_snapshot(std::time::Duration::ZERO, false)
+            .await;
+        let snapshot = snapshots
+            .latest()
+            .await
+            .expect("test snapshot should be published");
+
+        let response = security_audit_snapshot_response(&snapshot, &i18n::Lang::RU);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("x-security-collector-epoch")
+        );
+        assert_eq!(
+            response.headers()["x-security-generation"],
+            snapshot.identity().generation().to_string()
+        );
+        assert_eq!(
+            response.headers()["x-security-collected-at"],
+            snapshot.collected_at().to_string()
+        );
+        assert_eq!(response.headers()["x-security-collection-status"], "full");
+
+        let body = to_bytes(response.into_body(), 32 * 1024)
+            .await
+            .expect("bounded audit response should be readable");
+        let value: Value = serde_json::from_slice(&body).expect("audit body should be JSON");
+        assert!(value.is_array(), "legacy API body must remain an array");
+    }
+
+    #[tokio::test]
+    async fn unavailable_security_snapshot_maps_to_generic_typed_503() {
+        let response =
+            security_audit_result_response(Err(SecuritySnapshotUnavailable), &i18n::Lang::EN);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_error_code(response, "security_audit_unavailable").await;
     }
 }

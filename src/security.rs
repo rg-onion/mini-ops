@@ -5,7 +5,7 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 #[path = "security_probe.rs"]
@@ -20,9 +20,13 @@ use crate::docker::DockerService;
 use crate::i18n::Lang;
 use crate::notifications::{NotificationOutbox, NotificationService};
 use crate::security_events::SecurityEventService;
+use crate::security_snapshot::{
+    SecurityCollectionStatus, SecuritySnapshotIdentity, SecuritySnapshotService,
+};
 
 const AUDIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const FILE_READ_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const MONITOR_SNAPSHOT_MAX_AGE: Duration = Duration::ZERO;
 // `sshd -T` needs concrete connection contexts to evaluate `Match` blocks.
 // Reserved non-loopback addresses deliberately avoid treating localhost-only
 // exceptions as representative remote SSH state. Root-login and ordinary-user
@@ -246,57 +250,6 @@ struct ListeningPortBaseline {
 }
 
 pub struct SecurityAuditor;
-
-#[derive(Clone)]
-pub struct SecurityAuditCache {
-    ttl: Duration,
-    cached: Arc<Mutex<Option<CachedSecurityAudit>>>,
-}
-
-#[derive(Clone)]
-struct CachedSecurityAudit {
-    lang: Lang,
-    created_at: Instant,
-    checks: Vec<SecurityCheck>,
-}
-
-impl SecurityAuditCache {
-    pub fn from_env() -> Self {
-        Self {
-            ttl: env_duration_secs("SECURITY_AUDIT_CACHE_TTL_SECS", 30, 0, 3600),
-            cached: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub async fn get_or_run(
-        &self,
-        lang: Lang,
-        docker: Option<&DockerService>,
-    ) -> Vec<SecurityCheck> {
-        if self.ttl.as_secs() > 0 {
-            let cached = self.cached.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.lang == lang
-                && cached.created_at.elapsed() < self.ttl
-            {
-                return cached.checks.clone();
-            }
-        }
-
-        let checks = SecurityAuditor::run_audit(&lang, docker).await;
-
-        if self.ttl.as_secs() > 0 {
-            let mut cached = self.cached.lock().await;
-            *cached = Some(CachedSecurityAudit {
-                lang,
-                created_at: Instant::now(),
-                checks: checks.clone(),
-            });
-        }
-
-        checks
-    }
-}
 
 fn env_duration_secs(key: &str, default: u64, min: u64, max: u64) -> Duration {
     parse_duration_secs(std::env::var(key).ok().as_deref(), default, min, max)
@@ -1604,7 +1557,8 @@ impl SecurityAuditor {
                     remediation,
                 )
                 .with_evidence(evidence)
-                .with_references(vec!["https://docs.docker.com/engine/security/"]);
+                .with_references(vec!["https://docs.docker.com/engine/security/"])
+                .with_metadata("risk_count", vec![risks.len().to_string()]);
 
                 for (severity, values) in by_severity {
                     check = check.with_metadata(&format!("{}_risks", severity), values);
@@ -1629,24 +1583,43 @@ impl SecurityAuditor {
 pub struct SecurityMonitor {
     notifier: Arc<NotificationService>,
     outbox: Arc<NotificationOutbox>,
-    docker: Option<Arc<DockerService>>,
+    snapshots: Arc<SecuritySnapshotService>,
     events: Arc<SecurityEventService>,
     interval: Duration,
+    processed_snapshots: SnapshotIdentityTracker,
+}
+
+#[derive(Default)]
+struct SnapshotIdentityTracker {
+    last_processed: Mutex<Option<SecuritySnapshotIdentity>>,
+}
+
+impl SnapshotIdentityTracker {
+    async fn claim(&self, identity: SecuritySnapshotIdentity) -> bool {
+        let mut last_processed = self.last_processed.lock().await;
+        if last_processed.as_ref() == Some(&identity) {
+            return false;
+        }
+        *last_processed = Some(identity);
+        true
+    }
 }
 
 impl SecurityMonitor {
     pub fn new(
         notifier: Arc<NotificationService>,
         outbox: Arc<NotificationOutbox>,
-        docker: Option<Arc<DockerService>>,
+        snapshots: Arc<SecuritySnapshotService>,
         events: Arc<SecurityEventService>,
     ) -> Self {
+        let interval = snapshots.audit_interval();
         Self {
             notifier,
             outbox,
-            docker,
+            snapshots,
             events,
-            interval: env_duration_secs("SECURITY_AUDIT_INTERVAL_SECS", 300, 60, 86_400),
+            interval,
+            processed_snapshots: SnapshotIdentityTracker::default(),
         }
     }
 
@@ -1655,7 +1628,7 @@ impl SecurityMonitor {
             "Starting Security Monitor Loop with interval={}s",
             self.interval.as_secs()
         );
-        let mut interval = tokio::time::interval(self.interval);
+        let mut interval = security_monitor_interval(self.interval);
 
         loop {
             interval.tick().await;
@@ -1665,7 +1638,58 @@ impl SecurityMonitor {
 
     async fn check_once(&self) {
         let default_lang = Lang::from_headers(&crate::i18n::HeaderMap::new());
-        let checks = SecurityAuditor::run_audit(&default_lang, self.docker.as_deref()).await;
+        let snapshot = match self
+            .snapshots
+            .get_or_refresh(MONITOR_SNAPSHOT_MAX_AGE)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                tracing::warn!(
+                    snapshot_error = "unavailable",
+                    "Security monitor skipped audit transitions"
+                );
+                return;
+            }
+        };
+        let identity = snapshot.identity();
+        if !self.processed_snapshots.claim(identity).await {
+            return;
+        }
+        if snapshot.collection_status() == SecurityCollectionStatus::Full {
+            let collection_check = SecurityCheck::new(
+                "audit.collection",
+                crate::i18n::t("audit.collection.name", &default_lang),
+                "system",
+                "high",
+                "PASS",
+                crate::i18n::t("security.resolved", &default_lang),
+                crate::i18n::t("audit.collection.remediation", &default_lang),
+            );
+            let recovery_text = self.notifier.render_alert_text(&format!(
+                "{}\n\n{}: {}",
+                crate::i18n::t("security.resolved", &default_lang),
+                crate::i18n::t("security.check", &default_lang),
+                collection_check.name
+            ));
+            if self
+                .events
+                .resolve_audit_event_with_notification(
+                    &collection_check,
+                    &self.outbox,
+                    &recovery_text,
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    event_error = "database",
+                    check_id = "audit.collection",
+                    "Failed to resolve recovered collection event"
+                );
+            }
+        }
+        let checks = snapshot.project(&default_lang);
 
         for check in &checks {
             if check.status == "FAIL" {
@@ -1726,6 +1750,12 @@ impl SecurityMonitor {
             );
         }
     }
+}
+
+fn security_monitor_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
 }
 
 #[cfg(test)]
@@ -2275,5 +2305,108 @@ this line is not valid ss output
         assert_eq!(parse_duration_secs(Some("0"), 30, 5, 120).as_secs(), 5);
         assert_eq!(parse_duration_secs(Some("999"), 30, 5, 120).as_secs(), 120);
         assert_eq!(parse_duration_secs(Some("60"), 30, 5, 120).as_secs(), 60);
+    }
+
+    #[tokio::test]
+    async fn monitor_identity_tracker_claims_each_snapshot_once() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let snapshots = SecuritySnapshotService::test_service(counter);
+        snapshots.publish_test_snapshot(Duration::ZERO, false).await;
+        let first = snapshots
+            .latest()
+            .await
+            .expect("first test snapshot should exist")
+            .identity();
+        let tracker = SnapshotIdentityTracker::default();
+
+        assert!(tracker.claim(first).await);
+        assert!(!tracker.claim(first).await);
+
+        snapshots.publish_test_snapshot(Duration::ZERO, false).await;
+        let second = snapshots
+            .latest()
+            .await
+            .expect("second test snapshot should exist")
+            .identity();
+        assert_ne!(first, second);
+        assert!(tracker.claim(second).await);
+    }
+
+    #[tokio::test]
+    async fn monitor_zero_max_age_refreshes_each_sequential_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let snapshots = SecuritySnapshotService::test_service(Arc::clone(&counter));
+        let first = snapshots
+            .get_or_refresh(MONITOR_SNAPSHOT_MAX_AGE)
+            .await
+            .expect("first monitor tick should publish");
+        let second = snapshots
+            .get_or_refresh(MONITOR_SNAPSHOT_MAX_AGE)
+            .await
+            .expect("second monitor tick should publish");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(first.identity().generation(), 1);
+        assert_eq!(second.identity().generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn monitor_skips_missed_ticks_instead_of_bursting_audits() {
+        let interval = security_monitor_interval(Duration::from_secs(60));
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_resolves_collection_warning_without_notification() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::atomic::AtomicUsize;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database should open");
+        SecurityEventService::init_schema(&pool)
+            .await
+            .expect("security event schema should initialize");
+        let events = Arc::new(SecurityEventService::new(pool.clone()));
+        let notifier = Arc::new(NotificationService::new());
+        let outbox = Arc::new(NotificationOutbox::new(pool.clone(), notifier.clone()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let snapshots =
+            SecuritySnapshotService::test_degraded_then_full_service(Arc::clone(&counter));
+        let monitor = SecurityMonitor::new(notifier, outbox, snapshots, Arc::clone(&events));
+        monitor.check_once().await;
+        let active = events
+            .list(Some("active"), 100)
+            .await
+            .expect("active events should be readable");
+        assert!(active.iter().any(|event| {
+            event.event_key == "audit:audit.collection" && event.event_type == "audit.check_warning"
+        }));
+        assert!(active.iter().any(|event| {
+            event.event_key == "audit:firewall.ufw" && event.event_type == "audit.check_warning"
+        }));
+
+        monitor.check_once().await;
+
+        let resolved = events
+            .list(Some("resolved"), 100)
+            .await
+            .expect("resolved events should be readable");
+        assert!(resolved.iter().any(|event| {
+            event.event_key == "audit:audit.collection" && event.event_type == "audit.check_warning"
+        }));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let outbox_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&pool)
+            .await
+            .expect("outbox count should be readable");
+        assert_eq!(outbox_rows, 0);
     }
 }

@@ -162,6 +162,22 @@ Mini-Ops ограничивает локальную operational history, что
 Если Docker inspection превышает timeout, check Docker container hardening
 возвращает `WARN` с evidence о timeout вместо блокировки всего audit.
 
+API, background monitor и optional Cloud Push используют один общий
+language-neutral single-flight snapshot аудита. Concurrent refresh-запросы
+присоединяются к одному collection, а смена языка API не запускает probes
+повторно. Body существующего `/api/security/audit` остаётся массивом; успешный
+ответ добавляет headers `X-Security-Collector-Epoch`,
+`X-Security-Generation`, `X-Security-Collected-At` и
+`X-Security-Collection-Status`. Если в bounded collection window не появился
+новый publishable snapshot, route возвращает `503` с кодом
+`security_audit_unavailable`, а не устаревший healthy result.
+
+Unknown или incomplete facts остаются видимыми как `WARN` и помечают snapshot
+как `degraded`. Cloud Push только читает snapshot и пропускает push, если он
+отсутствует, degraded или старше удвоенного audit interval: текущий security
+payload не умеет честно представить unknown values без misleading zero/healthy
+полей.
+
 ## Baseline listening ports
 
 Mini-Ops показывает listening sockets, которые не входят в локальный baseline
