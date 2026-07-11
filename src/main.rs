@@ -1,17 +1,17 @@
-mod metrics;
-mod notifications;
-mod docker;
-mod deployment;
-mod disk_ops;
 mod auth;
-mod history;
-mod security;
-mod i18n;
-mod ssh_alerts;
 mod cloud_payload;
 mod cloud_push;
-mod security_events;
+mod deployment;
+mod disk_ops;
+mod docker;
+mod history;
+mod i18n;
+mod metrics;
+mod notifications;
 mod retention;
+mod security;
+mod security_events;
+mod ssh_alerts;
 
 use security::{SecurityAuditCache, SecurityCheck, SecurityMonitor};
 use security_events::{SecurityEvent, SecurityEventService};
@@ -19,23 +19,26 @@ use ssh_alerts::{SshAlertsService, SshLoginEvent};
 
 use rand::Rng;
 
+use auth::auth_middleware;
 use axum::{
-    extract::{Path, State, FromRef, Query},
-    http::{header, StatusCode},
-    middleware,
-    response::{IntoResponse, Response, sse::{Event, Sse}},
-    routing::{delete, get, post},
     Json, Router,
+    extract::{FromRef, Path, Query, State},
+    http::{StatusCode, header},
+    middleware,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+    routing::{delete, get, post},
 };
-use serde::Deserialize;
-use metrics::{MetricsState, SystemStats};
-use notifications::NotificationService;
-use docker::DockerService;
 use deployment::{DeploymentService, deploy_logs_sse_handler, trigger_update_handler};
 use disk_ops::{DiskOps, DiskUsageBreakdown};
+use docker::DockerService;
 use history::HistoryManager;
-use auth::auth_middleware;
+use metrics::{MetricsState, SystemStats};
+use notifications::NotificationService;
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,18 +62,18 @@ async fn main() {
 
     // Initialize auth token in OnceLock — safe, called before any threads are spawned
     auth::init_token(auth_token);
-    
+
     // Initialize tracing with RUST_LOG support
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into())
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
     // 1. Setup Database
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:mini-ops.db".to_string());
-    
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:mini-ops.db".to_string());
+
     // Create file if not exists for sqlite
     if !std::path::Path::new("mini-ops.db").exists() {
         std::fs::File::create("mini-ops.db").unwrap();
@@ -92,7 +95,7 @@ async fn main() {
             disk_used INTEGER,
             disk_total INTEGER,
             timestamp INTEGER
-        )"
+        )",
     )
     .execute(&pool)
     .await
@@ -113,7 +116,7 @@ async fn main() {
             ip TEXT UNIQUE NOT NULL,
             description TEXT,
             added_at INTEGER NOT NULL
-        );"
+        );",
     )
     .execute(&pool)
     .await
@@ -141,7 +144,7 @@ async fn main() {
             None
         }
     };
-    
+
     // Start Security Monitor
     let security_monitor = Arc::new(SecurityMonitor::new(
         notifications.clone(),
@@ -159,7 +162,7 @@ async fn main() {
         security_events.clone(),
         retention_config.ssh_logins_retention_days,
     ));
-    
+
     // Generate and save internal token
     let internal_token = uuid::Uuid::new_v4().to_string();
     let internal_token_path = std::env::var("MINI_OPS_INTERNAL_TOKEN_FILE")
@@ -228,15 +231,27 @@ async fn main() {
             interval.tick().await;
             metrics_clone.refresh();
             let stats = metrics_clone.get_current();
-            
+
             // Check for critical alerts
             let lang = i18n::Lang::from_headers(&header::HeaderMap::new());
             if stats.cpu_usage > 95.0 {
-                notifier_clone.send_alert(&i18n::t_val("alert.critical_cpu", &lang, &format!("{:.1}", stats.cpu_usage))).await;
+                notifier_clone
+                    .send_alert(&i18n::t_val(
+                        "alert.critical_cpu",
+                        &lang,
+                        &format!("{:.1}", stats.cpu_usage),
+                    ))
+                    .await;
             }
             let disk_percent = (stats.disk_used as f64 / stats.disk_total as f64) * 100.0;
             if disk_percent > 90.0 {
-                notifier_clone.send_alert(&i18n::t_val("alert.low_disk", &lang, &format!("{:.1}", disk_percent))).await;
+                notifier_clone
+                    .send_alert(&i18n::t_val(
+                        "alert.low_disk",
+                        &lang,
+                        &format!("{:.1}", disk_percent),
+                    ))
+                    .await;
             }
 
             let _ = sqlx::query(
@@ -279,7 +294,10 @@ async fn main() {
         .route("/history", get(list_deployments_handler))
         .route("/test-notification", post(test_notification_handler))
         .route("/docker/containers", get(list_containers_handler))
-        .route("/docker/containers/{id}/{action}", post(container_action_handler))
+        .route(
+            "/docker/containers/{id}/{action}",
+            post(container_action_handler),
+        )
         .route("/docker/containers/{id}/logs", get(docker_logs_sse_handler)) // SSE by default now
         .route("/disk/usage", get(get_disk_usage_handler))
         .route("/disk/clean", post(clean_disk_handler))
@@ -287,7 +305,10 @@ async fn main() {
         .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
         .route("/security/events", get(get_security_events_handler))
-        .route("/security/events/{id}/ack", post(ack_security_event_handler))
+        .route(
+            "/security/events/{id}/ack",
+            post(ack_security_event_handler),
+        )
         .route("/ssh/logs", get(get_ssh_logs_handler))
         .route("/ssh/trusted-ips", get(get_trusted_ips_handler))
         .route("/ssh/trusted-ips", post(add_trusted_ip_handler))
@@ -295,8 +316,7 @@ async fn main() {
         .route("/ssh/setup-alerts", post(setup_ssh_alerts_handler))
         .route("/version", get(get_version_handler));
 
-    let internal_api = Router::new()
-        .route("/internal/ssh-login", post(ssh_login_handler));
+    let internal_api = Router::new().route("/internal/ssh-login", post(ssh_login_handler));
 
     let api_routes = Router::new()
         .merge(protected_api.layer(middleware::from_fn(auth_middleware)))
@@ -308,10 +328,10 @@ async fn main() {
         .route("/index.html", get(index_handler))
         .route("/{*path}", get(handler)) // Modern catch-all
         .layer(TraceLayer::new_for_http())
-        .with_state(AppState { 
-            metrics: metrics_state, 
-            db: pool, 
-            notifier: notifications, 
+        .with_state(AppState {
+            metrics: metrics_state,
+            db: pool,
+            notifier: notifications,
             docker: docker_service,
             deployment: deployment_service,
             history: history_manager,
@@ -323,10 +343,12 @@ async fn main() {
     let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let app_port = std::env::var("APP_PORT").unwrap_or_else(|_| "3000".to_string());
     let addr_str = format!("{}:{}", app_host, app_port);
-    let addr: SocketAddr = addr_str.parse().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 3000)));
+    let addr: SocketAddr = addr_str
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 3000)));
 
     tracing::info!("Mini-Ops listening on {}", addr);
-    
+
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -368,8 +390,12 @@ fn resolve_auth_token() -> Result<String, String> {
         }
         _ => {
             let token = generate_auth_token();
-            persist_auth_token_to_env(".env", &token)
-                .map_err(|e| format!("AUTH_TOKEN is missing and could not be persisted to .env: {}", e))?;
+            persist_auth_token_to_env(".env", &token).map_err(|e| {
+                format!(
+                    "AUTH_TOKEN is missing and could not be persisted to .env: {}",
+                    e
+                )
+            })?;
             eprintln!(
                 "WARNING: AUTH_TOKEN was missing. Generated a strong token and persisted it to .env with 0600 permissions."
             );
@@ -386,8 +412,7 @@ fn validate_auth_token(token: &str) -> Result<(), String> {
         );
     }
 
-    if token.len() < 32
-        && std::env::var("MINI_OPS_ALLOW_WEAK_AUTH_TOKEN").as_deref() != Ok("true")
+    if token.len() < 32 && std::env::var("MINI_OPS_ALLOW_WEAK_AUTH_TOKEN").as_deref() != Ok("true")
     {
         return Err(
             "AUTH_TOKEN must be at least 32 characters. Set MINI_OPS_ALLOW_WEAK_AUTH_TOKEN=true only for local testing."
@@ -432,7 +457,9 @@ fn persist_auth_token_to_env(path: &str, token: &str) -> std::io::Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && metadata.file_type().is_symlink()
     {
-        return Err(std::io::Error::other("refusing to write AUTH_TOKEN through symlink"));
+        return Err(std::io::Error::other(
+            "refusing to write AUTH_TOKEN through symlink",
+        ));
     }
 
     let existing = match std::fs::read_to_string(path) {
@@ -510,28 +537,37 @@ async fn get_history_handler(State(state): State<AppState>) -> Json<Vec<SystemSt
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
-    
-    let stats = rows.into_iter().map(|row| {
-        SystemStats {
+
+    let stats = rows
+        .into_iter()
+        .map(|row| SystemStats {
             cpu_usage: row.get::<f64, _>("cpu_usage") as f32,
             memory_used: row.get::<i64, _>("memory_used") as u64,
             memory_total: row.get::<i64, _>("memory_total") as u64,
             disk_used: row.get::<i64, _>("disk_used") as u64,
             disk_total: row.get::<i64, _>("disk_total") as u64,
             timestamp: row.get::<i64, _>("timestamp"),
-        }
-    }).collect();
+        })
+        .collect();
 
     Json(stats)
 }
 
-async fn list_deployments_handler(State(state): State<AppState>) -> Json<Vec<history::DeploymentRecord>> {
+async fn list_deployments_handler(
+    State(state): State<AppState>,
+) -> Json<Vec<history::DeploymentRecord>> {
     Json(state.history.get_history())
 }
 
-async fn test_notification_handler(State(state): State<AppState>, headers: header::HeaderMap) -> impl IntoResponse {
+async fn test_notification_handler(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+) -> impl IntoResponse {
     let lang = i18n::Lang::from_headers(&headers);
-    state.notifier.send_alert(&i18n::t("alert.test", &lang)).await;
+    state
+        .notifier
+        .send_alert(&i18n::t("alert.test", &lang))
+        .await;
     StatusCode::OK
 }
 
@@ -542,7 +578,11 @@ async fn list_containers_handler(State(state): State<AppState>) -> Response {
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         }
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Docker integration is not available").into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Docker integration is not available",
+        )
+            .into_response()
     }
 }
 
@@ -555,7 +595,13 @@ async fn container_action_handler(
             "start" => docker.start_container(&id).await,
             "stop" => docker.stop_container(&id).await,
             "restart" => docker.restart_container(&id).await,
-            _ => return (StatusCode::BAD_REQUEST, "Invalid action. Use start, stop, or restart").into_response(),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid action. Use start, stop, or restart",
+                )
+                    .into_response();
+            }
         };
 
         match result {
@@ -563,7 +609,11 @@ async fn container_action_handler(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         }
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Docker integration is not available").into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Docker integration is not available",
+        )
+            .into_response()
     }
 }
 
@@ -578,7 +628,7 @@ struct LogParams {
 
 /// SSE-based log streaming
 /// SSE-обработчик для потоковой передачи логов Docker.
-/// 
+///
 /// Поддерживает параметры запроса:
 /// * `since` - (i64) время начала (Unix timestamp)
 /// * `tail` - (String) количество строк с конца
@@ -610,7 +660,7 @@ async fn docker_logs_sse_handler(
             } else {
                 Some("100".to_string())
             }
-        },
+        }
         None => Some("100".to_string()),
     };
 
@@ -674,7 +724,7 @@ fn serve_file(path: &str) -> Response {
     }
 
     if path.starts_with("assets/") {
-         return (StatusCode::NOT_FOUND, "Asset not found").into_response();
+        return (StatusCode::NOT_FOUND, "Asset not found").into_response();
     }
 
     if let Some(content) = Asset::get("index.html") {
@@ -737,17 +787,18 @@ async fn ssh_login_handler(
     headers: header::HeaderMap,
     Json(event): Json<SshLoginEvent>,
 ) -> Response {
-    let token = headers.get("Authorization")
+    let token = headers
+        .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or("");
-    
+
     match state.ssh_alerts.handle_login(event, token).await {
-            Ok(_) => StatusCode::OK.into_response(),
-            Err(e) => {
-                tracing::warn!("Failed SSH login alert attempt: {}", e);
-                (StatusCode::UNAUTHORIZED, e).into_response()
-            },
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::warn!("Failed SSH login alert attempt: {}", e);
+            (StatusCode::UNAUTHORIZED, e).into_response()
+        }
     }
 }
 
@@ -775,16 +826,17 @@ async fn add_trusted_ip_handler(
     State(state): State<AppState>,
     Json(payload): Json<AddIpRequest>,
 ) -> Response {
-    match state.ssh_alerts.add_trusted_ip(payload.ip, payload.description).await {
+    match state
+        .ssh_alerts
+        .add_trusted_ip(payload.ip, payload.description)
+        .await
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
-async fn delete_trusted_ip_handler(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Response {
+async fn delete_trusted_ip_handler(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     match state.ssh_alerts.delete_trusted_ip(id).await {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -809,7 +861,10 @@ async fn setup_ssh_alerts_handler() -> Response {
     let direct_output = Command::new(&script_path).output();
     let output: Result<Output, std::io::Error> = match direct_output {
         Ok(output) if output.status.success() => Ok(output),
-        _ => Command::new("/usr/bin/sudo").arg("-n").arg(&script_path).output(),
+        _ => Command::new("/usr/bin/sudo")
+            .arg("-n")
+            .arg(&script_path)
+            .output(),
     };
 
     match output {

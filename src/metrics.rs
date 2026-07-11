@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use sysinfo::{System, Disks};
 use std::sync::Mutex;
+use sysinfo::{Disks, System};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SystemStats {
@@ -23,9 +23,9 @@ impl MetricsState {
         let mut sys = System::new_all();
         let disks = Disks::new_with_refreshed_list();
         sys.refresh_all();
-        
+
         let stats = Self::collect_internal(&mut sys, &disks);
-        
+
         Self {
             sys: Mutex::new(sys),
             disks: Mutex::new(disks),
@@ -36,7 +36,7 @@ impl MetricsState {
     pub fn refresh(&self) {
         let mut sys = self.sys.lock().unwrap();
         let mut disks = self.disks.lock().unwrap();
-        
+
         sys.refresh_all();
         sys.refresh_memory();
         disks.refresh(true);
@@ -53,21 +53,23 @@ impl MetricsState {
 
         let mut disk_used = 0;
         let mut disk_total = 0;
-        
+
         // Find the disk mounted at "/"
         // If not found, fallback to summing up non-loop devices
-        let root_disk = disks.iter().find(|d| d.mount_point() == std::path::Path::new("/"));
-        
+        let root_disk = disks
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"));
+
         if let Some(disk) = root_disk {
-             disk_total = disk.total_space();
-             disk_used = disk.total_space() - disk.available_space();
+            disk_total = disk.total_space();
+            disk_used = disk.total_space() - disk.available_space();
         } else {
             // Fallback: exclude loop, tmpfs, overlay
             for disk in disks {
-                 // Simple filter: Only take physical-like disks
-                 // This is heuristic.
-                 disk_total += disk.total_space();
-                 disk_used += disk.total_space() - disk.available_space();
+                // Simple filter: Only take physical-like disks
+                // This is heuristic.
+                disk_total += disk.total_space();
+                disk_used += disk.total_space() - disk.available_space();
             }
         }
 
