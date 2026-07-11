@@ -1,17 +1,27 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+
+#[path = "security_probe.rs"]
+mod probe;
+
+use probe::{
+    AUDIT_COLLECTION_DEADLINE, CancellationReason, DEFAULT_PROBE_TIMEOUT, DOCKER_PROBE_TIMEOUT,
+    Fact, OUTPUT_CAP_BYTES, ProbeCancellation, ProbeProgram, ProbeRunner, UnknownReason,
+};
 
 use crate::docker::DockerService;
 use crate::i18n::Lang;
 use crate::notifications::NotificationService;
 use crate::security_events::SecurityEventService;
+
+const AUDIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const FILE_READ_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SecurityCheck {
@@ -52,7 +62,7 @@ impl SecurityCheck {
     }
 
     fn with_evidence(mut self, evidence: Vec<String>) -> Self {
-        self.evidence = evidence;
+        self.evidence = bounded_strings(evidence, 4 * 1024, 128);
         self
     }
 
@@ -62,8 +72,88 @@ impl SecurityCheck {
     }
 
     fn with_metadata(mut self, key: &str, values: Vec<String>) -> Self {
-        self.metadata.insert(key.to_string(), values);
+        self.metadata
+            .insert(key.to_string(), bounded_strings(values, 4 * 1024, 128));
         self
+    }
+}
+
+fn bounded_strings(values: Vec<String>, byte_cap: usize, item_cap: usize) -> Vec<String> {
+    let mut remaining = byte_cap;
+    values
+        .into_iter()
+        .take(item_cap)
+        .filter_map(|value| {
+            if remaining == 0 {
+                return None;
+            }
+            let keep = value
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(value.len()))
+                .take_while(|index| *index <= remaining)
+                .last()
+                .unwrap_or(0);
+            remaining = remaining.saturating_sub(keep);
+            Some(value[..keep].to_string())
+        })
+        .collect()
+}
+
+fn unknown_evidence(reason: UnknownReason) -> Vec<String> {
+    vec![format!("probe_error={}", reason.code())]
+}
+
+fn filesystem_unknown_reason(error: &std::io::Error) -> UnknownReason {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => UnknownReason::PermissionDenied,
+        _ => UnknownReason::IoError,
+    }
+}
+
+async fn read_bounded_text_file(
+    path: &'static str,
+    cancellation: &ProbeCancellation,
+) -> Result<String, UnknownReason> {
+    let mut task = tokio::task::spawn_blocking(move || {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::PermissionDenied => UnknownReason::PermissionDenied,
+                _ => UnknownReason::IoError,
+            })?;
+        if !file
+            .metadata()
+            .map_err(|_| UnknownReason::IoError)?
+            .is_file()
+        {
+            return Err(UnknownReason::IoError);
+        }
+        let mut bytes = Vec::with_capacity(OUTPUT_CAP_BYTES.min(8192));
+        file.take((OUTPUT_CAP_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| UnknownReason::IoError)?;
+        if bytes.len() > OUTPUT_CAP_BYTES {
+            return Err(UnknownReason::OutputTruncated);
+        }
+        String::from_utf8(bytes).map_err(|_| UnknownReason::MalformedOutput)
+    });
+
+    tokio::select! {
+        biased;
+        reason = cancellation.cancelled() => {
+            let _ = tokio::time::timeout(FILE_READ_SHUTDOWN_GRACE, &mut task).await;
+            Err(reason.unknown_reason())
+        }
+        _ = tokio::time::sleep(DEFAULT_PROBE_TIMEOUT) => {
+            let _ = tokio::time::timeout(FILE_READ_SHUTDOWN_GRACE, &mut task).await;
+            Err(UnknownReason::Timeout)
+        }
+        result = &mut task => {
+            result.map_err(|_| UnknownReason::IoError)?
+        }
     }
 }
 
@@ -71,6 +161,8 @@ impl SecurityCheck {
 struct SshdConfig {
     values: HashMap<String, String>,
     source: String,
+    effective: bool,
+    probe_error: Option<UnknownReason>,
 }
 
 impl SshdConfig {
@@ -83,9 +175,10 @@ impl SshdConfig {
 
 struct PortScanResult {
     check: SecurityCheck,
-    open_ports: Vec<u16>,
+    open_ports: Fact<Vec<u16>>,
 }
 
+#[derive(Debug)]
 struct ListeningSocket {
     protocol: String,
     address: String,
@@ -96,7 +189,7 @@ struct ListeningSocket {
 struct ListeningPortBaseline {
     allowed_public_ports: Vec<u16>,
     allowed_loopback_ports: Vec<u16>,
-    invalid_tokens: Vec<String>,
+    invalid_token_count: usize,
 }
 
 pub struct SecurityAuditor;
@@ -167,21 +260,70 @@ fn parse_duration_secs(value: Option<&str>, default: u64, min: u64, max: u64) ->
 
 impl SecurityAuditor {
     pub async fn run_audit(lang: &Lang, docker: Option<&DockerService>) -> Vec<SecurityCheck> {
-        let mut checks = Vec::new();
+        let cancellation = ProbeCancellation::new();
+        let collection = Self::collect_audit(lang, docker, &cancellation);
+        tokio::pin!(collection);
+        let collection_window = AUDIT_COLLECTION_DEADLINE.saturating_sub(AUDIT_SHUTDOWN_GRACE);
 
-        let sshd_config = Self::load_effective_sshd_config();
+        tokio::select! {
+            checks = &mut collection => checks,
+            _ = tokio::time::sleep(collection_window) => {
+                cancellation.cancel(CancellationReason::AuditDeadlineExceeded);
+                match tokio::time::timeout(AUDIT_SHUTDOWN_GRACE, &mut collection).await {
+                    Ok(checks) => checks,
+                    Err(_) => vec![Self::deadline_exceeded_check(lang)],
+                }
+            }
+        }
+    }
+
+    fn deadline_exceeded_check(lang: &Lang) -> SecurityCheck {
+        SecurityCheck::new(
+            "audit.collection",
+            crate::i18n::t("audit.collection.name", lang),
+            "system",
+            "high",
+            "WARN",
+            crate::i18n::t("audit.collection.error", lang),
+            crate::i18n::t("audit.collection.remediation", lang),
+        )
+        .with_evidence(unknown_evidence(UnknownReason::AuditDeadlineExceeded))
+    }
+
+    async fn collect_audit(
+        lang: &Lang,
+        docker: Option<&DockerService>,
+        cancellation: &ProbeCancellation,
+    ) -> Vec<SecurityCheck> {
+        let mut checks = Vec::new();
+        let (
+            sshd_config,
+            ufw,
+            docker_socket,
+            disk_encryption,
+            fail2ban,
+            port_scan,
+            docker_containers,
+        ) = tokio::join!(
+            Self::load_effective_sshd_config(cancellation),
+            Self::check_ufw_status(lang, cancellation),
+            Self::check_docker_socket(lang),
+            Self::check_disk_encryption(lang, cancellation),
+            Self::check_fail2ban_status(lang, cancellation),
+            Self::check_listening_ports(lang, cancellation),
+            Self::check_docker_container_risks(lang, docker, cancellation),
+        );
+
         checks.push(Self::check_ssh_root_login(lang, sshd_config.as_ref()));
         checks.push(Self::check_ssh_password_auth(lang, sshd_config.as_ref()));
-        checks.push(Self::check_ufw_status(lang));
-        checks.push(Self::check_docker_socket(lang));
-        checks.push(Self::check_disk_encryption(lang));
-        checks.push(Self::check_fail2ban_status(lang));
-
-        let port_scan = Self::check_listening_ports(lang);
+        checks.push(ufw);
+        checks.push(docker_socket);
+        checks.push(disk_encryption);
+        checks.push(fail2ban);
         let open_ports = port_scan.open_ports.clone();
         checks.push(port_scan.check);
         checks.push(Self::check_docker_tcp_api_ports(lang, &open_ports));
-        checks.push(Self::check_docker_container_risks(lang, docker).await);
+        checks.push(docker_containers);
 
         checks
     }
@@ -234,52 +376,37 @@ impl SecurityAuditor {
         }
     }
 
-    fn find_system_binary(name: &str) -> Option<PathBuf> {
-        let standard_paths = [
-            format!("/usr/sbin/{}", name),
-            format!("/usr/bin/{}", name),
-            format!("/sbin/{}", name),
-            format!("/bin/{}", name),
-        ];
+    async fn load_effective_sshd_config(
+        cancellation: &ProbeCancellation,
+    ) -> Result<SshdConfig, UnknownReason> {
+        let outcome = ProbeRunner::run(
+            ProbeProgram::Sshd,
+            &["-T"],
+            DEFAULT_PROBE_TIMEOUT,
+            cancellation,
+        )
+        .await;
 
-        for path_str in &standard_paths {
-            let path = Path::new(path_str);
-            if path.exists()
-                && path.is_file()
-                && let Ok(metadata) = fs::metadata(path)
-                && metadata.permissions().mode() & 0o111 != 0
-            {
-                tracing::debug!("Found {} at {}", name, path_str);
-                return Some(path.to_path_buf());
+        match outcome.parse_stdout(|stdout| {
+            let config = Self::parse_sshd_config_output(stdout, "sshd -T");
+            if config.values.is_empty() {
+                Err(UnknownReason::MalformedOutput)
+            } else {
+                Ok(config)
+            }
+        }) {
+            Fact::Known(config) => Ok(config),
+            Fact::Unknown(probe_error) => {
+                let content = read_bounded_text_file("/etc/ssh/sshd_config", cancellation).await?;
+                let mut config = Self::parse_sshd_config_output(&content, "/etc/ssh/sshd_config");
+                if config.values.is_empty() {
+                    return Err(UnknownReason::MalformedOutput);
+                }
+                config.effective = false;
+                config.probe_error = Some(probe_error);
+                Ok(config)
             }
         }
-
-        tracing::debug!("Binary '{}' not found in standard paths", name);
-        None
-    }
-
-    fn load_effective_sshd_config() -> Result<SshdConfig, String> {
-        if let Some(sshd_path) = Self::find_system_binary("sshd") {
-            match Command::new(&sshd_path).arg("-T").output() {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if !stdout.trim().is_empty() {
-                        return Ok(Self::parse_sshd_config_output(&stdout, "sshd -T"));
-                    }
-                }
-                Ok(output) => {
-                    tracing::warn!(
-                        "sshd -T failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                Err(e) => tracing::warn!("Failed to execute sshd -T: {}", e),
-            }
-        }
-
-        fs::read_to_string("/etc/ssh/sshd_config")
-            .map(|content| Self::parse_sshd_config_output(&content, "/etc/ssh/sshd_config"))
-            .map_err(|e| format!("Could not load sshd config: {}", e))
     }
 
     fn parse_sshd_config_output(content: &str, source: &str) -> SshdConfig {
@@ -303,12 +430,14 @@ impl SecurityAuditor {
         SshdConfig {
             values,
             source: source.to_string(),
+            effective: true,
+            probe_error: None,
         }
     }
 
     fn check_ssh_root_login(
         lang: &Lang,
-        sshd_config: Result<&SshdConfig, &String>,
+        sshd_config: Result<&SshdConfig, &UnknownReason>,
     ) -> SecurityCheck {
         let name = crate::i18n::t("audit.ssh_root.name", lang);
         let remediation = crate::i18n::t("audit.ssh_root.remediation", lang);
@@ -325,9 +454,24 @@ impl SecurityAuditor {
                     crate::i18n::t("audit.ssh_config.warn", lang),
                     remediation,
                 )
-                .with_evidence(vec![e.to_string()]);
+                .with_evidence(unknown_evidence(*e));
             }
         };
+
+        if !config.effective {
+            return SecurityCheck::new(
+                "ssh.root_login",
+                name,
+                "ssh",
+                "medium",
+                "WARN",
+                crate::i18n::t("audit.ssh_config.warn", lang),
+                remediation,
+            )
+            .with_evidence(unknown_evidence(
+                config.probe_error.unwrap_or(UnknownReason::MalformedOutput),
+            ));
+        }
 
         let value = config.get("permitrootlogin").unwrap_or("unknown");
         let evidence = vec![
@@ -383,7 +527,7 @@ impl SecurityAuditor {
 
     fn check_ssh_password_auth(
         lang: &Lang,
-        sshd_config: Result<&SshdConfig, &String>,
+        sshd_config: Result<&SshdConfig, &UnknownReason>,
     ) -> SecurityCheck {
         let name = crate::i18n::t("audit.ssh_passwd.name", lang);
         let remediation = crate::i18n::t("audit.ssh_passwd.remediation", lang);
@@ -400,9 +544,24 @@ impl SecurityAuditor {
                     crate::i18n::t("audit.ssh_config.warn", lang),
                     remediation,
                 )
-                .with_evidence(vec![e.to_string()]);
+                .with_evidence(unknown_evidence(*e));
             }
         };
+
+        if !config.effective {
+            return SecurityCheck::new(
+                "ssh.password_auth",
+                name,
+                "ssh",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.ssh_config.warn", lang),
+                remediation,
+            )
+            .with_evidence(unknown_evidence(
+                config.probe_error.unwrap_or(UnknownReason::MalformedOutput),
+            ));
+        }
 
         let value = config.get("passwordauthentication").unwrap_or("unknown");
         let evidence = vec![
@@ -435,104 +594,95 @@ impl SecurityAuditor {
         }
     }
 
-    fn check_ufw_status(lang: &Lang) -> SecurityCheck {
+    async fn check_ufw_status(lang: &Lang, cancellation: &ProbeCancellation) -> SecurityCheck {
         let name = crate::i18n::t("audit.ufw.name", lang);
         let remediation = crate::i18n::t("audit.ufw.remediation", lang);
-        let ufw_path = Self::find_system_binary("ufw").unwrap_or_else(|| PathBuf::from("ufw"));
-
-        match Command::new(&ufw_path).arg("status").output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let evidence = vec![stdout.lines().next().unwrap_or_default().to_string()];
-
-                if output.status.success() {
-                    if stdout.contains("Status: active") {
-                        SecurityCheck::new(
-                            "firewall.ufw",
-                            name,
-                            "firewall",
-                            "high",
-                            "PASS",
-                            crate::i18n::t("audit.ufw.pass", lang),
-                            remediation,
-                        )
-                        .with_evidence(evidence)
-                    } else {
-                        SecurityCheck::new(
-                            "firewall.ufw",
-                            name,
-                            "firewall",
-                            "high",
-                            "FAIL",
-                            crate::i18n::t("audit.ufw.fail", lang),
-                            remediation,
-                        )
-                        .with_evidence(evidence)
-                    }
-                } else {
-                    tracing::warn!(
-                        "UFW command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    SecurityCheck::new(
-                        "firewall.ufw",
-                        name,
-                        "firewall",
-                        "high",
-                        "WARN",
-                        crate::i18n::t("audit.ufw.error", lang),
-                        remediation,
-                    )
-                    .with_evidence(vec![String::from_utf8_lossy(&output.stderr).to_string()])
-                }
+        let outcome = ProbeRunner::run(
+            ProbeProgram::Ufw,
+            &["status"],
+            DEFAULT_PROBE_TIMEOUT,
+            cancellation,
+        )
+        .await;
+        let active = outcome.parse_stdout(|stdout| {
+            if stdout.lines().any(|line| line.trim() == "Status: active") {
+                Ok(true)
+            } else if stdout.lines().any(|line| line.trim() == "Status: inactive") {
+                Ok(false)
+            } else {
+                Err(UnknownReason::MalformedOutput)
             }
-            Err(e) => SecurityCheck::new(
+        });
+
+        match active {
+            Fact::Known(true) => SecurityCheck::new(
+                "firewall.ufw",
+                name,
+                "firewall",
+                "high",
+                "PASS",
+                crate::i18n::t("audit.ufw.pass", lang),
+                remediation,
+            )
+            .with_evidence(vec!["ufw_status=active".to_string()]),
+            Fact::Known(false) => SecurityCheck::new(
+                "firewall.ufw",
+                name,
+                "firewall",
+                "high",
+                "FAIL",
+                crate::i18n::t("audit.ufw.fail", lang),
+                remediation,
+            )
+            .with_evidence(vec!["ufw_status=inactive".to_string()]),
+            Fact::Unknown(reason) => SecurityCheck::new(
                 "firewall.ufw",
                 name,
                 "firewall",
                 "high",
                 "WARN",
-                crate::i18n::t("audit.ufw.warn", lang),
+                crate::i18n::t("audit.ufw.error", lang),
                 remediation,
             )
-            .with_evidence(vec![e.to_string()]),
+            .with_evidence(unknown_evidence(reason)),
         }
     }
 
-    fn check_docker_socket(lang: &Lang) -> SecurityCheck {
+    async fn check_docker_socket(lang: &Lang) -> SecurityCheck {
         let name = crate::i18n::t("audit.docker_sock.name", lang);
         let remediation = crate::i18n::t("audit.docker_sock.remediation", lang);
         let path = "/var/run/docker.sock";
 
-        if let Ok(metadata) = fs::metadata(path) {
-            let mode = metadata.permissions().mode() & 0o777;
-            let evidence = vec![format!("path={} mode={:o}", path, mode)];
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode() & 0o777;
+                let evidence = vec![format!("path={} mode={:o}", path, mode)];
 
-            if mode & 0o002 != 0 {
-                return SecurityCheck::new(
+                if mode & 0o002 != 0 {
+                    return SecurityCheck::new(
+                        "docker.socket_permissions",
+                        name,
+                        "docker",
+                        "critical",
+                        "FAIL",
+                        crate::i18n::t("audit.docker_sock.fail", lang),
+                        remediation,
+                    )
+                    .with_evidence(evidence);
+                }
+
+                SecurityCheck::new(
                     "docker.socket_permissions",
                     name,
                     "docker",
                     "critical",
-                    "FAIL",
-                    crate::i18n::t("audit.docker_sock.fail", lang),
+                    "PASS",
+                    crate::i18n::t("audit.docker_sock.pass", lang),
                     remediation,
                 )
-                .with_evidence(evidence);
+                .with_evidence(evidence)
             }
-
-            SecurityCheck::new(
-                "docker.socket_permissions",
-                name,
-                "docker",
-                "critical",
-                "PASS",
-                crate::i18n::t("audit.docker_sock.pass", lang),
-                remediation,
-            )
-            .with_evidence(evidence)
-        } else {
-            SecurityCheck::new(
+            Err(error) => SecurityCheck::new(
                 "docker.socket_permissions",
                 name,
                 "docker",
@@ -541,41 +691,52 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_sock.warn", lang),
                 remediation,
             )
+            .with_evidence(unknown_evidence(filesystem_unknown_reason(&error))),
         }
     }
 
-    fn check_disk_encryption(lang: &Lang) -> SecurityCheck {
+    async fn check_disk_encryption(lang: &Lang, cancellation: &ProbeCancellation) -> SecurityCheck {
         let name = crate::i18n::t("audit.disk_enc.name", lang);
         let remediation = crate::i18n::t("audit.disk_enc.remediation", lang);
-        let lsblk_path =
-            Self::find_system_binary("lsblk").unwrap_or_else(|| PathBuf::from("lsblk"));
-
-        if let Ok(output) = Command::new(&lsblk_path).args(["-o", "TYPE"]).output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("crypt") {
-                SecurityCheck::new(
-                    "system.disk_encryption",
-                    name,
-                    "system",
-                    "low",
-                    "PASS",
-                    crate::i18n::t("audit.disk_enc.pass", lang),
-                    remediation,
-                )
-                .with_evidence(vec!["lsblk_type=crypt".to_string()])
-            } else {
-                SecurityCheck::new(
-                    "system.disk_encryption",
-                    name,
-                    "system",
-                    "low",
-                    "WARN",
-                    crate::i18n::t("audit.disk_enc.warn", lang),
-                    remediation,
-                )
+        let outcome = ProbeRunner::run(
+            ProbeProgram::Lsblk,
+            &["-o", "TYPE"],
+            DEFAULT_PROBE_TIMEOUT,
+            cancellation,
+        )
+        .await;
+        let encrypted = outcome.parse_stdout(|stdout| {
+            let mut lines = stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty());
+            if lines.next() != Some("TYPE") {
+                return Err(UnknownReason::MalformedOutput);
             }
-        } else {
-            SecurityCheck::new(
+            Ok(lines.any(|line| line == "crypt"))
+        });
+
+        match encrypted {
+            Fact::Known(true) => SecurityCheck::new(
+                "system.disk_encryption",
+                name,
+                "system",
+                "low",
+                "PASS",
+                crate::i18n::t("audit.disk_enc.pass", lang),
+                remediation,
+            )
+            .with_evidence(vec!["lsblk_type=crypt".to_string()]),
+            Fact::Known(false) => SecurityCheck::new(
+                "system.disk_encryption",
+                name,
+                "system",
+                "low",
+                "WARN",
+                crate::i18n::t("audit.disk_enc.warn", lang),
+                remediation,
+            ),
+            Fact::Unknown(reason) => SecurityCheck::new(
                 "system.disk_encryption",
                 name,
                 "system",
@@ -584,20 +745,30 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.disk_enc.error", lang),
                 remediation,
             )
+            .with_evidence(unknown_evidence(reason)),
         }
     }
 
-    fn check_fail2ban_status(lang: &Lang) -> SecurityCheck {
+    async fn check_fail2ban_status(lang: &Lang, cancellation: &ProbeCancellation) -> SecurityCheck {
         let name = crate::i18n::t("audit.fail2ban.name", lang);
         let remediation = crate::i18n::t("audit.fail2ban.remediation", lang);
-        let systemctl_path =
-            Self::find_system_binary("systemctl").unwrap_or_else(|| PathBuf::from("systemctl"));
+        let outcome = ProbeRunner::run(
+            ProbeProgram::Systemctl,
+            &["is-active", "fail2ban"],
+            DEFAULT_PROBE_TIMEOUT,
+            cancellation,
+        )
+        .await;
+        let active = outcome.parse_stdout(|stdout| {
+            if stdout.trim() == "active" {
+                Ok(())
+            } else {
+                Err(UnknownReason::MalformedOutput)
+            }
+        });
 
-        match Command::new(&systemctl_path)
-            .args(["is-active", "fail2ban"])
-            .output()
-        {
-            Ok(output) if output.status.success() => SecurityCheck::new(
+        match active {
+            Fact::Known(()) => SecurityCheck::new(
                 "intrusion.fail2ban",
                 name,
                 "intrusion",
@@ -607,7 +778,7 @@ impl SecurityAuditor {
                 remediation,
             )
             .with_evidence(vec!["systemctl is-active fail2ban=active".to_string()]),
-            Ok(output) => SecurityCheck::new(
+            Fact::Unknown(reason) => SecurityCheck::new(
                 "intrusion.fail2ban",
                 name,
                 "intrusion",
@@ -616,148 +787,157 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.fail2ban.warn", lang),
                 remediation,
             )
-            .with_evidence(vec![
-                String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            ]),
-            Err(e) => SecurityCheck::new(
-                "intrusion.fail2ban",
-                name,
-                "intrusion",
-                "medium",
-                "WARN",
-                crate::i18n::t("audit.fail2ban.missing", lang),
-                remediation,
-            )
-            .with_evidence(vec![e.to_string()]),
+            .with_evidence(unknown_evidence(reason)),
         }
     }
 
-    fn check_listening_ports(lang: &Lang) -> PortScanResult {
+    async fn check_listening_ports(
+        lang: &Lang,
+        cancellation: &ProbeCancellation,
+    ) -> PortScanResult {
         let name = crate::i18n::t("audit.ports.name", lang);
         let remediation = crate::i18n::t("audit.ports.remediation", lang);
-        let ss_path = Self::find_system_binary("ss").unwrap_or_else(|| PathBuf::from("ss"));
+        let outcome = ProbeRunner::run(
+            ProbeProgram::Ss,
+            &["-H", "-tuln"],
+            DEFAULT_PROBE_TIMEOUT,
+            cancellation,
+        )
+        .await;
+        let sockets = outcome.parse_stdout(Self::parse_listening_sockets);
 
-        if let Ok(output) = Command::new(&ss_path).args(["-H", "-tuln"]).output() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut listening_sockets = Self::parse_listening_sockets(&stdout);
-            listening_sockets.sort_by(|a, b| {
-                a.port
-                    .cmp(&b.port)
-                    .then_with(|| a.protocol.cmp(&b.protocol))
-                    .then_with(|| a.address.cmp(&b.address))
-            });
+        match sockets {
+            Fact::Known(mut listening_sockets) => {
+                listening_sockets.sort_by(|a, b| {
+                    a.port
+                        .cmp(&b.port)
+                        .then_with(|| a.protocol.cmp(&b.protocol))
+                        .then_with(|| a.address.cmp(&b.address))
+                });
 
-            let mut open_ports = listening_sockets
-                .iter()
-                .map(|socket| socket.port)
-                .collect::<Vec<_>>();
-            open_ports.sort_unstable();
-            open_ports.dedup();
+                let mut open_ports = listening_sockets
+                    .iter()
+                    .map(|socket| socket.port)
+                    .collect::<Vec<_>>();
+                open_ports.sort_unstable();
+                open_ports.dedup();
 
-            let nginx_port = std::env::var("DEPLOY_NGINX_PORT")
-                .ok()
-                .and_then(|port| port.parse::<u16>().ok())
-                .unwrap_or(8090);
-            let app_port = std::env::var("APP_PORT")
-                .ok()
-                .and_then(|port| port.parse::<u16>().ok())
-                .unwrap_or(3000);
-            let baseline = Self::listening_port_baseline(
-                app_port,
-                nginx_port,
-                std::env::var("SECURITY_ALLOWED_PUBLIC_PORTS")
+                let nginx_port = std::env::var("DEPLOY_NGINX_PORT")
                     .ok()
-                    .as_deref(),
-                std::env::var("SECURITY_ALLOWED_LOOPBACK_PORTS")
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .unwrap_or(8090);
+                let app_port = std::env::var("APP_PORT")
                     .ok()
-                    .as_deref(),
-            );
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .unwrap_or(3000);
+                let baseline = Self::listening_port_baseline(
+                    app_port,
+                    nginx_port,
+                    std::env::var("SECURITY_ALLOWED_PUBLIC_PORTS")
+                        .ok()
+                        .as_deref(),
+                    std::env::var("SECURITY_ALLOWED_LOOPBACK_PORTS")
+                        .ok()
+                        .as_deref(),
+                );
 
-            let mut unexpected_listeners = listening_sockets
-                .iter()
-                .filter(|socket| {
-                    if baseline.allowed_public_ports.contains(&socket.port) {
-                        return false;
+                let mut unexpected_listeners = listening_sockets
+                    .iter()
+                    .filter(|socket| {
+                        if baseline.allowed_public_ports.contains(&socket.port) {
+                            return false;
+                        }
+                        !(socket.is_loopback
+                            && baseline.allowed_loopback_ports.contains(&socket.port))
+                    })
+                    .map(Self::format_listening_socket)
+                    .collect::<Vec<_>>();
+                unexpected_listeners.sort();
+                unexpected_listeners.dedup();
+
+                let mut suspicious = listening_sockets
+                    .iter()
+                    .filter(|socket| {
+                        if baseline.allowed_public_ports.contains(&socket.port) {
+                            return false;
+                        }
+                        !(socket.is_loopback
+                            && baseline.allowed_loopback_ports.contains(&socket.port))
+                    })
+                    .map(|socket| socket.port)
+                    .collect::<Vec<_>>();
+                suspicious.sort_unstable();
+                suspicious.dedup();
+
+                let open_port_strings = open_ports.iter().map(u16::to_string).collect::<Vec<_>>();
+                let suspicious_strings = suspicious.iter().map(u16::to_string).collect::<Vec<_>>();
+                let allowed_public_port_strings = baseline
+                    .allowed_public_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>();
+                let allowed_loopback_port_strings = baseline
+                    .allowed_loopback_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>();
+
+                let mut check = if suspicious.is_empty() {
+                    SecurityCheck::new(
+                        "network.listening_ports",
+                        name,
+                        "network",
+                        "medium",
+                        "PASS",
+                        crate::i18n::t("audit.ports.pass", lang),
+                        remediation,
+                    )
+                } else {
+                    SecurityCheck::new(
+                        "network.listening_ports",
+                        name,
+                        "network",
+                        "medium",
+                        "WARN",
+                        format!(
+                            "{}: {}",
+                            crate::i18n::t("audit.ports.warn", lang),
+                            suspicious_strings.join(", ")
+                        ),
+                        remediation,
+                    )
+                    .with_metadata("suspicious_ports", suspicious_strings)
+                    .with_metadata("unexpected_listeners", unexpected_listeners)
+                }
+                .with_metadata("open_ports", open_port_strings)
+                .with_metadata("allowed_public_ports", allowed_public_port_strings)
+                .with_metadata("allowed_loopback_ports", allowed_loopback_port_strings);
+
+                if baseline.invalid_token_count > 0 {
+                    if check.status == "PASS" {
+                        check.status = "WARN".to_string();
+                        check.message = crate::i18n::t("audit.ports.config_error", lang);
                     }
-                    !(socket.is_loopback && baseline.allowed_loopback_ports.contains(&socket.port))
-                })
-                .map(Self::format_listening_socket)
-                .collect::<Vec<_>>();
-            unexpected_listeners.sort();
-            unexpected_listeners.dedup();
+                    check = check
+                        .with_metadata(
+                            "invalid_allowed_port_count",
+                            vec![baseline.invalid_token_count.to_string()],
+                        )
+                        .with_evidence(vec![
+                            "config_error=invalid_allowed_port".to_string(),
+                            format!(
+                                "invalid_allowed_port_count={}",
+                                baseline.invalid_token_count
+                            ),
+                        ]);
+                }
 
-            let mut suspicious = listening_sockets
-                .iter()
-                .filter(|socket| {
-                    if baseline.allowed_public_ports.contains(&socket.port) {
-                        return false;
-                    }
-                    !(socket.is_loopback && baseline.allowed_loopback_ports.contains(&socket.port))
-                })
-                .map(|socket| socket.port)
-                .collect::<Vec<_>>();
-            suspicious.sort_unstable();
-            suspicious.dedup();
-
-            let open_port_strings = open_ports.iter().map(u16::to_string).collect::<Vec<_>>();
-            let suspicious_strings = suspicious.iter().map(u16::to_string).collect::<Vec<_>>();
-            let allowed_public_port_strings = baseline
-                .allowed_public_ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>();
-            let allowed_loopback_port_strings = baseline
-                .allowed_loopback_ports
-                .iter()
-                .map(u16::to_string)
-                .collect::<Vec<_>>();
-
-            let mut check = if suspicious.is_empty() {
-                SecurityCheck::new(
-                    "network.listening_ports",
-                    name,
-                    "network",
-                    "medium",
-                    "PASS",
-                    crate::i18n::t("audit.ports.pass", lang),
-                    remediation,
-                )
-            } else {
-                SecurityCheck::new(
-                    "network.listening_ports",
-                    name,
-                    "network",
-                    "medium",
-                    "WARN",
-                    format!(
-                        "{}: {}",
-                        crate::i18n::t("audit.ports.warn", lang),
-                        suspicious_strings.join(", ")
-                    ),
-                    remediation,
-                )
-                .with_metadata("suspicious_ports", suspicious_strings)
-                .with_metadata("unexpected_listeners", unexpected_listeners)
+                PortScanResult {
+                    check,
+                    open_ports: Fact::Known(open_ports),
+                }
             }
-            .with_metadata("open_ports", open_port_strings)
-            .with_metadata("allowed_public_ports", allowed_public_port_strings)
-            .with_metadata("allowed_loopback_ports", allowed_loopback_port_strings);
-
-            if !baseline.invalid_tokens.is_empty() {
-                check = check
-                    .with_metadata("invalid_allowed_ports", baseline.invalid_tokens.clone())
-                    .with_evidence(
-                        baseline
-                            .invalid_tokens
-                            .iter()
-                            .map(|token| format!("ignored_allowed_port={}", token))
-                            .collect(),
-                    );
-            }
-
-            PortScanResult { check, open_ports }
-        } else {
-            PortScanResult {
+            Fact::Unknown(reason) => PortScanResult {
                 check: SecurityCheck::new(
                     "network.listening_ports",
                     name,
@@ -766,9 +946,10 @@ impl SecurityAuditor {
                     "WARN",
                     crate::i18n::t("audit.ports.error", lang),
                     remediation,
-                ),
-                open_ports: Vec::new(),
-            }
+                )
+                .with_evidence(unknown_evidence(reason)),
+                open_ports: Fact::Unknown(reason),
+            },
         }
     }
 
@@ -778,18 +959,18 @@ impl SecurityAuditor {
         extra_public_ports: Option<&str>,
         extra_loopback_ports: Option<&str>,
     ) -> ListeningPortBaseline {
-        let mut invalid_tokens = Vec::new();
+        let mut invalid_token_count = 0_usize;
         let mut allowed_public_ports = vec![22, 80, 443, nginx_port];
         let mut allowed_loopback_ports = vec![app_port];
 
         Self::extend_ports_from_env(
             &mut allowed_public_ports,
-            &mut invalid_tokens,
+            &mut invalid_token_count,
             extra_public_ports,
         );
         Self::extend_ports_from_env(
             &mut allowed_loopback_ports,
-            &mut invalid_tokens,
+            &mut invalid_token_count,
             extra_loopback_ports,
         );
 
@@ -797,19 +978,16 @@ impl SecurityAuditor {
         allowed_public_ports.dedup();
         allowed_loopback_ports.sort_unstable();
         allowed_loopback_ports.dedup();
-        invalid_tokens.sort();
-        invalid_tokens.dedup();
-
         ListeningPortBaseline {
             allowed_public_ports,
             allowed_loopback_ports,
-            invalid_tokens,
+            invalid_token_count,
         }
     }
 
     fn extend_ports_from_env(
         ports: &mut Vec<u16>,
-        invalid_tokens: &mut Vec<String>,
+        invalid_token_count: &mut usize,
         value: Option<&str>,
     ) {
         for token in value
@@ -820,28 +998,45 @@ impl SecurityAuditor {
         {
             match token.parse::<u16>() {
                 Ok(port) => ports.push(port),
-                Err(_) => invalid_tokens.push(token.to_string()),
+                Err(_) => *invalid_token_count = invalid_token_count.saturating_add(1),
             }
         }
     }
 
-    fn parse_listening_sockets(ss_output: &str) -> Vec<ListeningSocket> {
-        ss_output
+    fn parse_listening_sockets(ss_output: &str) -> Result<Vec<ListeningSocket>, UnknownReason> {
+        let mut sockets = Vec::new();
+        for line in ss_output
             .lines()
-            .filter(|line| line.contains("LISTEN") || line.contains("UNCONN"))
-            .filter_map(|line| {
-                let mut parts = line.split_whitespace();
-                let protocol = parts.next()?.to_string();
-                let local_address = parts.nth(3)?;
-                let (address, port) = Self::parse_local_address(local_address)?;
-                Some(ListeningSocket {
-                    protocol,
-                    is_loopback: Self::is_loopback_address(&address),
-                    address,
-                    port,
-                })
-            })
-            .collect()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let mut parts = line.split_whitespace();
+            let protocol = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or(UnknownReason::MalformedOutput)?;
+            let state = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            if state != "LISTEN" && state != "UNCONN" {
+                return Err(UnknownReason::MalformedOutput);
+            }
+            let _receive_queue = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            let _send_queue = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            let local_address = parts.next().ok_or(UnknownReason::MalformedOutput)?;
+            let (address, port) =
+                Self::parse_local_address(local_address).ok_or(UnknownReason::MalformedOutput)?;
+            sockets.push(ListeningSocket {
+                protocol: protocol.to_string(),
+                is_loopback: Self::is_loopback_address(&address),
+                address,
+                port,
+            });
+        }
+
+        if sockets.is_empty() {
+            Err(UnknownReason::MalformedOutput)
+        } else {
+            Ok(sockets)
+        }
     }
 
     fn parse_local_address(local_address: &str) -> Option<(String, u16)> {
@@ -869,15 +1064,29 @@ impl SecurityAuditor {
         format!("{}://{}:{}", socket.protocol, socket.address, socket.port)
     }
 
-    fn check_docker_tcp_api_ports(lang: &Lang, open_ports: &[u16]) -> SecurityCheck {
+    fn check_docker_tcp_api_ports(lang: &Lang, open_ports: &Fact<Vec<u16>>) -> SecurityCheck {
+        let name = crate::i18n::t("audit.docker_api.name", lang);
+        let remediation = crate::i18n::t("audit.docker_api.remediation", lang);
+        let open_ports = match open_ports {
+            Fact::Known(open_ports) => open_ports,
+            Fact::Unknown(reason) => {
+                return SecurityCheck::new(
+                    "docker.tcp_api",
+                    name,
+                    "docker",
+                    "critical",
+                    "WARN",
+                    crate::i18n::t("audit.ports.error", lang),
+                    remediation,
+                )
+                .with_evidence(unknown_evidence(*reason));
+            }
+        };
         let exposed = open_ports
             .iter()
             .copied()
             .filter(|port| *port == 2375 || *port == 2376)
             .collect::<Vec<_>>();
-        let name = crate::i18n::t("audit.docker_api.name", lang);
-        let remediation = crate::i18n::t("audit.docker_api.remediation", lang);
-
         if exposed.is_empty() {
             SecurityCheck::new(
                 "docker.tcp_api",
@@ -922,20 +1131,29 @@ impl SecurityAuditor {
     async fn check_docker_container_risks(
         lang: &Lang,
         docker: Option<&DockerService>,
+        cancellation: &ProbeCancellation,
     ) -> SecurityCheck {
         let name = crate::i18n::t("audit.docker_containers.name", lang);
         let remediation = crate::i18n::t("audit.docker_containers.remediation", lang);
 
         let Some(docker) = docker else {
-            let status = if Path::new("/var/run/docker.sock").exists() {
-                "WARN"
-            } else {
-                "PASS"
-            };
-            let message = if status == "PASS" {
-                crate::i18n::t("audit.docker_containers.no_runtime", lang)
-            } else {
-                crate::i18n::t("audit.docker_containers.unavailable", lang)
+            let socket = tokio::fs::metadata("/var/run/docker.sock").await;
+            let (status, message, evidence) = match socket {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+                    "PASS",
+                    crate::i18n::t("audit.docker_containers.no_runtime", lang),
+                    Vec::new(),
+                ),
+                Ok(_) => (
+                    "WARN",
+                    crate::i18n::t("audit.docker_containers.unavailable", lang),
+                    Vec::new(),
+                ),
+                Err(error) => (
+                    "WARN",
+                    crate::i18n::t("audit.docker_containers.error", lang),
+                    unknown_evidence(filesystem_unknown_reason(&error)),
+                ),
             };
 
             return SecurityCheck::new(
@@ -946,15 +1164,38 @@ impl SecurityAuditor {
                 status,
                 message,
                 remediation,
-            );
+            )
+            .with_evidence(evidence);
         };
 
-        let docker_timeout = env_duration_secs("SECURITY_AUDIT_DOCKER_TIMEOUT_SECS", 10, 1, 120);
-        let audit_result =
-            tokio::time::timeout(docker_timeout, docker.audit_security_risks()).await;
+        let docker_timeout = env_duration_secs(
+            "SECURITY_AUDIT_DOCKER_TIMEOUT_SECS",
+            DOCKER_PROBE_TIMEOUT.as_secs(),
+            1,
+            DOCKER_PROBE_TIMEOUT.as_secs(),
+        );
+        enum DockerAuditResult<T> {
+            Completed(T),
+            TimedOut,
+            Cancelled(UnknownReason),
+        }
+        let audit_result = tokio::select! {
+            result = tokio::time::timeout(docker_timeout, docker.audit_security_risks()) => {
+                match result {
+                    Ok(result) => DockerAuditResult::Completed(result),
+                    Err(_) => DockerAuditResult::TimedOut,
+                }
+            }
+            reason = cancellation.cancelled() => {
+                DockerAuditResult::Cancelled(match reason {
+                    CancellationReason::Cancelled => UnknownReason::Cancelled,
+                    CancellationReason::AuditDeadlineExceeded => UnknownReason::AuditDeadlineExceeded,
+                })
+            }
+        };
 
         match audit_result {
-            Err(_) => SecurityCheck::new(
+            DockerAuditResult::TimedOut => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
                 "docker",
@@ -963,8 +1204,18 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_containers.timeout", lang),
                 remediation,
             )
-            .with_evidence(vec![format!("timeout_secs={}", docker_timeout.as_secs())]),
-            Ok(Ok(risks)) if risks.is_empty() => SecurityCheck::new(
+            .with_evidence(unknown_evidence(UnknownReason::Timeout)),
+            DockerAuditResult::Cancelled(reason) => SecurityCheck::new(
+                "docker.container_hardening",
+                name,
+                "docker",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.docker_containers.error", lang),
+                remediation,
+            )
+            .with_evidence(unknown_evidence(reason)),
+            DockerAuditResult::Completed(Ok(risks)) if risks.is_empty() => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
                 "docker",
@@ -974,7 +1225,7 @@ impl SecurityAuditor {
                 remediation,
             )
             .with_references(vec!["https://docs.docker.com/engine/security/"]),
-            Ok(Ok(risks)) => {
+            DockerAuditResult::Completed(Ok(risks)) => {
                 let has_critical = risks.iter().any(|risk| risk.severity == "critical");
                 let has_high = risks.iter().any(|risk| risk.severity == "high");
                 let severity = if has_critical {
@@ -991,11 +1242,12 @@ impl SecurityAuditor {
                 };
                 let evidence = risks
                     .iter()
+                    .take(128)
                     .map(|risk| format!("{}: {}", risk.finding, risk.evidence))
                     .collect::<Vec<_>>();
 
                 let mut by_severity: HashMap<String, Vec<String>> = HashMap::new();
-                for risk in &risks {
+                for risk in risks.iter().take(128) {
                     by_severity
                         .entry(risk.severity.clone())
                         .or_default()
@@ -1024,7 +1276,7 @@ impl SecurityAuditor {
 
                 check
             }
-            Ok(Err(e)) => SecurityCheck::new(
+            DockerAuditResult::Completed(Err(_)) => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
                 "docker",
@@ -1033,7 +1285,7 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_containers.error", lang),
                 remediation,
             )
-            .with_evidence(vec![e]),
+            .with_evidence(unknown_evidence(UnknownReason::IoError)),
         }
     }
 }
@@ -1136,25 +1388,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_system_binary_existing() {
-        let result = SecurityAuditor::find_system_binary("ls");
-        assert!(
-            result.is_some(),
-            "Binary 'ls' should be found in standard paths"
-        );
-
-        let path = result.unwrap();
-        assert!(path.exists());
-        assert!(path.is_file());
-    }
-
-    #[test]
-    fn test_find_system_binary_nonexistent() {
-        let result = SecurityAuditor::find_system_binary("nonexistent_binary_xyz123");
-        assert!(result.is_none(), "Nonexistent binary should not be found");
-    }
-
-    #[test]
     fn test_parse_sshd_config_output_normalizes_keys() {
         let config = SecurityAuditor::parse_sshd_config_output(
             "PermitRootLogin prohibit-password\nPermitRootLogin yes\nPasswordAuthentication no\n# ignored yes\n",
@@ -1175,6 +1408,7 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
 ";
 
         let mut ports = SecurityAuditor::parse_listening_sockets(output)
+            .expect("valid ss output")
             .into_iter()
             .map(|socket| socket.port)
             .collect::<Vec<_>>();
@@ -1196,11 +1430,11 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
             vec![22, 80, 81, 82, 443, 8090]
         );
         assert_eq!(baseline.allowed_loopback_ports, vec![53, 3000, 9001]);
-        assert!(baseline.invalid_tokens.is_empty());
+        assert_eq!(baseline.invalid_token_count, 0);
     }
 
     #[test]
-    fn test_listening_port_baseline_keeps_invalid_tokens() {
+    fn test_listening_port_baseline_counts_invalid_tokens_without_storing_values() {
         let baseline = SecurityAuditor::listening_port_baseline(
             3000,
             8090,
@@ -1210,7 +1444,7 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
 
         assert_eq!(baseline.allowed_public_ports, vec![22, 80, 443, 5435, 8090]);
         assert_eq!(baseline.allowed_loopback_ports, vec![3000]);
-        assert_eq!(baseline.invalid_tokens, vec!["70000", "bad"]);
+        assert_eq!(baseline.invalid_token_count, 3);
     }
 
     #[test]
@@ -1221,7 +1455,7 @@ tcp LISTEN 0 4096 0.0.0.0:5435 0.0.0.0:*
 tcp LISTEN 0 128 [::1]:9001 [::]:*
 ";
 
-        let sockets = SecurityAuditor::parse_listening_sockets(output);
+        let sockets = SecurityAuditor::parse_listening_sockets(output).expect("valid ss output");
         let loopback_ports = sockets
             .iter()
             .filter(|socket| socket.is_loopback)
@@ -1235,6 +1469,50 @@ tcp LISTEN 0 128 [::1]:9001 [::]:*
 
         assert_eq!(loopback_ports, vec![3000, 9001]);
         assert_eq!(public_ports, vec![5435]);
+    }
+
+    #[test]
+    fn test_parse_listening_sockets_rejects_mixed_malformed_output() {
+        let output = "\
+tcp LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:*
+this line is not valid ss output
+";
+
+        assert_eq!(
+            SecurityAuditor::parse_listening_sockets(output)
+                .expect_err("mixed malformed output must remain unknown"),
+            UnknownReason::MalformedOutput
+        );
+    }
+
+    #[test]
+    fn test_unknown_port_fact_keeps_dependent_docker_check_unknown() {
+        let lang = Lang::EN;
+        let check = SecurityAuditor::check_docker_tcp_api_ports(
+            &lang,
+            &Fact::Unknown(UnknownReason::Timeout),
+        );
+
+        assert_eq!(check.status, "WARN");
+        assert_eq!(check.evidence, vec!["probe_error=timeout"]);
+    }
+
+    #[test]
+    fn test_evidence_and_metadata_are_bounded() {
+        let check = SecurityCheck::new(
+            "bounded",
+            "bounded".to_string(),
+            "test",
+            "low",
+            "WARN",
+            "bounded".to_string(),
+            "bounded".to_string(),
+        )
+        .with_evidence(vec!["x".repeat(8 * 1024)])
+        .with_metadata("items", (0..256).map(|value| value.to_string()).collect());
+
+        assert!(check.evidence.iter().map(String::len).sum::<usize>() <= 4 * 1024);
+        assert_eq!(check.metadata["items"].len(), 128);
     }
 
     #[test]

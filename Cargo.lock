@@ -1215,6 +1215,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "hostname",
+ "libc",
  "mime_guess",
  "rand 0.9.4",
  "reqwest",

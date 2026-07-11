@@ -43,6 +43,10 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.ssh_source_ip.title" => "SSH-вход с недоверенного IP-источника".to_string(),
             "security.ssh_source_ip.message" => "SSH-вход не совпадает с baseline доверенных IP".to_string(),
 
+            "audit.collection.name" => "Сбор данных аудита".to_string(),
+            "audit.collection.error" => "Сбор данных аудита превысил общий лимит времени".to_string(),
+            "audit.collection.remediation" => "Проверьте доступность системных утилит и повторите аудит".to_string(),
+
             "audit.ssh_root.name" => "Доступ root через SSH".to_string(),
             "audit.ssh_root.fail" => "Root-доступ разрешен по паролю/ключам (небезопасно)".to_string(),
             "audit.ssh_root.pass" => "Доступ для root ограничен или отключен".to_string(),
@@ -97,6 +101,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.ports.pass" => "Найдены только ожидаемые listening ports".to_string(),
             "audit.ports.warn" => "Найдены неожиданные listening ports".to_string(),
             "audit.ports.error" => "Ошибка сканирования портов".to_string(),
+            "audit.ports.config_error" => "Список разрешённых портов содержит некорректные значения".to_string(),
             "audit.ports.remediation" => "Закройте неожиданные listening ports, привяжите приватные сервисы к loopback, защитите их firewall-правилами или добавьте ожидаемые public/loopback порты в SECURITY_ALLOWED_PUBLIC_PORTS и SECURITY_ALLOWED_LOOPBACK_PORTS".to_string(),
             _ => key.to_string(),
         },
@@ -110,6 +115,10 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.message" => "Message".to_string(),
             "security.ssh_source_ip.title" => "SSH login from untrusted source IP".to_string(),
             "security.ssh_source_ip.message" => "SSH login does not match the trusted IP baseline".to_string(),
+
+            "audit.collection.name" => "Security Audit Collection".to_string(),
+            "audit.collection.error" => "Security audit collection exceeded its overall deadline".to_string(),
+            "audit.collection.remediation" => "Verify that required system tools respond and run the audit again".to_string(),
 
             "audit.ssh_root.name" => "SSH Root Login".to_string(),
             "audit.ssh_root.fail" => "Root login is permitted via SSH via password/keys".to_string(),
@@ -165,6 +174,7 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "audit.ports.pass" => "Only expected listening ports found".to_string(),
             "audit.ports.warn" => "Unexpected listening ports found".to_string(),
             "audit.ports.error" => "Error scanning ports".to_string(),
+            "audit.ports.config_error" => "The allowed-port configuration contains invalid values".to_string(),
             "audit.ports.remediation" => "Close unexpected listening ports, bind private services to loopback, protect them with firewall rules, or add expected public/loopback ports to SECURITY_ALLOWED_PUBLIC_PORTS and SECURITY_ALLOWED_LOOPBACK_PORTS".to_string(),
             _ => key.to_string(),
         }
