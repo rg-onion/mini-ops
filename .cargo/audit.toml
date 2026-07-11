@@ -1,0 +1,17 @@
+# RUSTSEC-2023-0071 (`rsa` 0.9.10) has no fixed release. It is retained only
+# as an unreachable Cargo.lock entry: on 2026-07-11 both of these returned
+# `warning: nothing to print`:
+#
+# cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa@0.9.10
+# cargo tree --locked --target all -i rsa@0.9.10
+#
+# Owner/revisit: Mini-Ops maintainers must remove this ignore if `rsa` becomes
+# reachable, when a patched release exists, or during the mandatory P9 audit.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+
+[output]
+deny = ["warnings"]
+format = "terminal"
+quiet = false
+show_tree = true
