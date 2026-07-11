@@ -18,7 +18,7 @@ use probe::{
 
 use crate::docker::DockerService;
 use crate::i18n::Lang;
-use crate::notifications::NotificationService;
+use crate::notifications::{NotificationOutbox, NotificationService};
 use crate::security_events::SecurityEventService;
 
 const AUDIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -1628,6 +1628,7 @@ impl SecurityAuditor {
 
 pub struct SecurityMonitor {
     notifier: Arc<NotificationService>,
+    outbox: Arc<NotificationOutbox>,
     docker: Option<Arc<DockerService>>,
     events: Arc<SecurityEventService>,
     interval: Duration,
@@ -1636,11 +1637,13 @@ pub struct SecurityMonitor {
 impl SecurityMonitor {
     pub fn new(
         notifier: Arc<NotificationService>,
+        outbox: Arc<NotificationOutbox>,
         docker: Option<Arc<DockerService>>,
         events: Arc<SecurityEventService>,
     ) -> Self {
         Self {
             notifier,
+            outbox,
             docker,
             events,
             interval: env_duration_secs("SECURITY_AUDIT_INTERVAL_SECS", 300, 60, 86_400),
@@ -1664,57 +1667,63 @@ impl SecurityMonitor {
         let default_lang = Lang::from_headers(&crate::i18n::HeaderMap::new());
         let checks = SecurityAuditor::run_audit(&default_lang, self.docker.as_deref()).await;
 
-        let mut alerts = Vec::new();
         for check in &checks {
             if check.status == "FAIL" {
-                match self.events.raise_audit_event(check).await {
-                    Ok(true) => alerts.push(format!(
-                        "{}\n\n{}: {}\n{}: {}",
-                        crate::i18n::t("security.detected", &default_lang),
-                        crate::i18n::t("security.check", &default_lang),
-                        check.name,
-                        crate::i18n::t("security.message", &default_lang),
-                        check.message
-                    )),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        "Failed to persist security event for check {}: {}",
-                        check.id,
-                        e
-                    ),
+                let alert = self.notifier.render_alert_text(&format!(
+                    "{}\n\n{}: {}\n{}: {}",
+                    crate::i18n::t("security.detected", &default_lang),
+                    crate::i18n::t("security.check", &default_lang),
+                    check.name,
+                    crate::i18n::t("security.message", &default_lang),
+                    check.message
+                ));
+                if self
+                    .events
+                    .raise_audit_event_with_notification(check, &self.outbox, &alert)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        event_error = "database",
+                        check_id = %check.id,
+                        "Failed to persist security event and notification"
+                    );
                 }
             } else if check.status == "WARN" {
-                if let Err(e) = self.events.raise_audit_event(check).await {
+                if self.events.raise_audit_event(check).await.is_err() {
                     tracing::warn!(
-                        "Failed to persist warning security event for check {}: {}",
-                        check.id,
-                        e
+                        event_error = "database",
+                        check_id = %check.id,
+                        "Failed to persist warning security event"
                     );
                 }
             } else if check.status == "PASS" {
-                match self.events.resolve_audit_event(check).await {
-                    Ok(true) => alerts.push(format!(
-                        "{}\n\n{}: {}",
-                        crate::i18n::t("security.resolved", &default_lang),
-                        crate::i18n::t("security.check", &default_lang),
-                        check.name
-                    )),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(
-                        "Failed to resolve security event for check {}: {}",
-                        check.id,
-                        e
-                    ),
+                let alert = self.notifier.render_alert_text(&format!(
+                    "{}\n\n{}: {}",
+                    crate::i18n::t("security.resolved", &default_lang),
+                    crate::i18n::t("security.check", &default_lang),
+                    check.name
+                ));
+                if self
+                    .events
+                    .resolve_audit_event_with_notification(check, &self.outbox, &alert)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        event_error = "database",
+                        check_id = %check.id,
+                        "Failed to resolve security event and notification"
+                    );
                 }
             }
         }
 
-        if let Err(e) = self.events.cleanup_if_due().await {
-            tracing::warn!("Failed to clean up old security events: {}", e);
-        }
-
-        for alert in alerts {
-            self.notifier.send_alert(&alert).await;
+        if self.events.cleanup_if_due().await.is_err() {
+            tracing::warn!(
+                event_error = "database",
+                "Failed to clean up old security events"
+            );
         }
     }
 }

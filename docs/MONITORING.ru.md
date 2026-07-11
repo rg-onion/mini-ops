@@ -32,10 +32,25 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
+Оба значения должны быть непустыми. Если хотя бы одно отсутствует или содержит
+только пробелы, Telegram delivery выключена. Пустой `SERVER_NAME` заменяется
+именем хоста.
+
+Operational и security alerts используют durable SQLite outbox. Retryable
+ошибки переживают restart и повторяются не более пяти раз с bounded backoff.
+Очередь ограничена 1000 live и 200 terminal rows; переполнение отображается как
+локальное security event `notification.delivery_degraded`. Metric alerts
+используют стабильные CPU/disk keys с cooldown 30 минут, а не меняющийся текст
+метрики как identity. Provider response body, request URL, token и raw transport
+error не сохраняются и не пишутся в log.
+
 ### Тестирование
 Вы можете проверить отправку уведомлений вручную:
 ```bash
-curl -X POST http://YOUR_SERVER_IP:8090/api/test-notification \
+curl --include --request POST http://127.0.0.1:3000/api/test-notification \
   -H "Authorization: Bearer YOUR_AUTH_TOKEN"
 ```
-Если настройки верны, бот пришлет тестовое сообщение.
+
+Это immediate non-durable attempt: HTTP `200` означает, что Telegram реально
+вернул успешный ответ. Disabled config и delivery failure возвращают typed
+non-2xx response и не ставятся в retry queue.

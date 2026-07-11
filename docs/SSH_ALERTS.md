@@ -1,6 +1,7 @@
 # SSH Alerts Setup
 
-Mini-Ops can send Telegram notifications for every successful SSH login.
+Mini-Ops records successful SSH logins. Alerts for untrusted source IPs are
+placed in a durable Telegram queue with bounded cooldown and retry.
 
 ## How It Works
 
@@ -13,6 +14,9 @@ Mini-Ops can send Telegram notifications for every successful SSH login.
     arguments or hook logs.
 5.  **Source-IP baseline**: Mini-Ops compares the login source IP with the
     trusted IP list managed on the SSH Security page.
+6.  **Durable delivery**: An untrusted occurrence is queued; the worker performs
+    bounded provider attempts. Trusted occurrences and duplicates within the
+    suppression/live window are not queued.
 
 ## Manual Installation
 
@@ -61,10 +65,15 @@ The trusted IP list is the local baseline for SSH source IPs.
 
 - Logins from trusted IPs are still recorded in SSH history, but Telegram
   notifications are suppressed.
-- Logins from untrusted IPs are recorded, trigger the normal SSH Telegram alert,
-  and create a `ssh.untrusted_source_ip` security event.
+- Logins from untrusted IPs are recorded, enqueue the normal SSH Telegram alert,
+  and create a `ssh.untrusted_source_ip` security event. The durable outbox
+  suppresses the same normalized source IP for 10 seconds; failed retryable
+  delivery survives restart.
 - Adding an IP to the trusted list resolves any active security event for that
   source IP.
+- The existing SSH history `notified` flag means the occurrence was accepted by
+  the durable queue; it is not proof of provider delivery. The linked local
+  security event carries the redacted delivery status.
 - IPs are normalized before comparison, so equivalent IPv6 spellings compare as
   the same address.
 
@@ -79,6 +88,6 @@ The trusted IP list is the local baseline for SSH source IPs.
 5. Run the installed alert script as root to test connectivity without printing
    the token:
    ```bash
-   sudo env PAM_USER=test PAM_RHOST=1.2.3.4 PAM_TYPE=open_session \
+   sudo env PAM_USER=test PAM_RHOST=192.0.2.10 PAM_TYPE=open_session \
      /usr/local/bin/ssh-alert.sh
    ```

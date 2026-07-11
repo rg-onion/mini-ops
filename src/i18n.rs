@@ -42,6 +42,8 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.message" => "Описание".to_string(),
             "security.ssh_source_ip.title" => "SSH-вход с недоверенного IP-источника".to_string(),
             "security.ssh_source_ip.message" => "SSH-вход не совпадает с baseline доверенных IP".to_string(),
+            "notification.delivery_degraded.title" => "Доставка уведомлений работает в degraded mode".to_string(),
+            "notification.delivery_degraded.message" => "Очередь уведомлений достигла лимита; новые доставки временно ограничены".to_string(),
 
             "audit.collection.name" => "Сбор данных аудита".to_string(),
             "audit.collection.error" => "Сбор данных аудита превысил общий лимит времени".to_string(),
@@ -115,6 +117,8 @@ pub fn t(key: &str, lang: &Lang) -> String {
             "security.message" => "Message".to_string(),
             "security.ssh_source_ip.title" => "SSH login from untrusted source IP".to_string(),
             "security.ssh_source_ip.message" => "SSH login does not match the trusted IP baseline".to_string(),
+            "notification.delivery_degraded.title" => "Notification delivery is degraded".to_string(),
+            "notification.delivery_degraded.message" => "The notification queue reached its capacity; new deliveries are temporarily backpressured".to_string(),
 
             "audit.collection.name" => "Security Audit Collection".to_string(),
             "audit.collection.error" => "Security audit collection exceeded its overall deadline".to_string(),

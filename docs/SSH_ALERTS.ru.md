@@ -1,6 +1,7 @@
 # 🔐 SSH Alerts (Уведомления о входе по SSH)
 
-Mini-Ops включает систему реального времени для отслеживания SSH-сессий и мгновенного оповещения в Telegram при каждом успешном входе.
+Mini-Ops фиксирует успешные SSH-входы; уведомления для недоверенных source IP
+ставятся в durable Telegram queue с bounded cooldown и retry.
 
 ## ⚙️ Как это работает
 
@@ -16,8 +17,10 @@ Mini-Ops включает систему реального времени дл�
     для curl отключается.
 4.  Backend проверяет:
     *   **Trusted source-IP baseline**: Если IP доверенный, уведомление не отправляется.
-    *   **Rate Limiting**: Ограничение — не более одного уведомления в 10 секунд для одного IP.
-5.  Если проверки пройдены, отправляется сообщение в Telegram.
+    *   **Durable suppression**: Для одного normalized IP новая occurrence
+        подавляется 10 секунд либо пока предыдущая delivery остаётся live.
+5.  Для недоверенного IP сообщение ставится в durable outbox; worker выполняет
+    bounded provider attempt и retry.
 
 ## 🚀 Настройка (Setup)
 
@@ -45,11 +48,15 @@ grep ssh-alert /var/log/syslog
 
 - Подключения с доверенных IP записываются в историю, но Telegram-уведомление не
   отправляется.
-- Подключения с недоверенных IP записываются в историю, отправляют обычное SSH
-  Telegram-уведомление и создают событие безопасности
-  `ssh.untrusted_source_ip`.
+- Подключения с недоверенных IP записываются в историю, ставят обычное SSH
+  Telegram-уведомление в durable outbox и создают событие безопасности
+  `ssh.untrusted_source_ip`. Outbox подавляет повтор того же normalized source
+  IP на 10 секунд, а retryable delivery переживает restart.
 - Добавление IP в доверенный baseline закрывает активное событие безопасности
   для этого source IP.
+- Существующий флаг `notified` в SSH history означает, что occurrence принята в
+  durable queue; это не доказательство provider delivery. Redacted delivery
+  status хранится в связанном локальном security event.
 - IP нормализуются перед сравнением, поэтому эквивалентные записи IPv6
   считаются одним адресом.
 
@@ -59,7 +66,8 @@ grep ssh-alert /var/log/syslog
 - Время и дату.
 - Пользователя (`root`, `admin` и т.д.).
 - IP адрес источника.
-- Статус уведомления (было отправлено или проигнорировано).
+- Legacy queue status: occurrence была поставлена в outbox либо была
+  suppressed/disabled; фактическую delivery показывает security event.
 
 ## ⚠️ Безопасность токена
 Внутренний токен (`internal_token`) генерируется случайным образом (UUID v4)

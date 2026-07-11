@@ -105,8 +105,15 @@ remains active, and resolved when the check returns to `PASS`.
   the matching event.
 - Resolved events are retained for `SECURITY_EVENTS_RETENTION_HOURS` hours
   (`168` by default).
-- Telegram notifications are sent only when a failed check first opens/reopens
-  and when it resolves.
+- Alert-worthy transitions and their Telegram delivery row are committed in one
+  SQLite transaction. Retryable failures survive restart; a transition is
+  marked delivered only after Telegram returns HTTP `2xx` with `ok=true`.
+- Acknowledging an event does not cancel its pending delivery. Delivery state
+  uses closed error codes and never stores the bot token, chat ID, request URL,
+  or raw provider response.
+- Security event JSON exposes nullable `notification_delivery_status`, attempt
+  count, update time, and a closed error code. The internal transition sequence
+  is not exposed.
 
 ## Local Data Retention
 

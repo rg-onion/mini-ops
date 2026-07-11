@@ -39,7 +39,9 @@ use disk_ops::{DiskOps, DiskUsageBreakdown};
 use docker::DockerService;
 use history::HistoryManager;
 use metrics::{MetricsState, SystemStats};
-use notifications::NotificationService;
+use notifications::{
+    NotificationEvent, NotificationOutbox, NotificationOutcome, NotificationService,
+};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -172,6 +174,8 @@ async fn main() {
     let retention_config = retention::RetentionConfig::from_env();
     let security_audit_cache = SecurityAuditCache::from_env();
     let security_events = Arc::new(SecurityEventService::new(pool.clone()));
+    let notification_outbox =
+        Arc::new(NotificationOutbox::new(pool.clone(), notifications.clone()));
 
     let docker_service = match DockerService::new() {
         Ok(s) => Some(Arc::new(s)),
@@ -186,6 +190,7 @@ async fn main() {
         pool.clone(),
         notifications.clone(),
         security_events.clone(),
+        notification_outbox.clone(),
         retention_config.ssh_logins_retention_days,
     ));
 
@@ -202,9 +207,12 @@ async fn main() {
     })
     .unwrap_or_else(|error| exit_with_runtime_error("internal_token_write", error));
 
+    let _notification_worker = Arc::clone(&notification_outbox).start();
+
     // Start the monitor only after all fail-fast runtime state is ready.
     let security_monitor = Arc::new(SecurityMonitor::new(
         notifications.clone(),
+        notification_outbox.clone(),
         docker_service.clone(),
         security_events.clone(),
     ));
@@ -256,6 +264,7 @@ async fn main() {
     // 3. Start Background Task for Metrics & Alerts
     let metrics_clone = Arc::clone(&metrics_state);
     let notifier_clone = Arc::clone(&notifications);
+    let notification_outbox_clone = Arc::clone(&notification_outbox);
     let pool_clone = pool.clone();
     let metrics_retention_hours = retention_config.metrics_retention_hours;
     tokio::spawn(async move {
@@ -269,23 +278,41 @@ async fn main() {
             // Check for critical alerts
             let lang = i18n::Lang::from_headers(&header::HeaderMap::new());
             if stats.cpu_usage > 95.0 {
-                notifier_clone
-                    .send_alert(&i18n::t_val(
-                        "alert.critical_cpu",
-                        &lang,
-                        &format!("{:.1}", stats.cpu_usage),
-                    ))
-                    .await;
+                let message = i18n::t_val(
+                    "alert.critical_cpu",
+                    &lang,
+                    &format!("{:.1}", stats.cpu_usage),
+                );
+                let event = NotificationEvent::generic(
+                    "metric:cpu:critical",
+                    "metric.cpu.critical",
+                    notifier_clone.render_alert_text(&message),
+                    stats.timestamp,
+                    1800,
+                );
+                if notification_outbox_clone.enqueue(&event).await.is_err() {
+                    tracing::warn!(
+                        delivery_error = "database",
+                        "Could not enqueue CPU notification"
+                    );
+                }
             }
             let disk_percent = (stats.disk_used as f64 / stats.disk_total as f64) * 100.0;
             if disk_percent > 90.0 {
-                notifier_clone
-                    .send_alert(&i18n::t_val(
-                        "alert.low_disk",
-                        &lang,
-                        &format!("{:.1}", disk_percent),
-                    ))
-                    .await;
+                let message = i18n::t_val("alert.low_disk", &lang, &format!("{:.1}", disk_percent));
+                let event = NotificationEvent::generic(
+                    "metric:disk:low",
+                    "metric.disk.low",
+                    notifier_clone.render_alert_text(&message),
+                    stats.timestamp,
+                    1800,
+                );
+                if notification_outbox_clone.enqueue(&event).await.is_err() {
+                    tracing::warn!(
+                        delivery_error = "database",
+                        "Could not enqueue disk notification"
+                    );
+                }
             }
 
             let _ = sqlx::query(
@@ -615,11 +642,17 @@ async fn test_notification_handler(
     headers: header::HeaderMap,
 ) -> impl IntoResponse {
     let lang = i18n::Lang::from_headers(&headers);
-    state
+    let outcome = state
         .notifier
         .send_alert(&i18n::t("alert.test", &lang))
         .await;
-    StatusCode::OK
+    let status = match outcome {
+        NotificationOutcome::Sent => StatusCode::OK,
+        NotificationOutcome::Disabled => StatusCode::SERVICE_UNAVAILABLE,
+        NotificationOutcome::Suppressed => StatusCode::TOO_MANY_REQUESTS,
+        NotificationOutcome::Failed { .. } => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(outcome)).into_response()
 }
 
 async fn list_containers_handler(State(state): State<AppState>) -> Response {

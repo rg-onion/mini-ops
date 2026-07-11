@@ -121,7 +121,15 @@ Mini-Ops сохраняет результаты аудита безопасно
   `ssh.untrusted_source_ip`; добавление IP в доверенный список закрывает
   соответствующее событие.
 - Закрытые события хранятся `SECURITY_EVENTS_RETENTION_HOURS` часов (`168` по умолчанию).
-- Telegram-уведомления отправляются только когда failed-проверка открывается/переоткрывается и когда она закрывается.
+- Alert-worthy transition и строка Telegram delivery фиксируются одной SQLite
+  transaction. Retryable ошибки переживают restart; transition считается
+  доставленным только после HTTP `2xx` и `ok=true` от Telegram.
+- Acknowledge события не отменяет pending delivery. Delivery state использует
+  только closed error codes и не хранит bot token, chat ID, request URL или raw
+  provider response.
+- JSON security event содержит nullable `notification_delivery_status`, число
+  попыток, время обновления и закрытый error code. Внутренний transition
+  sequence наружу не выдаётся.
 
 ## Локальное хранение данных
 

@@ -1,9 +1,10 @@
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::notifications::{EnqueueOutcome, NotificationEvent, NotificationOutbox};
 use crate::security::SecurityCheck;
 
 const DEFAULT_SECURITY_EVENTS_RETENTION_HOURS: i64 = 168;
@@ -23,6 +24,10 @@ pub struct SecurityEvent {
     pub last_seen: i64,
     pub acknowledged_at: Option<i64>,
     pub resolved_at: Option<i64>,
+    pub notification_delivery_status: Option<String>,
+    pub notification_delivery_attempts: Option<i64>,
+    pub notification_delivery_updated_at: Option<i64>,
+    pub notification_delivery_error_code: Option<String>,
 }
 
 #[derive(Clone)]
@@ -81,10 +86,34 @@ impl SecurityEventService {
         .execute(db)
         .await?;
 
+        ensure_notification_columns(db).await?;
+        NotificationOutbox::init_schema(db).await?;
+
         Ok(())
     }
 
     pub async fn raise_audit_event(&self, check: &SecurityCheck) -> Result<bool, sqlx::Error> {
+        let (should_alert, _) = self.raise_audit_event_inner(check, None).await?;
+        Ok(should_alert)
+    }
+
+    pub(crate) async fn raise_audit_event_with_notification(
+        &self,
+        check: &SecurityCheck,
+        outbox: &NotificationOutbox,
+        notification_text: &str,
+    ) -> Result<Option<EnqueueOutcome>, sqlx::Error> {
+        let (_, notification) = self
+            .raise_audit_event_inner(check, Some((outbox, notification_text)))
+            .await?;
+        Ok(notification)
+    }
+
+    async fn raise_audit_event_inner(
+        &self,
+        check: &SecurityCheck,
+        notification: Option<(&NotificationOutbox, &str)>,
+    ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
         let event_key = Self::audit_event_key(&check.id);
         let now = Utc::now().timestamp();
         let event_type = if check.status == "WARN" {
@@ -92,17 +121,18 @@ impl SecurityEventService {
         } else {
             "audit.check_failed"
         };
-        let previous_state = self.get_state_by_key(&event_key).await?;
+        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
         let is_warning_to_failed = matches!(
             previous_state.as_ref(),
-            Some((status, previous_event_type))
+            Some((status, previous_event_type, _))
                 if matches!(status.as_str(), "open" | "acknowledged")
                     && previous_event_type == "audit.check_warning"
                     && event_type == "audit.check_failed"
         );
         let should_alert = match previous_state.as_ref() {
             None => event_type == "audit.check_failed",
-            Some((status, _)) if status == "resolved" => event_type == "audit.check_failed",
+            Some((status, _, _)) if status == "resolved" => event_type == "audit.check_failed",
             _ if is_warning_to_failed => true,
             _ => false,
         };
@@ -164,28 +194,77 @@ impl SecurityEventService {
         .bind(evidence_json)
         .bind(now)
         .bind(now)
-        .execute(&self.db)
+        .execute(&mut *transaction)
         .await?;
 
+        let notification_outcome = if should_alert {
+            if let Some((outbox, notification_text)) = notification {
+                let sequence = next_notification_sequence(&mut transaction, &event_key).await?;
+                let event = NotificationEvent::security_transition(
+                    &event_key,
+                    sequence,
+                    event_type,
+                    notification_text,
+                    now,
+                );
+                let outcome = outbox
+                    .enqueue_in_transaction(&mut transaction, &event, now)
+                    .await?;
+                update_enqueue_summary(&mut transaction, &event_key, sequence, &outcome, now)
+                    .await?;
+                Some(outcome)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        transaction.commit().await?;
+        Ok((should_alert, notification_outcome))
+    }
+
+    #[cfg(test)]
+    pub async fn resolve_audit_event(&self, check: &SecurityCheck) -> Result<bool, sqlx::Error> {
+        let (should_alert, _) = self.resolve_audit_event_inner(check, None).await?;
         Ok(should_alert)
     }
 
-    pub async fn resolve_audit_event(&self, check: &SecurityCheck) -> Result<bool, sqlx::Error> {
+    pub(crate) async fn resolve_audit_event_with_notification(
+        &self,
+        check: &SecurityCheck,
+        outbox: &NotificationOutbox,
+        notification_text: &str,
+    ) -> Result<Option<EnqueueOutcome>, sqlx::Error> {
+        let (_, notification) = self
+            .resolve_audit_event_inner(check, Some((outbox, notification_text)))
+            .await?;
+        Ok(notification)
+    }
+
+    async fn resolve_audit_event_inner(
+        &self,
+        check: &SecurityCheck,
+        notification: Option<(&NotificationOutbox, &str)>,
+    ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
         let event_key = Self::audit_event_key(&check.id);
-        let previous_state = self.get_state_by_key(&event_key).await?;
+        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
         let should_resolve = matches!(
-            previous_state.as_ref().map(|(status, _)| status.as_str()),
+            previous_state
+                .as_ref()
+                .map(|(status, _, _)| status.as_str()),
             Some("open") | Some("acknowledged")
         );
         let should_alert = matches!(
             previous_state.as_ref(),
-            Some((status, event_type))
+            Some((status, event_type, _))
                 if matches!(status.as_str(), "open" | "acknowledged")
                     && event_type == "audit.check_failed"
         );
 
+        let now = Utc::now().timestamp();
         if should_resolve {
-            let now = Utc::now().timestamp();
             sqlx::query(
                 "UPDATE security_events
                 SET status = 'resolved', last_seen = ?, resolved_at = ?
@@ -193,14 +272,39 @@ impl SecurityEventService {
             )
             .bind(now)
             .bind(now)
-            .bind(event_key)
-            .execute(&self.db)
+            .bind(&event_key)
+            .execute(&mut *transaction)
             .await?;
         }
 
-        Ok(should_alert)
+        let notification_outcome = if should_alert {
+            if let Some((outbox, notification_text)) = notification {
+                let sequence = next_notification_sequence(&mut transaction, &event_key).await?;
+                let event = NotificationEvent::security_transition(
+                    &event_key,
+                    sequence,
+                    "audit.check_resolved",
+                    notification_text,
+                    now,
+                );
+                let outcome = outbox
+                    .enqueue_in_transaction(&mut transaction, &event, now)
+                    .await?;
+                update_enqueue_summary(&mut transaction, &event_key, sequence, &outcome, now)
+                    .await?;
+                Some(outcome)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        transaction.commit().await?;
+        Ok((should_alert, notification_outcome))
     }
 
+    #[cfg(test)]
     pub async fn raise_ssh_source_ip_event(
         &self,
         user: &str,
@@ -208,10 +312,48 @@ impl SecurityEventService {
         method: &str,
         timestamp: i64,
     ) -> Result<bool, sqlx::Error> {
+        let (should_alert, _) = self
+            .raise_ssh_source_ip_event_inner(user, ip, method, timestamp, None)
+            .await?;
+        Ok(should_alert)
+    }
+
+    pub(crate) async fn raise_ssh_source_ip_event_with_notification(
+        &self,
+        user: &str,
+        ip: &str,
+        method: &str,
+        timestamp: i64,
+        outbox: &NotificationOutbox,
+        notification_text: &str,
+    ) -> Result<Option<EnqueueOutcome>, sqlx::Error> {
+        let (_, notification) = self
+            .raise_ssh_source_ip_event_inner(
+                user,
+                ip,
+                method,
+                timestamp,
+                Some((outbox, notification_text)),
+            )
+            .await?;
+        Ok(notification)
+    }
+
+    async fn raise_ssh_source_ip_event_inner(
+        &self,
+        user: &str,
+        ip: &str,
+        method: &str,
+        timestamp: i64,
+        notification: Option<(&NotificationOutbox, &str)>,
+    ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
         let event_key = Self::ssh_source_ip_event_key(ip);
-        let previous_state = self.get_state_by_key(&event_key).await?;
+        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
         let should_alert = matches!(
-            previous_state.as_ref().map(|(status, _)| status.as_str()),
+            previous_state
+                .as_ref()
+                .map(|(status, _, _)| status.as_str()),
             None | Some("resolved")
         );
         let now = Utc::now().timestamp();
@@ -269,10 +411,29 @@ impl SecurityEventService {
         .bind(evidence_json)
         .bind(now)
         .bind(now)
-        .execute(&self.db)
+        .execute(&mut *transaction)
         .await?;
 
-        Ok(should_alert)
+        let notification_outcome = if let Some((outbox, notification_text)) = notification {
+            let sequence = next_notification_sequence(&mut transaction, &event_key).await?;
+            let event = NotificationEvent::ssh_login_transition(
+                &event_key,
+                ip,
+                sequence,
+                notification_text,
+                now,
+            );
+            let outcome = outbox
+                .enqueue_in_transaction(&mut transaction, &event, now)
+                .await?;
+            update_enqueue_summary(&mut transaction, &event_key, sequence, &outcome, now).await?;
+            Some(outcome)
+        } else {
+            None
+        };
+
+        transaction.commit().await?;
+        Ok((should_alert, notification_outcome))
     }
 
     pub async fn resolve_ssh_source_ip_event(&self, ip: &str) -> Result<bool, sqlx::Error> {
@@ -425,8 +586,125 @@ impl SecurityEventService {
             last_seen: row.get("last_seen"),
             acknowledged_at: row.get("acknowledged_at"),
             resolved_at: row.get("resolved_at"),
+            notification_delivery_status: row.get("notification_delivery_status"),
+            notification_delivery_attempts: row.get("notification_delivery_attempts"),
+            notification_delivery_updated_at: row.get("notification_delivery_updated_at"),
+            notification_delivery_error_code: row.get("notification_delivery_error_code"),
         }
     }
+}
+
+async fn ensure_notification_columns(db: &SqlitePool) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query("PRAGMA table_info(security_events)")
+        .fetch_all(db)
+        .await?;
+    let existing: std::collections::HashSet<String> = rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+
+    let additions = [
+        (
+            "notification_seq",
+            "ALTER TABLE security_events ADD COLUMN notification_seq INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "notification_delivery_status",
+            "ALTER TABLE security_events ADD COLUMN notification_delivery_status TEXT",
+        ),
+        (
+            "notification_delivery_attempts",
+            "ALTER TABLE security_events ADD COLUMN notification_delivery_attempts INTEGER",
+        ),
+        (
+            "notification_delivery_updated_at",
+            "ALTER TABLE security_events ADD COLUMN notification_delivery_updated_at INTEGER",
+        ),
+        (
+            "notification_delivery_error_code",
+            "ALTER TABLE security_events ADD COLUMN notification_delivery_error_code TEXT",
+        ),
+    ];
+    for (name, statement) in additions {
+        if !existing.contains(name) {
+            sqlx::query(statement).execute(db).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn get_notification_state_by_key(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_key: &str,
+) -> Result<Option<(String, String, i64)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT status, event_type, notification_seq
+         FROM security_events WHERE event_key = ?",
+    )
+    .bind(event_key)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(row.map(|row| {
+        (
+            row.get("status"),
+            row.get("event_type"),
+            row.get("notification_seq"),
+        )
+    }))
+}
+
+async fn next_notification_sequence(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_key: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE security_events
+         SET notification_seq = MAX(
+                notification_seq,
+                COALESCE((
+                    SELECT MAX(source_event_seq) FROM notification_outbox
+                    WHERE channel = 'telegram' AND source_event_key = ?
+                ), 0)
+             ) + 1
+         WHERE event_key = ?
+         RETURNING notification_seq",
+    )
+    .bind(event_key)
+    .bind(event_key)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+async fn update_enqueue_summary(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event_key: &str,
+    sequence: i64,
+    outcome: &EnqueueOutcome,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let (status, error_code) = match outcome {
+        EnqueueOutcome::Pending { .. } => ("pending", None),
+        EnqueueOutcome::Disabled => ("disabled", None),
+        EnqueueOutcome::Suppressed => ("suppressed", None),
+        EnqueueOutcome::Backpressure => ("failed", None),
+        EnqueueOutcome::Failed { code } => ("failed", Some(code.as_str())),
+    };
+    sqlx::query(
+        "UPDATE security_events
+         SET notification_delivery_status = ?,
+             notification_delivery_attempts = 0,
+             notification_delivery_updated_at = ?,
+             notification_delivery_error_code = ?
+         WHERE event_key = ? AND notification_seq = ?",
+    )
+    .bind(status)
+    .bind(now)
+    .bind(error_code)
+    .bind(event_key)
+    .bind(sequence)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn parse_security_events_retention_hours(value: Option<&str>) -> i64 {
@@ -452,8 +730,10 @@ fn retention_cutoff(now: i64, retention_hours: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::{EnqueueOutcome, NotificationOutbox, NotificationService};
     use crate::security::SecurityCheck;
     use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
 
     async fn test_service() -> SecurityEventService {
         let pool = SqlitePoolOptions::new()
@@ -497,6 +777,16 @@ mod tests {
         }
     }
 
+    fn enabled_outbox(service: &SecurityEventService) -> NotificationOutbox {
+        NotificationOutbox::new(
+            service.db.clone(),
+            Arc::new(NotificationService::with_test_endpoint(
+                "123456:test",
+                "http://127.0.0.1:9".to_string(),
+            )),
+        )
+    }
+
     #[test]
     fn security_events_retention_hours_uses_default_and_bounds() {
         assert_eq!(parse_security_events_retention_hours(None), 168);
@@ -519,6 +809,78 @@ mod tests {
             retention_cutoff(1_000, i64::MAX),
             1_000_i64.saturating_sub(i64::MAX)
         );
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_adds_notification_state_without_backfill_delivery() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                acknowledged_at INTEGER,
+                resolved_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO security_events (
+                event_key, event_type, severity, title, message, evidence_json,
+                status, first_seen, last_seen
+             ) VALUES ('legacy', 'audit.check_failed', 'high', 'title',
+                       'message', '{}', 'open', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        SecurityEventService::init_schema(&pool).await.unwrap();
+        let row = sqlx::query(
+            "SELECT notification_seq, notification_delivery_status,
+                    notification_delivery_attempts,
+                    notification_delivery_updated_at,
+                    notification_delivery_error_code
+             FROM security_events WHERE event_key = 'legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("notification_seq"), 0);
+        assert!(
+            row.get::<Option<String>, _>("notification_delivery_status")
+                .is_none()
+        );
+        assert!(
+            row.get::<Option<i64>, _>("notification_delivery_attempts")
+                .is_none()
+        );
+        assert!(
+            row.get::<Option<i64>, _>("notification_delivery_updated_at")
+                .is_none()
+        );
+        assert!(
+            row.get::<Option<String>, _>("notification_delivery_error_code")
+                .is_none()
+        );
+        let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     #[tokio::test]
@@ -653,6 +1015,219 @@ mod tests {
         assert_eq!(active[0].status, "open");
         assert_eq!(active[0].event_type, "audit.check_failed");
         assert!(active[0].acknowledged_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn warning_failed_pass_transition_enqueues_once_without_alert_spam() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+
+        assert_eq!(
+            service
+                .raise_audit_event_with_notification(
+                    &warning_check(),
+                    &outbox,
+                    "warning should not deliver",
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            service
+                .raise_audit_event_with_notification(&failed_check(), &outbox, "audit failure",)
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Pending { .. })
+        ));
+        assert_eq!(
+            service
+                .raise_audit_event_with_notification(
+                    &failed_check(),
+                    &outbox,
+                    "same failure with changed metric=99",
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            service
+                .resolve_audit_event_with_notification(&passed_check(), &outbox, "audit resolved",)
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Suppressed)
+        );
+
+        let row = sqlx::query(
+            "SELECT notification_seq, notification_delivery_status
+             FROM security_events WHERE event_key = 'audit:test.failure'",
+        )
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("notification_seq"), 2);
+        assert_eq!(
+            row.get::<String, _>("notification_delivery_status"),
+            "suppressed"
+        );
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_outbox
+             WHERE source_event_key = 'audit:test.failure'",
+        )
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn event_and_outbox_enqueue_roll_back_together() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        sqlx::query("DROP TABLE notification_outbox")
+            .execute(&service.db)
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .raise_audit_event_with_notification(&failed_check(), &outbox, "must roll back",)
+                .await
+                .is_err()
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_events")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn recreated_event_continues_sequence_from_retained_terminal_outbox_row() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO notification_outbox (
+                channel, dedup_key, kind, source_event_key, source_event_seq,
+                payload_json, suppress_until, state, attempts, next_attempt_at,
+                lease_until, last_error_code, last_http_status, created_at,
+                updated_at, sent_at, abandoned_at
+             ) VALUES (
+                'telegram', 'security:audit:test.failure', 'audit.check_failed',
+                'audit:test.failure', 1,
+                '{\"version\":1,\"text\":\"old\",\"occurred_at\":1}',
+                ?, 'sent', 1, NULL, NULL, NULL, NULL, ?, ?, ?, NULL
+             )",
+        )
+        .bind(now.saturating_sub(1))
+        .bind(now.saturating_sub(2))
+        .bind(now.saturating_sub(2))
+        .bind(now.saturating_sub(2))
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            service
+                .raise_audit_event_with_notification(&failed_check(), &outbox, "new failure")
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Pending { .. })
+        ));
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT notification_seq FROM security_events
+             WHERE event_key = 'audit:test.failure'",
+        )
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT source_event_seq FROM notification_outbox
+             WHERE source_event_key = 'audit:test.failure'
+             ORDER BY source_event_seq",
+        )
+        .fetch_all(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(sequence, 2);
+        assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn repeated_ssh_login_after_cooldown_enqueues_while_event_stays_open() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        let ip = "203.0.113.42";
+        assert!(matches!(
+            service
+                .raise_ssh_source_ip_event_with_notification(
+                    "root",
+                    ip,
+                    "publickey",
+                    1_700_000_000,
+                    &outbox,
+                    "first login",
+                )
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Pending { .. })
+        ));
+        assert_eq!(
+            service
+                .raise_ssh_source_ip_event_with_notification(
+                    "root",
+                    ip,
+                    "publickey",
+                    1_700_000_001,
+                    &outbox,
+                    "duplicate login",
+                )
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Suppressed)
+        );
+
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            "UPDATE notification_outbox
+             SET state = 'sent', next_attempt_at = NULL, sent_at = ?,
+                 suppress_until = ?, updated_at = ?
+             WHERE dedup_key = ?",
+        )
+        .bind(now)
+        .bind(now.saturating_sub(1))
+        .bind(now)
+        .bind(format!("ssh:login:{ip}"))
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            service
+                .raise_ssh_source_ip_event_with_notification(
+                    "root",
+                    ip,
+                    "publickey",
+                    1_700_000_020,
+                    &outbox,
+                    "later login",
+                )
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Pending { .. })
+        ));
+        let active = service.list(Some("active"), 10).await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, "open");
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox WHERE dedup_key = ?")
+                .bind(format!("ssh:login:{ip}"))
+                .fetch_one(&service.db)
+                .await
+                .unwrap();
+        assert_eq!(queued, 2);
     }
 
     #[tokio::test]
