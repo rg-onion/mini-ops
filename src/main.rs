@@ -9,6 +9,7 @@ mod i18n;
 mod metrics;
 mod notifications;
 mod retention;
+mod runtime;
 mod security;
 mod security_events;
 mod ssh_alerts;
@@ -41,7 +42,6 @@ use metrics::{MetricsState, SystemStats};
 use notifications::NotificationService;
 use rust_embed::RustEmbed;
 use serde::Deserialize;
-use sqlx::sqlite::SqlitePoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -83,9 +83,13 @@ struct Asset;
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    runtime::enforce_private_process_umask();
+    let runtime_mode = runtime::RuntimeMode::detect();
+    if runtime_mode == runtime::RuntimeMode::Standalone {
+        dotenvy::dotenv().ok();
+    }
 
-    let auth_token = match resolve_auth_token() {
+    let auth_token = match resolve_auth_token(runtime_mode) {
         Ok(token) => token,
         Err(e) => {
             eprintln!("CRITICAL: {}", e);
@@ -104,19 +108,15 @@ async fn main() {
         .init();
 
     // 1. Setup Database
+    let configured_database_url = std::env::var("DATABASE_URL").ok();
     let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:mini-ops.db".to_string());
-
-    // Create file if not exists for sqlite
-    if !std::path::Path::new("mini-ops.db").exists() {
-        std::fs::File::create("mini-ops.db").unwrap();
-    }
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+        runtime::resolve_database_url(configured_database_url.as_deref(), runtime_mode)
+            .unwrap_or_else(|error| exit_with_runtime_error("database_configuration", error));
+    runtime::sqlite_connect_options(&database_url, runtime_mode)
+        .unwrap_or_else(|error| exit_with_runtime_error("database_configuration", error));
+    let pool = runtime::connect_sqlite_pool(&database_url, runtime_mode, 5)
         .await
-        .expect("Could not connect to database");
+        .unwrap_or_else(|error| exit_with_runtime_error("database_connection", error));
 
     // Initialize schema
     sqlx::query(
@@ -163,6 +163,9 @@ async fn main() {
         .await
         .expect("Could not initialize retention indexes");
 
+    runtime::ensure_sqlite_private_database(&database_url, runtime_mode)
+        .unwrap_or_else(|error| exit_with_runtime_error("database_permissions", error));
+
     // 2. Setup Services
     let metrics_state = Arc::new(MetricsState::new());
     let notifications = Arc::new(NotificationService::new());
@@ -178,16 +181,6 @@ async fn main() {
         }
     };
 
-    // Start Security Monitor
-    let security_monitor = Arc::new(SecurityMonitor::new(
-        notifications.clone(),
-        docker_service.clone(),
-        security_events.clone(),
-    ));
-    tokio::spawn(async move {
-        security_monitor.run_loop().await;
-    });
-
     // Setup SSH Alerts
     let ssh_alerts_service = Arc::new(SshAlertsService::new(
         pool.clone(),
@@ -198,18 +191,26 @@ async fn main() {
 
     // Generate and save internal token
     let internal_token = uuid::Uuid::new_v4().to_string();
-    let internal_token_path = std::env::var("MINI_OPS_INTERNAL_TOKEN_FILE")
-        .ok()
-        .filter(|path| !path.trim().is_empty())
-        .unwrap_or_else(|| "mini-ops-internal.token".to_string());
-    if let Err(e) = write_internal_token(&internal_token_path, &internal_token) {
-        tracing::error!(
-            "Failed to write internal token to {}: {}",
-            internal_token_path,
-            e
-        );
-    }
-    ssh_alerts_service.set_token(internal_token);
+    let configured_internal_token_path = std::env::var_os("MINI_OPS_INTERNAL_TOKEN_FILE");
+    let internal_token_path = runtime::resolve_internal_token_path(
+        configured_internal_token_path.as_deref(),
+        runtime_mode,
+    )
+    .unwrap_or_else(|error| exit_with_runtime_error("internal_token_path", error));
+    runtime::persist_and_publish_internal_token(&internal_token_path, internal_token, |token| {
+        ssh_alerts_service.set_token(token)
+    })
+    .unwrap_or_else(|error| exit_with_runtime_error("internal_token_write", error));
+
+    // Start the monitor only after all fail-fast runtime state is ready.
+    let security_monitor = Arc::new(SecurityMonitor::new(
+        notifications.clone(),
+        docker_service.clone(),
+        security_events.clone(),
+    ));
+    tokio::spawn(async move {
+        security_monitor.run_loop().await;
+    });
 
     let deployment_service = Arc::new(DeploymentService::new());
     let history_manager = Arc::new(HistoryManager::new("history.json"));
@@ -392,42 +393,20 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn write_internal_token(path: &str, token: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let path = std::path::Path::new(path);
-    if let Ok(metadata) = std::fs::symlink_metadata(path)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(std::io::Error::other(
-            "refusing to write internal token through symlink",
-        ));
-    }
-
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(token.as_bytes())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+fn exit_with_runtime_error(context: &'static str, error: runtime::RuntimeError) -> ! {
+    eprintln!(
+        "CRITICAL: startup_error context={} code={}: {}",
+        context,
+        error.code(),
+        error
+    );
+    std::process::exit(1);
 }
 
-fn resolve_auth_token() -> Result<String, String> {
-    match std::env::var("AUTH_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => {
-            let token = token.trim().to_string();
-            validate_auth_token(&token)?;
-            Ok(token)
-        }
-        _ => {
+fn resolve_auth_token(mode: runtime::RuntimeMode) -> Result<String, String> {
+    match configured_auth_token(std::env::var("AUTH_TOKEN").ok().as_deref(), mode)? {
+        Some(token) => Ok(token),
+        None => {
             let token = generate_auth_token();
             persist_auth_token_to_env(".env", &token).map_err(|e| {
                 format!(
@@ -443,7 +422,41 @@ fn resolve_auth_token() -> Result<String, String> {
     }
 }
 
-fn validate_auth_token(token: &str) -> Result<(), String> {
+fn configured_auth_token(
+    configured: Option<&str>,
+    mode: runtime::RuntimeMode,
+) -> Result<Option<String>, String> {
+    configured_auth_token_with_weak_override(
+        configured,
+        mode,
+        std::env::var("MINI_OPS_ALLOW_WEAK_AUTH_TOKEN").as_deref() == Ok("true"),
+    )
+}
+
+fn configured_auth_token_with_weak_override(
+    configured: Option<&str>,
+    mode: runtime::RuntimeMode,
+    weak_override: bool,
+) -> Result<Option<String>, String> {
+    if let Some(token) = configured.map(str::trim).filter(|token| !token.is_empty()) {
+        validate_auth_token(
+            token,
+            mode == runtime::RuntimeMode::Standalone && weak_override,
+        )?;
+        return Ok(Some(token.to_string()));
+    }
+
+    if mode == runtime::RuntimeMode::Managed {
+        return Err(
+            "AUTH_TOKEN is required in managed mode and must be provided by EnvironmentFile"
+                .to_string(),
+        );
+    }
+
+    Ok(None)
+}
+
+fn validate_auth_token(token: &str, allow_weak_local_token: bool) -> Result<(), String> {
     if auth_token_is_placeholder(token) {
         return Err(
             "AUTH_TOKEN is set to a known placeholder. Generate a strong token with `openssl rand -hex 32`."
@@ -451,10 +464,9 @@ fn validate_auth_token(token: &str) -> Result<(), String> {
         );
     }
 
-    if token.len() < 32 && std::env::var("MINI_OPS_ALLOW_WEAK_AUTH_TOKEN").as_deref() != Ok("true")
-    {
+    if token.len() < 32 && !allow_weak_local_token {
         return Err(
-            "AUTH_TOKEN must be at least 32 characters. Set MINI_OPS_ALLOW_WEAK_AUTH_TOKEN=true only for local testing."
+            "AUTH_TOKEN must be at least 32 characters. The weak-token override is available only in standalone local mode."
                 .to_string(),
         );
     }
@@ -989,6 +1001,39 @@ mod tests {
         for value in [None, Some(""), Some(" true "), Some("TRUE"), Some("1")] {
             assert!(!disk_cleanup_enabled(value));
         }
+    }
+
+    #[test]
+    fn managed_mode_requires_preconfigured_auth_token() {
+        for configured in [None, Some(""), Some("   ")] {
+            let error = configured_auth_token(configured, runtime::RuntimeMode::Managed)
+                .expect_err("managed mode must not generate or persist AUTH_TOKEN");
+            assert!(error.contains("required in managed mode"));
+        }
+        assert!(
+            configured_auth_token_with_weak_override(
+                Some("short-token"),
+                runtime::RuntimeMode::Managed,
+                true,
+            )
+            .is_err(),
+            "managed mode must ignore the standalone weak-token override"
+        );
+    }
+
+    #[test]
+    fn standalone_mode_preserves_local_auth_token_generation_path() {
+        assert_eq!(
+            configured_auth_token(None, runtime::RuntimeMode::Standalone)
+                .expect("standalone missing token should remain generatable"),
+            None
+        );
+        let token = "a".repeat(64);
+        assert_eq!(
+            configured_auth_token(Some(&token), runtime::RuntimeMode::Standalone)
+                .expect("strong standalone token should be accepted"),
+            Some(token)
+        );
     }
 
     #[tokio::test]

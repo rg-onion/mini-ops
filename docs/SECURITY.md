@@ -53,8 +53,8 @@ The agent includes a PAM hook script that catches SSH login events and sends ale
 
 ### How it Works
 1.  **PAM Configuration**: The script `scripts/setup_ssh_alerts.sh` adds a call to `pam_exec.so` in `/etc/pam.d/sshd`.
-2.  **Hook Script**: When a user logs in, PAM executes `/opt/mini-ops/scripts/ssh-alert.sh`.
-3.  **Token Validation**: Mini-Ops generates a random internal token at startup and writes it to `MINI_OPS_INTERNAL_TOKEN_FILE` (or `mini-ops-internal.token` by default). The hook reads that file and sends a request to the Mini-Ops API on localhost.
+2.  **Hook Script**: When a user logs in, PAM executes the root-owned `/usr/local/bin/ssh-alert.sh` installed by the setup script.
+3.  **Token Validation**: Mini-Ops generates a random internal token at startup. Managed mode atomically writes `/run/mini-ops/internal.token`; standalone mode defaults to `mini-ops-internal.token`. The hook performs a bounded no-follow read as the configured service account and sends the bearer only to the loopback API with proxy and curlrc behavior disabled.
 4.  **Telegram Alert**: The API verifies the internal token, validates the source IP, throttles repeated alerts per IP, and sends a message to the administrator unless the IP is trusted.
 
 Does not require exposing the API to the internet (communication happens via `localhost`).
@@ -147,24 +147,16 @@ SECURITY_ALLOWED_PUBLIC_PORTS=81,82,86
 SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
 ```
 
-Invalid entries are ignored and included as audit evidence so the operator can
-fix the environment value.
+Invalid entries make the port check `WARN`; evidence exposes only a closed
+configuration error code and invalid-entry count, never the raw environment
+value.
 
 ## 🌐 Network & Deployment Security
 
-### Automated Deployment
-The deployment script (`scripts/bootstrap_server.sh`) currently behaves as follows:
+### Deployment boundary
 
-1. **Internal binding**: Mini-Ops listens on `127.0.0.1:3000` by default. The script appends `APP_HOST=127.0.0.1` and `APP_PORT=3000` to the deployed `.env` if they are missing.
-2. **Nginx automation**: In `DEPLOY_MODE=test`, generated plain-HTTP Nginx is enabled by default on `DEPLOY_NGINX_PORT` (default `8090`). In `DEPLOY_MODE=production`, generated Nginx is disabled unless `DEPLOY_SETUP_NGINX=1` is explicitly set. The generated config blocks `/api/internal/*`.
-3. **Firewall automation**: With `DEPLOY_HARDENING=1` (default), UFW allows OpenSSH. Dashboard ports are opened only when `DEPLOY_EXPOSE_HTTP=1` for either Nginx (`DEPLOY_SETUP_NGINX=1`) or direct test app access (`DEPLOY_SETUP_NGINX=0 DEPLOY_MODE=test`).
-4. **TLS**: The bootstrap script does not configure HTTPS certificates. For production exposure, add TLS with Nginx/Caddy/Cloudflare Tunnel or restrict access to a private network/VPN.
-
-### Environment Variable (`.env`) Syncing
-The deployment script builds a temporary `.env` locally and uploads it via SCP:
-
-- If a project-root `.env` exists, it is used as the source.
-- If no `.env` exists, `.env.example` is used as a template. When `AUTH_TOKEN`
-  is absent or empty, bootstrap generates a strong token before upload.
-- `AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` overrides are applied locally before upload, so they are not passed as remote command-line arguments.
-- Runtime defaults such as `APP_HOST`, `APP_PORT`, `DEPLOY_NGINX_PORT`, `DATABASE_URL`, `MINI_OPS_INTERNAL_TOKEN_FILE`, `RUST_LOG`, `AGENT_LANG`, and `SERVER_NAME` are appended on the server only when missing.
+Legacy automated deployment scripts are disabled and exit before build,
+network, firewall, PAM, or service mutations. The supported manual unit binds
+the application to loopback, keeps code/config root-owned, uses private
+state/runtime directories, and does not grant Docker-group access. See
+[DEPLOY.md](DEPLOY.md).

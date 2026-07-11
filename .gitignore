@@ -2,7 +2,15 @@
 /target
 /mini-ops.db
 /mini-ops.db-journal
+/mini-ops.db-wal
+/mini-ops.db-shm
 /mini-ops-internal.token
+/mini-ops-internal.token.*
+*.db-journal
+*.db-wal
+*.db-shm
+*.token
+*.token.*
 /history.json
 
 # Frontend
@@ -11,6 +19,8 @@
 
 # Environment
 .env
+.env.*
+!.env.example
 
 # IDEs
 .idea/

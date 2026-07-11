@@ -59,7 +59,13 @@ Mini-Ops включает в себя встроенную систему ауд
 
 ## 🔒 SSH Security & Alerts
 
-Mini-Ops обеспечивает мониторинг SSH-подключений через PAM hook. При старте агент генерирует случайный internal token, записывает его в `MINI_OPS_INTERNAL_TOKEN_FILE`, а hook читает этот файл и отправляет localhost request в Mini-Ops API. Повторные уведомления о SSH-входах ограничиваются по source IP. Подробное описание в [SSH_ALERTS.ru.md](SSH_ALERTS.ru.md).
+Mini-Ops обеспечивает мониторинг SSH-подключений через PAM hook. При старте
+агент генерирует случайный internal token; managed mode атомарно записывает его
+в `/run/mini-ops/internal.token`, standalone mode по умолчанию использует
+`mini-ops-internal.token`. Root-owned hook выполняет bounded no-follow чтение с
+правами service account и отправляет bearer только в loopback API с отключённым
+proxy/curlrc behavior. Повторные уведомления ограничиваются по source IP.
+Подробнее: [SSH_ALERTS.ru.md](SSH_ALERTS.ru.md).
 
 ## API Exposure
 
@@ -152,8 +158,8 @@ SECURITY_ALLOWED_PUBLIC_PORTS=81,82,86
 SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
 ```
 
-Некорректные значения игнорируются и попадают в audit evidence, чтобы оператор
-мог исправить `.env`.
+Некорректные значения переводят port check в `WARN`. Evidence содержит только
+closed configuration error code и количество ошибок, но не raw env value.
 
 ## 🔔 Alerting (Оповещения)
 
@@ -174,19 +180,10 @@ TELEGRAM_CHAT_ID=ваш_id
 
 ## 🌐 Безопасность развертывания (Deployment)
 
-### Автоматизированный деплой
-Скрипт развертывания (`scripts/bootstrap_server.sh`) сейчас работает так:
+### Deployment boundary
 
-1. **Внутренняя привязка**: Mini-Ops по умолчанию слушает `127.0.0.1:3000`. Скрипт добавляет `APP_HOST=127.0.0.1` и `APP_PORT=3000` в deployed `.env`, если они отсутствуют.
-2. **Nginx automation**: в `DEPLOY_MODE=test` generated plain-HTTP Nginx включен по умолчанию на `DEPLOY_NGINX_PORT` (`8090` по умолчанию). В `DEPLOY_MODE=production` generated Nginx выключен, если явно не задан `DEPLOY_SETUP_NGINX=1`. Сгенерированный config блокирует `/api/internal/*`.
-3. **Firewall automation**: при `DEPLOY_HARDENING=1` (default) UFW разрешает OpenSSH. Dashboard ports открываются только при `DEPLOY_EXPOSE_HTTP=1` для Nginx (`DEPLOY_SETUP_NGINX=1`) или прямого test app access (`DEPLOY_SETUP_NGINX=0 DEPLOY_MODE=test`).
-4. **TLS**: bootstrap script не настраивает HTTPS certificates. Для production exposure добавьте TLS через Nginx/Caddy/Cloudflare Tunnel или ограничьте доступ private network/VPN.
-
-### Синхронизация переменных окружения (`.env`)
-Скрипт развертывания собирает временный `.env` локально и загружает его на сервер по SCP:
-
-- Если в корне проекта есть `.env`, он используется как source.
-- Если `.env` нет, используется `.env.example` как template. Когда `AUTH_TOKEN`
-  отсутствует или пустой, bootstrap генерирует сильный токен до загрузки.
-- Overrides для `AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` применяются локально до загрузки, поэтому они не передаются как remote command-line arguments.
-- Runtime defaults (`APP_HOST`, `APP_PORT`, `DEPLOY_NGINX_PORT`, `DATABASE_URL`, `MINI_OPS_INTERNAL_TOKEN_FILE`, `RUST_LOG`, `AGENT_LANG`, `SERVER_NAME`) добавляются на сервере только если отсутствуют.
+Legacy-скрипты автоматического деплоя выключены и завершаются до build,
+network, firewall, PAM или service mutations. Поддерживаемый manual unit
+привязывает приложение к loopback, оставляет code/config root-owned, использует
+private state/runtime directories и не выдаёт доступ к Docker group. См.
+[DEPLOY.ru.md](DEPLOY.ru.md).

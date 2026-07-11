@@ -7,8 +7,13 @@ Mini-Ops включает систему реального времени дл�
 Система использует стандартный механизм **PAM (Pluggable Authentication Modules)** в Linux для перехвата событий входа.
 
 1.  При успешном входе PAM вызывает скрипт `/usr/local/bin/ssh-alert.sh`.
-2.  Скрипт читает временный токен авторизации из файла Mini-Ops, по умолчанию `/opt/mini-ops/mini-ops-internal.token`.
+2.  Скрипт читает runtime-токен авторизации из файла Mini-Ops, в managed
+    systemd deployment по умолчанию `/run/mini-ops/internal.token`.
 3.  Скрипт отправляет HTTP POST запрос на локальный API Mini-Ops.
+    Bearer header передаётся `curl` через bounded stdin configuration, поэтому
+    значение токена не попадает в process argv или логи хука. Перед чтением
+    токена root hook понижает права до service account, а proxy/curlrc behavior
+    для curl отключается.
 4.  Backend проверяет:
     *   **Trusted source-IP baseline**: Если IP доверенный, уведомление не отправляется.
     *   **Rate Limiting**: Ограничение — не более одного уведомления в 10 секунд для одного IP.
@@ -16,12 +21,14 @@ Mini-Ops включает систему реального времени дл�
 
 ## 🚀 Настройка (Setup)
 
-Настройку можно выполнить автоматически через UI:
-1. Перейдите в раздел **Security**.
-2. Нажмите кнопку **SSH Setup** (или **Enable SSH Alerts** в детальном виде).
-3. Сервис выполнит:
-    - Копирование хука в `/usr/local/bin/`.
-    - Добавление правила в `/etc/pam.d/sshd`.
+Настройка PAM выполняется отдельной ручной операцией:
+
+```bash
+sudo env MINI_OPS_APP_USER=miniops \
+  MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token \
+  DEPLOY_APP_PORT=3000 \
+  ./scripts/setup_ssh_alerts.sh
+```
 
 ### Ручная проверка
 Если уведомления не приходят, проверьте логи:
@@ -55,4 +62,15 @@ grep ssh-alert /var/log/syslog
 - Статус уведомления (было отправлено или проигнорировано).
 
 ## ⚠️ Безопасность токена
-Внутренний токен (`internal_token`) генерируется случайным образом (UUID v4) при каждом запуске Mini-Ops. Он хранится в памяти и записывается в файл `MINI_OPS_INTERNAL_TOKEN_FILE`, а при стандартном деплое — в `/opt/mini-ops/mini-ops-internal.token` с правами `600`. Это позволяет PAM-хуку отправлять события входа в локальный API без хранения токена в world-writable `/tmp`.
+Внутренний токен (`internal_token`) генерируется случайным образом (UUID v4)
+при каждом запуске Mini-Ops. Managed systemd unit создаёт `/run/mini-ops` с
+правами `0700`, а агент атомарно ротирует
+`/run/mini-ops/internal.token` с правами `0600`.
+
+`setup_ssh_alerts.sh` создаёт root-owned файл
+`/etc/mini-ops/ssh-alert.conf` с правами `0600`. В нём находятся только
+loopback URL, путь к token file и имя service account; самого bearer value там
+нет. Для custom standalone deployment перед запуском setup script задайте
+абсолютный `MINI_OPS_INTERNAL_TOKEN_FILE` и `MINI_OPS_APP_USER`, совпадающий с
+владельцем процесса Mini-Ops. Не выводите содержимое token file при
+диагностике; для проверки используйте только `stat`.

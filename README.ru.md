@@ -31,16 +31,10 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 
 ### 1. Установка
 
-Mini-Ops собирается из исходного кода или развертывается с помощью автоматического скрипта.
-
-#### Вариант А: Автоматическая установка (Ubuntu, рекомендуется)
-Этот скрипт соберет приложение локально и развернет его на сервере:
-```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
-```
-
-#### Вариант Б: Ручная сборка
-См. раздел [Разработка](#-разработка) ниже для сборки бинарного файла из исходников.
+Соберите Mini-Ops из исходного кода и выполните hardened manual systemd
+процедуру из [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md). Legacy-скрипты
+автоматического деплоя выключены и завершаются до сборки, SSH, firewall, PAM
+или изменений сервиса.
 
 ### 2. Конфигурация (`.env`)
 
@@ -54,8 +48,9 @@ cp .env.example .env
 AUTH_TOKEN=
 ```
 
-Оставьте значение пустым, чтобы Mini-Ops/bootstrap сгенерировал сильный токен,
-или сгенерируйте токен в shell и вставьте готовое значение в `.env`:
+Standalone local mode может сгенерировать токен для пустого значения. Managed
+systemd mode требует заранее заданный сильный токен и иначе завершает startup.
+Сгенерируйте токен и вставьте его в `.env`:
 ```bash
 openssl rand -hex 32
 ```
@@ -64,57 +59,26 @@ openssl rand -hex 32
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
-DATABASE_URL=sqlite:mini-ops.db
+# Override только для standalone; не задавайте его для managed systemd service.
+# DATABASE_URL=sqlite:mini-ops.db
 SERVER_NAME=My-VPS-1
 RUST_LOG=info
 ```
 
-### 3. Запуск как сервис
+### 3. Запуск как managed service
 
-```bash
-# Создать systemd сервис
-sudo tee /etc/systemd/system/mini-ops.service <<EOF
-[Unit]
-Description=Mini-Ops Agent
-After=network.target docker.service
-
-[Service]
-ExecStart=/usr/local/bin/mini-ops
-Restart=always
-EnvironmentFile=/path/to/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Запустить
-sudo systemctl enable --now mini-ops
-```
-
-В этом ручном примере Mini-Ops по умолчанию слушает
-**http://127.0.0.1:3000**. Перед внешней публикацией настройте reverse proxy
-или явно задайте `APP_HOST`/`APP_PORT`.
-
-**Автоматическая установка (Ubuntu, рекомендуется):**
-```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
-```
-Доступ при bootstrap-настройках по умолчанию:
-**http://your-server-ip:8090** через сгенерированный plain-HTTP Nginx reverse
-proxy.
-
-Подробнее см. [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
+Shipped unit оставляет код и конфигурацию root-owned, хранит mutable state в
+`/var/lib/mini-ops`, ротирует PAM token в `/run/mini-ops` и применяет
+`UMask=0077`, `ProtectSystem=strict`, `ProtectHome=true`. Exact команды
+установки и проверки находятся в [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
 
 ---
 
 ## 🌐 Сетевые режимы
 
-- **Bootstrap test access по умолчанию**: `http://server-ip:8090` через
-  сгенерированный Nginx config. Это plain HTTP для lab/internal тестов.
-- **Production mode**: `DEPLOY_MODE=production` не включает сгенерированный
-  plain-HTTP Nginx proxy, если явно не задать `DEPLOY_SETUP_NGINX=1`.
-- **Production exposure**: добавьте TLS через Nginx/Caddy/Cloudflare Tunnel
-  или ограничьте доступ private network/VPN. Не публикуйте `3000` напрямую.
+- **По умолчанию**: приложение слушает `127.0.0.1:3000`.
+- **Внешний доступ**: отдельно настройте TLS и reverse proxy, VPN, tunnel или
+  private network. Не публикуйте `3000` напрямую.
 
 ---
 

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+echo "provision.sh is disabled: it does not satisfy the current managed-runtime security contract. Use docs/DEPLOY.md." >&2
+exit 1
+
 # Configuration
 USER="${DEPLOY_USER:-root}"
 HOST="${DEPLOY_HOST:-your-server-ip}"

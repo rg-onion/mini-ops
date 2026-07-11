@@ -7,23 +7,25 @@ Mini-Ops can send Telegram notifications for every successful SSH login.
 1.  **PAM Module**: Uses `pam_exec.so` to trigger a script on login.
 2.  **Micro-script**: A lightweight bash script (`ssh-alert.sh`) gathers session info (User, IP).
 3.  **Internal API**: The script sends a POST request to `http://127.0.0.1:3000/api/internal/ssh-login`.
-4.  **Security**: The request is signed with an internal token generated at Mini-Ops startup.
+4.  **Security**: The request is signed with a private runtime token generated
+    at Mini-Ops startup. The PAM hook supplies the bearer header to `curl`
+    through bounded stdin configuration, so the token is not placed in process
+    arguments or hook logs.
 5.  **Source-IP baseline**: Mini-Ops compares the login source IP with the
     trusted IP list managed on the SSH Security page.
 
-## Automatic Installation
-
-Using `bootstrap_server.sh` with `DEPLOY_ENABLE_SSH_ALERTS=1` automatically configures everything.
-
 ## Manual Installation
 
-If you deployed manually or want to enable alerts later:
+SSH-alert setup is an explicit manual PAM mutation:
 
 1.  Ensure `mini-ops` is running.
 2.  Run the setup script:
     ```bash
     cd /opt/mini-ops/scripts
-    sudo ./setup_ssh_alerts.sh
+    sudo env MINI_OPS_APP_USER=miniops \
+      MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token \
+      DEPLOY_APP_PORT=3000 \
+      ./setup_ssh_alerts.sh
     ```
 
 ## Configuration
@@ -35,13 +37,23 @@ In `.env`:
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 
-# Optional; bootstrap_server.sh writes this automatically
-MINI_OPS_INTERNAL_TOKEN_FILE=/opt/mini-ops/mini-ops-internal.token
+# Managed systemd default
+MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token
 ```
 
-The token file is written with `0600` permissions. By default the deployed PAM
-hook reads it from `/opt/mini-ops/mini-ops-internal.token`; custom deployments
-can set `MINI_OPS_INTERNAL_TOKEN_FILE` before running `setup_ssh_alerts.sh`.
+The managed systemd unit creates `/run/mini-ops` with `0700` permissions. The
+agent rotates `internal.token` at startup using an atomic same-directory write
+and keeps the file at `0600`. `setup_ssh_alerts.sh` installs a root-owned
+`/etc/mini-ops/ssh-alert.conf` containing only the loopback URL, token file
+path, and token-owner account; the bearer value is never copied into that
+configuration. The root PAM hook drops to that account for a bounded no-follow
+token read before calling curl with proxy and curlrc behavior disabled.
+
+Custom standalone deployments can set `MINI_OPS_INTERNAL_TOKEN_FILE` and
+`MINI_OPS_APP_USER` before running `setup_ssh_alerts.sh`. The configured path
+must be absolute, and the account must match the owner running Mini-Ops. Keep
+the token in a private directory and ensure the agent and PAM hook use the same
+path and owner.
 
 ## Trusted Source IP Baseline
 
@@ -62,7 +74,11 @@ The trusted IP list is the local baseline for SSH source IPs.
 1. Check if `mini-ops` is running: `systemctl status mini-ops`.
 2. check logs: `journalctl -u mini-ops -f`.
 3. Verify PAM config: `grep "pam_exec.so" /etc/pam.d/sshd`.
-4. Run the alert script manually to test connectivity:
+4. Verify the non-secret hook configuration and token metadata without printing
+   the token: `sudo stat /etc/mini-ops/ssh-alert.conf /run/mini-ops/internal.token`.
+5. Run the installed alert script as root to test connectivity without printing
+   the token:
    ```bash
-   PAM_USER=test PAM_RHOST=1.2.3.4 PAM_TYPE=open_session ./scripts/ssh-alert.sh
+   sudo env PAM_USER=test PAM_RHOST=1.2.3.4 PAM_TYPE=open_session \
+     /usr/local/bin/ssh-alert.sh
    ```

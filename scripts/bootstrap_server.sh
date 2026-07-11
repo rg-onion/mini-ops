@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+echo "bootstrap_server.sh is disabled: its legacy mutable layout does not satisfy the current managed-runtime security contract. Use docs/DEPLOY.md." >&2
+exit 1
+
 # One-command bootstrap for Ubuntu VPS.
 # - Baseline hardening (UFW + fail2ban)
 # - Configurable systemd service user (root by default for full VPS control)
