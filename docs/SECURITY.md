@@ -114,6 +114,14 @@ remains active, and resolved when the check returns to `PASS`.
 - Security event JSON exposes nullable `notification_delivery_status`, attempt
   count, update time, and a closed error code. The internal transition sequence
   is not exposed.
+- Security event JSON keeps the legacy `evidence_json` field and adds a typed
+  `evidence` envelope with `schema_version`, `kind`, `data`, and `error_code`.
+  For a valid v1 row, `kind` exactly matches `event_type`, `data` contains only
+  allowlisted fields for that event kind, and `error_code` is `null`;
+  `evidence_json` is the exact JSON serialization of that data. Unsupported or
+  invalid stored evidence is not returned raw: `data` is `null`, `error_code`
+  is `unsupported_schema_version` or `invalid_stored_payload`, and the legacy
+  field is the exact string `{}`. Projection does not rewrite the stored row.
 
 ## Local Data Retention
 

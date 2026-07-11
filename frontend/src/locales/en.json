@@ -18,6 +18,8 @@
         "ram_history": "RAM History (%)",
         "security_audit": "Security Audit",
         "refresh": "Refresh",
+        "retry": "Retry",
+        "pending": "Working...",
         "close": "Close",
         "cancel": "Cancel",
         "open_menu": "Open menu",
@@ -27,6 +29,13 @@
             "error": "Error",
             "closed": "Closed"
         }
+    },
+    "dashboard": {
+        "current_error": "Current system metrics could not be loaded. Values are unavailable until a successful response.",
+        "current_unavailable": "Current metrics unavailable",
+        "history_loading": "Loading metrics history...",
+        "history_error": "Metrics history could not be loaded.",
+        "history_empty": "No metrics history recorded yet."
     },
     "login": {
         "title": "Mini-Ops Login",
@@ -58,6 +67,9 @@
         "snapshots": "Snapshots",
         "success_action": "{{action}} request sent successfully",
         "error_action": "Action failed: {{error}}",
+        "action_failed": "The container action failed.",
+        "action_pending": "{{action}} in progress...",
+        "action_error": "{{action}} failed",
         "confirm_action_title": "Confirm {{action}}",
         "confirm_action_description": "Run {{action}} for container {{name}}?",
         "confirm_action_button": "{{action}}",
@@ -103,7 +115,10 @@
         "rollback": "Rollback",
         "no_history": "No history recorded yet.",
         "loading": "Loading history...",
-        "rollback_wip": "Rollback logic WIP"
+        "load_error": "Deployment history could not be loaded.",
+        "rollback_wip": "Rollback logic WIP",
+        "rollback_unavailable": "Rollback unavailable",
+        "rollback_unavailable_detail": "Rollback is not available in this release."
     },
     "disk": {
         "trigger": "Disk Analyzer",
@@ -126,6 +141,7 @@
         "title": "Security Audit",
         "short_title": "Audit",
         "test_alert": "Test Alert",
+        "test_sending": "Sending...",
         "status": "Status",
         "check": "Check",
         "risk": "Risk",
@@ -135,13 +151,42 @@
         "last_seen": "Last seen",
         "ack": "Acknowledge",
         "no_events": "No active security events",
+        "events_loading": "Loading security events...",
         "events_load_error": "Failed to load security events",
         "event_ack_success": "Security event acknowledged",
         "event_ack_error": "Failed to acknowledge event",
+        "ack_pending": "Acknowledging...",
         "event_status": {
             "open": "Open",
             "acknowledged": "Acknowledged",
             "resolved": "Resolved"
+        },
+        "audit_loading": "Loading the security audit...",
+        "audit_load_error": "The security audit could not be loaded. No security result is available.",
+        "audit_degraded_detail": "The audit is degraded: at least one check could not establish a trustworthy result.",
+        "audit_unknown_detail": "The audit collection state is unknown. Do not treat the displayed checks as a complete healthy audit.",
+        "audit_no_data": "No trustworthy audit checks were returned.",
+        "audit_state": {
+            "healthy": "Healthy",
+            "findings": "Findings",
+            "degraded": "Degraded",
+            "unknown": "Unknown"
+        },
+        "evidence": {
+            "unavailable": "Typed evidence unavailable",
+            "audit": "Check {{checkId}} · {{status}}",
+            "ssh": "Source {{ip}} · {{method}}",
+            "notification": "Notification backpressure · live {{liveLimit}} · terminal {{terminalLimit}}",
+            "file": "File {{path}} · {{changes}}",
+            "file_change": {
+                "added": "added",
+                "content_changed": "content changed",
+                "owner_changed": "owner changed",
+                "permissions_changed": "permissions changed",
+                "removed": "removed",
+                "type_changed": "type changed",
+                "unreadable": "unreadable"
+            }
         },
         "test_sent": "Test notification sent!",
         "test_fail": "Failed to send notification",
@@ -176,8 +221,10 @@
         "title": "SSH Security",
         "setup": {
             "btn": "Setup SSH",
+            "pending": "Setting up SSH...",
             "success": "Setup successful",
             "error": "Setup failed: {{error}}",
+            "error_safe": "SSH alert setup failed.",
             "confirm_title": "Setup SSH alerts?",
             "confirm_description": "This will install or update SSH alert integration on this host."
         },
@@ -185,8 +232,11 @@
             "title": "Trusted SSH source IPs",
             "added": "IP added to baseline",
             "add_error": "Failed to add IP: {{error}}",
+            "add_error_safe": "Failed to add the trusted IP.",
             "deleted": "Trusted IP deleted",
             "delete_error": "Failed to delete IP: {{error}}",
+            "delete_error_safe": "Failed to delete the trusted IP.",
+            "load_error": "Trusted SSH source IPs could not be loaded.",
             "ip": "IP",
             "description": "Description",
             "ip_placeholder": "IP",
@@ -197,12 +247,15 @@
             "confirm_delete_description": "Remove {{ip}} from the trusted IP list?"
         },
         "logs": {
-            "title": "SSH Logs"
+            "title": "SSH Logs",
+            "load_error": "SSH logs could not be loaded."
         },
         "table": {
             "time": "Time",
             "user": "User",
-            "status": "Status"
+            "status": "Notification",
+            "queued": "Queued",
+            "not_queued": "Not queued"
         }
     }
 }

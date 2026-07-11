@@ -943,9 +943,16 @@ async fn get_security_events_handler(
     let status = params.status.as_deref();
     let limit = params.limit.unwrap_or(100);
 
-    match state.security_events.list(status, limit).await {
+    security_events_list_response(state.security_events.list(status, limit).await)
+}
+
+fn security_events_list_response(result: Result<Vec<SecurityEvent>, sqlx::Error>) -> Response {
+    match result {
         Ok(events) => Json::<Vec<SecurityEvent>>(events).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(_) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "security_events_unavailable",
+        ),
     }
 }
 
@@ -953,10 +960,17 @@ async fn ack_security_event_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
-    match state.security_events.acknowledge(id).await {
+    security_event_ack_response(state.security_events.acknowledge(id).await)
+}
+
+fn security_event_ack_response(result: Result<bool, sqlx::Error>) -> Response {
+    match result {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(_) => api_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "security_event_ack_failed",
+        ),
     }
 }
 
@@ -1235,5 +1249,19 @@ mod tests {
             security_audit_result_response(Err(SecuritySnapshotUnavailable), &i18n::Lang::EN);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_error_code(response, "security_audit_unavailable").await;
+    }
+
+    #[tokio::test]
+    async fn security_event_database_errors_use_closed_api_codes() {
+        let list_response = security_events_list_response(Err(sqlx::Error::Protocol(
+            "RAW_SQL_SENTINEL".to_string(),
+        )));
+        assert_eq!(list_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_error_code(list_response, "security_events_unavailable").await;
+
+        let ack_response =
+            security_event_ack_response(Err(sqlx::Error::Protocol("RAW_SQL_SENTINEL".to_string())));
+        assert_eq!(ack_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_error_code(ack_response, "security_event_ack_failed").await;
     }
 }

@@ -18,6 +18,8 @@
         "ram_history": "История RAM (%)",
         "security_audit": "Аудит безопасности",
         "refresh": "Обновить",
+        "retry": "Повторить",
+        "pending": "Выполняется...",
         "close": "Закрыть",
         "cancel": "Отмена",
         "open_menu": "Открыть меню",
@@ -27,6 +29,13 @@
             "error": "Ошибка",
             "closed": "Закрыто"
         }
+    },
+    "dashboard": {
+        "current_error": "Не удалось загрузить текущие системные метрики. Значения недоступны до успешного ответа.",
+        "current_unavailable": "Текущие метрики недоступны",
+        "history_loading": "Загрузка истории метрик...",
+        "history_error": "Не удалось загрузить историю метрик.",
+        "history_empty": "История метрик пока пуста."
     },
     "login": {
         "title": "Вход в Mini-Ops",
@@ -58,6 +67,9 @@
         "snapshots": "Снапшоты",
         "success_action": "Запрос «{{action}}» отправлен",
         "error_action": "Ошибка: {{error}}",
+        "action_failed": "Не удалось выполнить действие с контейнером.",
+        "action_pending": "{{action}} выполняется...",
+        "action_error": "Действие «{{action}}» завершилось ошибкой",
         "confirm_action_title": "Подтвердите: {{action}}",
         "confirm_action_description": "Выполнить «{{action}}» для контейнера {{name}}?",
         "confirm_action_button": "{{action}}",
@@ -103,7 +115,10 @@
         "rollback": "Откат",
         "no_history": "История пока пуста.",
         "loading": "Загрузка истории...",
-        "rollback_wip": "Логика отката в разработке"
+        "load_error": "Не удалось загрузить историю деплоев.",
+        "rollback_wip": "Логика отката в разработке",
+        "rollback_unavailable": "Откат недоступен",
+        "rollback_unavailable_detail": "Откат недоступен в этой версии."
     },
     "disk": {
         "trigger": "Анализатор диска",
@@ -126,6 +141,7 @@
         "title": "Аудит безопасности",
         "short_title": "Аудит",
         "test_alert": "Тест уведомления",
+        "test_sending": "Отправка...",
         "status": "Статус",
         "check": "Проверка",
         "risk": "Риск",
@@ -135,13 +151,42 @@
         "last_seen": "Последнее обнаружение",
         "ack": "Принять к сведению",
         "no_events": "Активных событий безопасности нет",
+        "events_loading": "Загрузка событий безопасности...",
         "events_load_error": "Не удалось загрузить события безопасности",
         "event_ack_success": "Событие безопасности принято к сведению",
         "event_ack_error": "Не удалось принять событие",
+        "ack_pending": "Принятие...",
         "event_status": {
             "open": "Открыто",
             "acknowledged": "Принято к сведению",
             "resolved": "Решено"
+        },
+        "audit_loading": "Загрузка аудита безопасности...",
+        "audit_load_error": "Не удалось загрузить аудит безопасности. Результат проверки недоступен.",
+        "audit_degraded_detail": "Аудит работает в деградированном режиме: как минимум одна проверка не дала достоверного результата.",
+        "audit_unknown_detail": "Состояние сбора аудита неизвестно. Показанные проверки нельзя считать полным здоровым аудитом.",
+        "audit_no_data": "Достоверные результаты аудита не получены.",
+        "audit_state": {
+            "healthy": "Без замечаний",
+            "findings": "Есть замечания",
+            "degraded": "Деградирован",
+            "unknown": "Неизвестно"
+        },
+        "evidence": {
+            "unavailable": "Типизированные данные недоступны",
+            "audit": "Проверка {{checkId}} · {{status}}",
+            "ssh": "Источник {{ip}} · {{method}}",
+            "notification": "Переполнение очереди уведомлений · активных {{liveLimit}} · завершённых {{terminalLimit}}",
+            "file": "Файл {{path}} · {{changes}}",
+            "file_change": {
+                "added": "добавлен",
+                "content_changed": "содержимое изменено",
+                "owner_changed": "владелец изменён",
+                "permissions_changed": "права изменены",
+                "removed": "удалён",
+                "type_changed": "тип изменён",
+                "unreadable": "недоступен для чтения"
+            }
         },
         "test_sent": "Тестовое уведомление отправлено!",
         "test_fail": "Не удалось отправить уведомление",
@@ -176,8 +221,10 @@
         "title": "Безопасность SSH",
         "setup": {
             "btn": "Настроить SSH",
+            "pending": "Настройка SSH...",
             "success": "Успешно настроено",
             "error": "Ошибка настройки: {{error}}",
+            "error_safe": "Не удалось настроить SSH-уведомления.",
             "confirm_title": "Настроить SSH-уведомления?",
             "confirm_description": "Это установит или обновит интеграцию SSH-уведомлений на этом хосте."
         },
@@ -185,8 +232,11 @@
             "title": "Доверенные SSH source IP",
             "added": "IP добавлен в baseline",
             "add_error": "Не удалось добавить IP: {{error}}",
+            "add_error_safe": "Не удалось добавить доверенный IP.",
             "deleted": "Доверенный IP удален",
             "delete_error": "Не удалось удалить IP: {{error}}",
+            "delete_error_safe": "Не удалось удалить доверенный IP.",
+            "load_error": "Не удалось загрузить доверенные SSH source IP.",
             "ip": "IP",
             "description": "Описание",
             "ip_placeholder": "IP",
@@ -197,12 +247,15 @@
             "confirm_delete_description": "Удалить {{ip}} из списка доверенных IP?"
         },
         "logs": {
-            "title": "SSH Логи"
+            "title": "SSH Логи",
+            "load_error": "Не удалось загрузить SSH-логи."
         },
         "table": {
             "time": "Время",
             "user": "Пользователь",
-            "status": "Статус"
+            "status": "Уведомление",
+            "queued": "В очереди",
+            "not_queued": "Не поставлено в очередь"
         }
     }
 }

@@ -843,6 +843,7 @@ async fn set_delivery_degraded(
     sqlx::query(
         "INSERT INTO security_events (
             event_key, event_type, severity, title, message, evidence_json,
+            evidence_schema_version,
             status, first_seen, last_seen, acknowledged_at, resolved_at
          ) VALUES (
             'notification:delivery_degraded',
@@ -851,6 +852,7 @@ async fn set_delivery_degraded(
             ?,
             ?,
             '{\"reason\":\"backpressure\",\"live_limit\":1000,\"terminal_limit\":200}',
+            1,
             'open', ?, ?, NULL, NULL
          )
          ON CONFLICT(event_key) DO UPDATE SET
@@ -859,6 +861,7 @@ async fn set_delivery_degraded(
             title = excluded.title,
             message = excluded.message,
             evidence_json = excluded.evidence_json,
+            evidence_schema_version = excluded.evidence_schema_version,
             status = CASE
                 WHEN security_events.status = 'resolved' THEN 'open'
                 ELSE security_events.status
@@ -1617,6 +1620,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(degraded_after_unique, 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_degraded_writer_resets_evidence_version_to_v1() {
+        let pool = full_test_pool().await;
+        let outbox = NotificationOutbox::new(
+            pool.clone(),
+            Arc::new(NotificationService::disabled_for_tests()),
+        );
+        let now = Utc::now().timestamp();
+        outbox.set_delivery_degraded(now).await.unwrap();
+        sqlx::query(
+            "UPDATE security_events
+             SET evidence_schema_version = 2, evidence_json = '{\"future\":true}'
+             WHERE event_key = 'notification:delivery_degraded'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        outbox
+            .set_delivery_degraded(now.saturating_add(1))
+            .await
+            .unwrap();
+        let row = sqlx::query(
+            "SELECT evidence_schema_version, evidence_json
+             FROM security_events
+             WHERE event_key = 'notification:delivery_degraded'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("evidence_schema_version"), 1);
+        assert_eq!(
+            row.get::<String, _>("evidence_json"),
+            r#"{"reason":"backpressure","live_limit":1000,"terminal_limit":200}"#
+        );
     }
 
     #[tokio::test]

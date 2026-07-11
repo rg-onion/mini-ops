@@ -130,6 +130,15 @@ Mini-Ops сохраняет результаты аудита безопасно
 - JSON security event содержит nullable `notification_delivery_status`, число
   попыток, время обновления и закрытый error code. Внутренний transition
   sequence наружу не выдаётся.
+- JSON security event сохраняет legacy-поле `evidence_json` и добавляет typed
+  envelope `evidence` с полями `schema_version`, `kind`, `data` и `error_code`.
+  Для valid v1 row поле `kind` точно совпадает с `event_type`, `data` содержит
+  только allowlisted поля соответствующего event kind, а `error_code` равен
+  `null`; `evidence_json` является точной JSON serialization этих data.
+  Unsupported или invalid stored evidence не возвращается raw: `data` равен
+  `null`, `error_code` равен `unsupported_schema_version` или
+  `invalid_stored_payload`, а legacy-поле содержит точную строку `{}`.
+  Projection не переписывает сохранённую row.
 
 ## Локальное хранение данных
 
