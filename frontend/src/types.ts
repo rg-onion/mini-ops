@@ -53,14 +53,8 @@ export type SensitiveFileObservationError =
     | "symlink"
     | "not_regular"
     | "file_too_large"
-    | "tracked_file_limit"
-    | "scan_byte_limit"
-    | "deadline_exceeded"
     | "changed_during_read"
     | "vanished_during_scan"
-    | "directory_unreadable"
-    | "path_not_utf8"
-    | "path_too_long"
     | "io_error";
 
 export type SensitiveFileCompleteEvidenceMetadata =
@@ -76,6 +70,14 @@ export type SensitiveFileCompleteEvidenceMetadata =
         state: "regular";
         size_bytes: number;
         mtime_unix_seconds: number;
+        mode: number;
+        uid: number;
+        gid: number;
+    }
+    | {
+        state: "directory";
+        size_bytes: null;
+        mtime_unix_seconds: null;
         mode: number;
         uid: number;
         gid: number;

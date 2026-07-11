@@ -81,11 +81,20 @@ The "Security Audit" section checks:
       preserved. An unknown or malformed socket result remains `WARN`.
     - Ports outside `22`, `80`, `443`, `APP_PORT` (default `3000`), and `DEPLOY_NGINX_PORT` (default `8090`) are reported as warnings.
 - **Docker**:
-    - Docker socket world-writable permission check.
+    - `/var/run/docker.sock` must be a real final Unix socket and must not be
+      world-writable and must be owned by root; a symlink or another file type
+      cannot pass the check.
     - TCP API listeners on `2375`/`2376`: public or wildcard listeners fail,
       loopback-only listeners warn, and UDP listeners with the same port
       number do not count as the Docker TCP API.
-    - Container hardening risks when Docker is available.
+    - Container hardening checks cover privileged mode; host network, PID,
+      IPC, UTS, user, and cgroup namespaces; explicit capabilities and device
+      access; sensitive host bind mounts; seccomp, no-new-privileges and
+      unconfined system paths; and effective AppArmor/SELinux confinement.
+      Only closed built-in/default profile facts prove confinement. Custom or
+      malformed profiles, incomplete inspect data, and unavailable SELinux
+      enforcement state remain `WARN`; known critical/high risks remain
+      `FAIL` even when other facts are incomplete.
 - **Disk encryption**:
     - A `PASS` requires a `crypt` device in the actual root filesystem backing
       tree reported by bounded `lsblk` JSON. An unrelated encrypted volume,
@@ -151,8 +160,14 @@ Security audit work is bounded with local runtime controls:
 - `SECURITY_AUDIT_DOCKER_TIMEOUT_SECS` limits Docker container inspection during
   security audit (`10` seconds by default).
 
-If Docker inspection times out, the Docker container hardening check returns
-`WARN` with timeout evidence instead of blocking the whole audit.
+Docker audit work uses one internal deadline and bounded projections: at most
+`256` containers; per inspected container, `256` capabilities, mounts, and
+entries in each device category plus `64` security options; `64` daemon
+security options; and `128` retained global risk rows. An overflow or timeout
+returns closed incomplete evidence instead of a clean result. Risks collected
+before the deadline are preserved, so a known `FAIL` is not downgraded by a
+later timeout. Docker daemon error bodies are not copied into API responses or
+application logs.
 
 The API, background monitor, and optional Cloud Push consumer share one
 language-neutral, single-flight audit snapshot. Concurrent refreshes join one

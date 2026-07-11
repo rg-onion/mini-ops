@@ -29,7 +29,9 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **WARN**: UFW не найден или команда не может быть выполнена (например, из-за недостатка прав)
 
 3.  **Docker Socket**:
-    *   **Проверяет**: права доступа к `/var/run/docker.sock`.
+    *   **Проверяет**: `/var/run/docker.sock` является реальным final Unix
+        socket, а не symlink/другим типом файла, принадлежит root и имеет
+        безопасные права доступа.
     *   **Правило**: Не должен быть доступен для записи всем (`o+w`).
     *   **Риск**: Любой пользователь с доступом к сокету получает права root на хосте.
 
@@ -69,7 +71,14 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **Риск**: Открытый Docker API может дать контроль над хостом.
 
 9.  **Docker Container Hardening**:
-    *   **Проверяет**: container hardening risks, если Docker доступен агенту.
+    *   **Проверяет**: privileged mode; host network/PID/IPC/UTS/user/cgroup
+        namespaces; explicit capabilities и device access; sensitive host bind
+        mounts; seccomp, no-new-privileges, unconfined system paths и effective
+        AppArmor/SELinux confinement. Только closed built-in/default profile
+        facts доказывают confinement. Custom/malformed profiles, incomplete
+        inspect data и недоступное SELinux enforcement state остаются `WARN`;
+        известный Critical/High остаётся `FAIL`, даже если другие facts
+        incomplete.
     *   **Риск**: Привилегированные или опасно настроенные контейнеры расширяют blast radius.
 
 ## 🔒 SSH Security & Alerts
@@ -168,8 +177,15 @@ Mini-Ops ограничивает локальную operational history, что
 - `SECURITY_AUDIT_DOCKER_TIMEOUT_SECS` ограничивает Docker container inspection
   во время security audit (`10` секунд по умолчанию).
 
-Если Docker inspection превышает timeout, check Docker container hardening
-возвращает `WARN` с evidence о timeout вместо блокировки всего audit.
+Docker audit использует один внутренний deadline и bounded projections: не
+более `256` containers; для каждого проверяемого container — по `256`
+capabilities, mounts и entries в каждой категории devices плюс `64` security
+options; `64` daemon security options; `128` сохранённых глобальных risk rows.
+Overflow/timeout даёт
+closed incomplete evidence, а не clean result. Риски, найденные до deadline,
+сохраняются, поэтому известный `FAIL` не понижается из-за более позднего
+timeout. Docker daemon error bodies не копируются в API responses или
+application logs.
 
 API, background monitor и optional Cloud Push используют один общий
 language-neutral single-flight snapshot аудита. Concurrent refresh-запросы

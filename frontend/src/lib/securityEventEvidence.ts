@@ -97,14 +97,8 @@ const FILE_OBSERVATION_ERRORS = new Set<SensitiveFileObservationError>([
     "symlink",
     "not_regular",
     "file_too_large",
-    "tracked_file_limit",
-    "scan_byte_limit",
-    "deadline_exceeded",
     "changed_during_read",
     "vanished_during_scan",
-    "directory_unreadable",
-    "path_not_utf8",
-    "path_too_long",
     "io_error",
 ]);
 const FIXED_FILE_PATHS = new Set([
@@ -114,6 +108,7 @@ const FIXED_FILE_PATHS = new Set([
     "/etc/ssh/sshd_config",
     "/etc/crontab",
 ]);
+const REQUIRED_FIXED_FILE_PATHS = new Set(["/etc/passwd", "/etc/group"]);
 const DIRECT_CHILD_ROOTS = [
     "/etc/sudoers.d/",
     "/etc/ssh/sshd_config.d/",
@@ -122,6 +117,7 @@ const DIRECT_CHILD_ROOTS = [
     "/etc/cron.hourly/",
     "/etc/cron.weekly/",
 ];
+const DIRECTORY_ROOT_PATHS = new Set(DIRECT_CHILD_ROOTS.map(root => root.slice(0, -1)));
 
 function isRecord(value: unknown): value is JsonRecord {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -330,7 +326,7 @@ function isFrozenLogicalPath(path: string): boolean {
     if (components.some(component => component.length === 0 || component === "." || component === "..")) {
         return false;
     }
-    if (FIXED_FILE_PATHS.has(path)) return true;
+    if (FIXED_FILE_PATHS.has(path) || DIRECTORY_ROOT_PATHS.has(path)) return true;
     return DIRECT_CHILD_ROOTS.some(root => {
         if (!path.startsWith(root)) return false;
         const basename = path.slice(root.length);
@@ -359,7 +355,7 @@ function readFileMetadata(
 function readFileMetadata(
     value: unknown,
     allowPartialRegular: boolean,
-): SensitiveFileObservedEvidenceMetadata | null {
+): SensitiveFileCompleteEvidenceMetadata | SensitiveFileObservedEvidenceMetadata | null {
     if (!isRecord(value) || !hasExactKeys(value, [
         "gid",
         "mode",
@@ -393,6 +389,20 @@ function readFileMetadata(
             gid: null,
         };
     }
+    if (value.state === "directory") {
+        if (allowPartialRegular) return null;
+        if (sizeBytes !== null || mtime !== null || mode === null || uid === null || gid === null) {
+            return null;
+        }
+        return {
+            state: "directory",
+            size_bytes: null,
+            mtime_unix_seconds: null,
+            mode,
+            uid,
+            gid,
+        };
+    }
     if (value.state !== "regular") return null;
     if (!allowPartialRegular && [sizeBytes, mtime, mode, uid, gid].some(item => item === null)) {
         return null;
@@ -406,6 +416,69 @@ function readFileMetadata(
         uid,
         gid,
     } as SensitiveFileObservedEvidenceMetadata;
+}
+
+function fileMetadataMatchesLogicalPath(
+    path: string,
+    baseline: SensitiveFileCompleteEvidenceMetadata,
+    observed: SensitiveFileCompleteEvidenceMetadata | SensitiveFileObservedEvidenceMetadata,
+    changeKinds: SensitiveFileChangeKind[],
+    observationFailed: boolean,
+): boolean {
+    const baselineDirectory = baseline.state === "directory";
+    const observedDirectory = observed.state === "directory";
+    const directoryRoot = DIRECTORY_ROOT_PATHS.has(path);
+    const baselineMatchesTarget = directoryRoot
+        ? baselineDirectory || baseline.state === "absent"
+        : REQUIRED_FIXED_FILE_PATHS.has(path)
+            ? baseline.state === "regular"
+            : !baselineDirectory;
+    if (!baselineMatchesTarget) return false;
+
+    const has = (kind: SensitiveFileChangeKind) => changeKinds.includes(kind);
+    const ownerChangeIsProven = baseline.state !== "absent"
+        && observed.state !== "absent"
+        && ((baseline.uid !== null
+                && observed.uid !== null
+                && baseline.uid !== observed.uid)
+            || (baseline.gid !== null
+                && observed.gid !== null
+                && baseline.gid !== observed.gid));
+    const permissionChangeIsProven = baseline.state !== "absent"
+        && observed.state !== "absent"
+        && baseline.mode !== null
+        && observed.mode !== null
+        && baseline.mode !== observed.mode;
+    if (observationFailed) {
+        return !directoryRoot
+            && !observedDirectory
+            && has("unreadable")
+            && !has("added")
+            && !has("removed")
+            && !has("type_changed")
+            && !has("content_changed")
+            && has("owner_changed") === ownerChangeIsProven
+            && has("permissions_changed") === permissionChangeIsProven;
+    }
+    if (has("unreadable")) return false;
+
+    const baselinePresent = baseline.state !== "absent";
+    const observedPresent = observed.state !== "absent";
+    const observedHasWrongTargetType = directoryRoot
+        ? observed.state === "regular"
+        : observedDirectory;
+    const contentChangeIsValid = !has("content_changed")
+        || (baseline.state === "regular" && observed.state === "regular");
+    const regularSizeChanged = baseline.state === "regular"
+        && observed.state === "regular"
+        && baseline.size_bytes !== observed.size_bytes;
+    return has("added") === (!baselinePresent && observedPresent)
+        && has("removed") === (baselinePresent && !observedPresent)
+        && has("type_changed") === observedHasWrongTargetType
+        && has("owner_changed") === ownerChangeIsProven
+        && has("permissions_changed") === permissionChangeIsProven
+        && contentChangeIsValid
+        && (!regularSizeChanged || has("content_changed"));
 }
 
 function readFileData(value: unknown): SensitiveFileChangedEvidenceData | null {
@@ -458,10 +531,26 @@ function readFileData(value: unknown): SensitiveFileChangedEvidenceData | null {
 
     if (value.observation_error === null) {
         const observedMetadata = readFileMetadata(value.observed_metadata, false);
-        return observedMetadata ? { ...base, observed_metadata: observedMetadata, observation_error: null } : null;
+        return observedMetadata
+            && fileMetadataMatchesLogicalPath(
+                value.logical_path,
+                baselineMetadata,
+                observedMetadata,
+                changeKinds,
+                false,
+            )
+            ? { ...base, observed_metadata: observedMetadata, observation_error: null }
+            : null;
     }
     const observedMetadata = readFileMetadata(value.observed_metadata, true);
     return observedMetadata
+        && fileMetadataMatchesLogicalPath(
+            value.logical_path,
+            baselineMetadata,
+            observedMetadata,
+            changeKinds,
+            true,
+        )
         ? {
             ...base,
             observed_metadata: observedMetadata,

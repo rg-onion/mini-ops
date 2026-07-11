@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::net::IpAddr;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -16,7 +16,7 @@ use probe::{
     Fact, OUTPUT_CAP_BYTES, ProbeCancellation, ProbeProgram, ProbeRunner, UnknownReason,
 };
 
-use crate::docker::DockerService;
+use crate::docker::{DockerSecurityIncompleteReason, DockerSecurityRisk, DockerService};
 use crate::i18n::Lang;
 use crate::notifications::{NotificationOutbox, NotificationService};
 use crate::security_events::SecurityEventService;
@@ -123,6 +123,53 @@ fn filesystem_unknown_reason(error: &std::io::Error) -> UnknownReason {
         std::io::ErrorKind::PermissionDenied => UnknownReason::PermissionDenied,
         _ => UnknownReason::IoError,
     }
+}
+
+fn docker_socket_facts(metadata: &fs::Metadata) -> Result<(u32, u32, u32), UnknownReason> {
+    if !metadata.file_type().is_socket() {
+        return Err(UnknownReason::MalformedOutput);
+    }
+
+    Ok((
+        metadata.permissions().mode() & 0o777,
+        metadata.uid(),
+        metadata.gid(),
+    ))
+}
+
+fn docker_audit_severity_status(
+    risks: &[DockerSecurityRisk],
+    has_incomplete_facts: bool,
+) -> (&'static str, &'static str) {
+    let has_critical = risks.iter().any(|risk| risk.severity == "critical");
+    let has_high = risks.iter().any(|risk| risk.severity == "high");
+    if has_critical {
+        ("critical", "FAIL")
+    } else if has_high {
+        ("high", "FAIL")
+    } else if has_incomplete_facts {
+        ("high", "WARN")
+    } else {
+        ("medium", "WARN")
+    }
+}
+
+fn docker_audit_evidence(
+    risks: &[DockerSecurityRisk],
+    incomplete_reasons: &[DockerSecurityIncompleteReason],
+) -> Vec<String> {
+    let mut evidence = incomplete_reasons
+        .iter()
+        .map(|reason| format!("docker_audit_incomplete={}", reason.code()))
+        .collect::<Vec<_>>();
+    let risk_evidence_limit = 128usize.saturating_sub(evidence.len());
+    evidence.extend(
+        risks
+            .iter()
+            .take(risk_evidence_limit)
+            .map(|risk| format!("{}: {}", risk.finding, risk.evidence)),
+    );
+    evidence
 }
 
 async fn read_bounded_text_file(
@@ -728,15 +775,7 @@ impl SecurityAuditor {
             cancellation,
         )
         .await;
-        let active = outcome.parse_stdout(|stdout| {
-            if stdout.lines().any(|line| line.trim() == "Status: active") {
-                Ok(true)
-            } else if stdout.lines().any(|line| line.trim() == "Status: inactive") {
-                Ok(false)
-            } else {
-                Err(UnknownReason::MalformedOutput)
-            }
-        });
+        let active = outcome.parse_stdout(Self::parse_ufw_status_output);
 
         match active {
             Fact::Known(true) => SecurityCheck::new(
@@ -772,40 +811,77 @@ impl SecurityAuditor {
         }
     }
 
+    fn parse_ufw_status_output(stdout: &str) -> Result<bool, UnknownReason> {
+        let mut active_count = 0usize;
+        let mut inactive_count = 0usize;
+        for line in stdout.lines().map(str::trim) {
+            match line {
+                "Status: active" => active_count = active_count.saturating_add(1),
+                "Status: inactive" => inactive_count = inactive_count.saturating_add(1),
+                line if line
+                    .get(.."Status:".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Status:")) =>
+                {
+                    return Err(UnknownReason::MalformedOutput);
+                }
+                _ => {}
+            }
+        }
+        match (active_count, inactive_count) {
+            (1, 0) => Ok(true),
+            (0, 1) => Ok(false),
+            _ => Err(UnknownReason::MalformedOutput),
+        }
+    }
+
     async fn check_docker_socket(lang: &Lang) -> SecurityCheck {
         let name = crate::i18n::t("audit.docker_sock.name", lang);
         let remediation = crate::i18n::t("audit.docker_sock.remediation", lang);
         let path = "/var/run/docker.sock";
 
-        match tokio::fs::metadata(path).await {
-            Ok(metadata) => {
-                let mode = metadata.permissions().mode() & 0o777;
-                let evidence = vec![format!("path={} mode={:o}", path, mode)];
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => match docker_socket_facts(&metadata) {
+                Ok((mode, uid, gid)) => {
+                    let evidence = vec![format!(
+                        "path={} mode={:o} uid={} gid={}",
+                        path, mode, uid, gid
+                    )];
 
-                if mode & 0o002 != 0 {
-                    return SecurityCheck::new(
+                    if mode & 0o002 != 0 || uid != 0 {
+                        return SecurityCheck::new(
+                            "docker.socket_permissions",
+                            name,
+                            "docker",
+                            "critical",
+                            "FAIL",
+                            crate::i18n::t("audit.docker_sock.fail", lang),
+                            remediation,
+                        )
+                        .with_evidence(evidence);
+                    }
+
+                    SecurityCheck::new(
                         "docker.socket_permissions",
                         name,
                         "docker",
                         "critical",
-                        "FAIL",
-                        crate::i18n::t("audit.docker_sock.fail", lang),
+                        "PASS",
+                        crate::i18n::t("audit.docker_sock.pass", lang),
                         remediation,
                     )
-                    .with_evidence(evidence);
+                    .with_evidence(evidence)
                 }
-
-                SecurityCheck::new(
+                Err(reason) => SecurityCheck::new(
                     "docker.socket_permissions",
                     name,
                     "docker",
-                    "critical",
-                    "PASS",
-                    crate::i18n::t("audit.docker_sock.pass", lang),
+                    "low",
+                    "WARN",
+                    crate::i18n::t("audit.docker_sock.warn", lang),
                     remediation,
                 )
-                .with_evidence(evidence)
-            }
+                .with_evidence(unknown_evidence(reason)),
+            },
             Err(error) => SecurityCheck::new(
                 "docker.socket_permissions",
                 name,
@@ -1465,16 +1541,10 @@ impl SecurityAuditor {
         );
         enum DockerAuditResult<T> {
             Completed(T),
-            TimedOut,
             Cancelled(UnknownReason),
         }
         let audit_result = tokio::select! {
-            result = tokio::time::timeout(docker_timeout, docker.audit_security_risks()) => {
-                match result {
-                    Ok(result) => DockerAuditResult::Completed(result),
-                    Err(_) => DockerAuditResult::TimedOut,
-                }
-            }
+            result = docker.audit_security_risks(docker_timeout) => DockerAuditResult::Completed(result),
             reason = cancellation.cancelled() => {
                 DockerAuditResult::Cancelled(match reason {
                     CancellationReason::Cancelled => UnknownReason::Cancelled,
@@ -1484,16 +1554,6 @@ impl SecurityAuditor {
         };
 
         match audit_result {
-            DockerAuditResult::TimedOut => SecurityCheck::new(
-                "docker.container_hardening",
-                name,
-                "docker",
-                "high",
-                "WARN",
-                crate::i18n::t("audit.docker_containers.timeout", lang),
-                remediation,
-            )
-            .with_evidence(unknown_evidence(UnknownReason::Timeout)),
             DockerAuditResult::Cancelled(reason) => SecurityCheck::new(
                 "docker.container_hardening",
                 name,
@@ -1504,36 +1564,27 @@ impl SecurityAuditor {
                 remediation,
             )
             .with_evidence(unknown_evidence(reason)),
-            DockerAuditResult::Completed(Ok(risks)) if risks.is_empty() => SecurityCheck::new(
-                "docker.container_hardening",
-                name,
-                "docker",
-                "high",
-                "PASS",
-                crate::i18n::t("audit.docker_containers.pass", lang),
-                remediation,
-            )
-            .with_references(vec!["https://docs.docker.com/engine/security/"]),
-            DockerAuditResult::Completed(Ok(risks)) => {
-                let has_critical = risks.iter().any(|risk| risk.severity == "critical");
-                let has_high = risks.iter().any(|risk| risk.severity == "high");
-                let severity = if has_critical {
-                    "critical"
-                } else if has_high {
-                    "high"
-                } else {
-                    "medium"
-                };
-                let status = if has_critical || has_high {
-                    "FAIL"
-                } else {
-                    "WARN"
-                };
-                let evidence = risks
-                    .iter()
-                    .take(128)
-                    .map(|risk| format!("{}: {}", risk.finding, risk.evidence))
-                    .collect::<Vec<_>>();
+            DockerAuditResult::Completed(outcome)
+                if outcome.risks.is_empty() && outcome.incomplete_reasons.is_empty() =>
+            {
+                SecurityCheck::new(
+                    "docker.container_hardening",
+                    name,
+                    "docker",
+                    "high",
+                    "PASS",
+                    crate::i18n::t("audit.docker_containers.pass", lang),
+                    remediation,
+                )
+                .with_references(vec!["https://docs.docker.com/engine/security/"])
+            }
+            DockerAuditResult::Completed(outcome) => {
+                let risks = outcome.risks;
+                let mut incomplete_reasons = outcome.incomplete_reasons;
+                incomplete_reasons.sort_by_key(|reason| reason.code());
+                let (severity, status) =
+                    docker_audit_severity_status(&risks, !incomplete_reasons.is_empty());
+                let evidence = docker_audit_evidence(&risks, &incomplete_reasons);
 
                 let mut by_severity: HashMap<String, Vec<String>> = HashMap::new();
                 for risk in risks.iter().take(128) {
@@ -1543,17 +1594,22 @@ impl SecurityAuditor {
                         .push(risk.finding.clone());
                 }
 
+                let message = if risks.is_empty() {
+                    crate::i18n::t("audit.docker_containers.error", lang)
+                } else {
+                    format!(
+                        "{}: {}",
+                        crate::i18n::t("audit.docker_containers.fail", lang),
+                        risks.len()
+                    )
+                };
                 let mut check = SecurityCheck::new(
                     "docker.container_hardening",
                     name,
                     "docker",
                     severity,
                     status,
-                    format!(
-                        "{}: {}",
-                        crate::i18n::t("audit.docker_containers.fail", lang),
-                        risks.len()
-                    ),
+                    message,
                     remediation,
                 )
                 .with_evidence(evidence)
@@ -1566,16 +1622,6 @@ impl SecurityAuditor {
 
                 check
             }
-            DockerAuditResult::Completed(Err(_)) => SecurityCheck::new(
-                "docker.container_hardening",
-                name,
-                "docker",
-                "high",
-                "WARN",
-                crate::i18n::t("audit.docker_containers.error", lang),
-                remediation,
-            )
-            .with_evidence(unknown_evidence(UnknownReason::IoError)),
         }
     }
 }
@@ -1998,6 +2044,128 @@ mod tests {
             SecurityAuditor::parse_root_backing_encryption(two_roots)
                 .expect_err("ambiguous root backing tree must remain unknown"),
             UnknownReason::MalformedOutput
+        );
+    }
+
+    #[test]
+    fn test_ufw_status_requires_one_unambiguous_status_line() {
+        assert_eq!(
+            SecurityAuditor::parse_ufw_status_output("Status: active\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            SecurityAuditor::parse_ufw_status_output("header\n Status: inactive \nfooter\n"),
+            Ok(false)
+        );
+        for ambiguous in [
+            "",
+            "Status: unknown\n",
+            "Status: active\nStatus: unknown\n",
+            "Status: active\nstatus: unknown\n",
+            "Status: active\nStatus: inactive\n",
+            "Status: active\nStatus: active\n",
+            "Status: inactive\nStatus: inactive\n",
+        ] {
+            assert_eq!(
+                SecurityAuditor::parse_ufw_status_output(ambiguous),
+                Err(UnknownReason::MalformedOutput),
+                "ambiguous UFW output must remain unknown: {ambiguous:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_socket_check_requires_a_real_final_unix_socket() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let fixture = std::env::temp_dir().join(format!(
+            "mini-ops-docker-socket-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&fixture).expect("fixture directory should be created");
+
+        let socket_path = fixture.join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("fixture socket should bind");
+        let socket_metadata =
+            fs::symlink_metadata(&socket_path).expect("fixture socket metadata should exist");
+        assert_eq!(
+            docker_socket_facts(&socket_metadata),
+            Ok((
+                socket_metadata.permissions().mode() & 0o777,
+                socket_metadata.uid(),
+                socket_metadata.gid()
+            ))
+        );
+
+        let regular_path = fixture.join("regular");
+        fs::write(&regular_path, b"not a socket").expect("fixture file should be written");
+        assert_eq!(
+            docker_socket_facts(
+                &fs::symlink_metadata(&regular_path)
+                    .expect("fixture regular metadata should exist")
+            ),
+            Err(UnknownReason::MalformedOutput)
+        );
+
+        let symlink_path = fixture.join("socket-link");
+        std::os::unix::fs::symlink(&socket_path, &symlink_path)
+            .expect("fixture symlink should be created");
+        assert_eq!(
+            docker_socket_facts(
+                &fs::symlink_metadata(&symlink_path)
+                    .expect("fixture symlink metadata should exist")
+            ),
+            Err(UnknownReason::MalformedOutput)
+        );
+
+        drop(listener);
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removed");
+    }
+
+    #[test]
+    fn incomplete_docker_facts_do_not_hide_known_failures() {
+        let critical = DockerSecurityRisk {
+            severity: "critical".to_string(),
+            finding: "fixture".to_string(),
+            evidence: "container=fixture privileged=true".to_string(),
+        };
+        assert_eq!(
+            docker_audit_severity_status(&[critical], true),
+            ("critical", "FAIL")
+        );
+
+        let high = DockerSecurityRisk {
+            severity: "high".to_string(),
+            finding: "fixture".to_string(),
+            evidence: "container=fixture seccomp=disabled".to_string(),
+        };
+        assert_eq!(
+            docker_audit_severity_status(&[high], true),
+            ("high", "FAIL")
+        );
+        assert_eq!(docker_audit_severity_status(&[], true), ("high", "WARN"));
+
+        let long_risk = DockerSecurityRisk {
+            severity: "medium".to_string(),
+            finding: "fixture".to_string(),
+            evidence: "x".repeat(8 * 1024),
+        };
+        let bounded = bounded_strings(
+            docker_audit_evidence(
+                &[long_risk],
+                &[DockerSecurityIncompleteReason::MissingMounts],
+            ),
+            4 * 1024,
+            128,
+        );
+        assert_eq!(
+            bounded.first().map(String::as_str),
+            Some("docker_audit_incomplete=missing_mounts")
         );
     }
 

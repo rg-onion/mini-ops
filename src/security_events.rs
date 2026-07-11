@@ -189,6 +189,7 @@ pub struct FileEvidenceMetadataV1 {
 #[serde(rename_all = "snake_case")]
 pub enum FileEvidenceStateV1 {
     Regular,
+    Directory,
     Absent,
 }
 
@@ -199,14 +200,8 @@ pub enum FileObservationErrorV1 {
     Symlink,
     NotRegular,
     FileTooLarge,
-    TrackedFileLimit,
-    ScanByteLimit,
-    DeadlineExceeded,
     ChangedDuringRead,
     VanishedDuringScan,
-    DirectoryUnreadable,
-    PathNotUtf8,
-    PathTooLong,
     IoError,
 }
 
@@ -1026,10 +1021,110 @@ fn parse_file_sensitive_changed_evidence(stored: &str) -> Option<FileSensitiveCh
         || !(0..=MAX_FILE_TIMESTAMP).contains(&evidence.observed_at)
         || !valid_file_evidence_metadata(&evidence.baseline_metadata, false)
         || !valid_file_evidence_metadata(&evidence.observed_metadata, observation_failed)
+        || !file_metadata_matches_logical_path(
+            &evidence.logical_path,
+            &evidence.baseline_metadata,
+            &evidence.observed_metadata,
+            &evidence.change_kinds,
+            observation_failed,
+        )
+        || (evidence
+            .change_kinds
+            .contains(&FileChangeKindV1::ContentChanged)
+            && (evidence.baseline_metadata.state == FileEvidenceStateV1::Directory
+                || evidence.observed_metadata.state == FileEvidenceStateV1::Directory))
     {
         return None;
     }
     Some(evidence)
+}
+
+fn is_directory_root_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/etc/sudoers.d"
+            | "/etc/ssh/sshd_config.d"
+            | "/etc/cron.d"
+            | "/etc/cron.daily"
+            | "/etc/cron.hourly"
+            | "/etc/cron.weekly"
+    )
+}
+
+fn file_metadata_matches_logical_path(
+    path: &str,
+    baseline: &FileEvidenceMetadataV1,
+    observed: &FileEvidenceMetadataV1,
+    change_kinds: &[FileChangeKindV1],
+    observation_failed: bool,
+) -> bool {
+    let directory_root = is_directory_root_path(path);
+    let baseline_matches_target = if directory_root {
+        matches!(
+            baseline.state,
+            FileEvidenceStateV1::Directory | FileEvidenceStateV1::Absent
+        )
+    } else if matches!(path, "/etc/passwd" | "/etc/group") {
+        baseline.state == FileEvidenceStateV1::Regular
+    } else {
+        baseline.state != FileEvidenceStateV1::Directory
+    };
+    if !baseline_matches_target {
+        return false;
+    }
+
+    let has = |kind| change_kinds.contains(&kind);
+    let owner_change_is_proven = || {
+        baseline.state != FileEvidenceStateV1::Absent
+            && observed.state != FileEvidenceStateV1::Absent
+            && ((baseline.uid.is_some() && observed.uid.is_some() && baseline.uid != observed.uid)
+                || (baseline.gid.is_some()
+                    && observed.gid.is_some()
+                    && baseline.gid != observed.gid))
+    };
+    let permission_change_is_proven = || {
+        baseline.state != FileEvidenceStateV1::Absent
+            && observed.state != FileEvidenceStateV1::Absent
+            && baseline.mode.is_some()
+            && observed.mode.is_some()
+            && baseline.mode != observed.mode
+    };
+    if observation_failed {
+        return !directory_root
+            && observed.state != FileEvidenceStateV1::Directory
+            && has(FileChangeKindV1::Unreadable)
+            && !has(FileChangeKindV1::Added)
+            && !has(FileChangeKindV1::Removed)
+            && !has(FileChangeKindV1::TypeChanged)
+            && !has(FileChangeKindV1::ContentChanged)
+            && has(FileChangeKindV1::OwnerChanged) == owner_change_is_proven()
+            && has(FileChangeKindV1::PermissionsChanged) == permission_change_is_proven();
+    }
+
+    if has(FileChangeKindV1::Unreadable) {
+        return false;
+    }
+    let baseline_present = baseline.state != FileEvidenceStateV1::Absent;
+    let observed_present = observed.state != FileEvidenceStateV1::Absent;
+    let observed_has_wrong_target_type = if directory_root {
+        observed.state == FileEvidenceStateV1::Regular
+    } else {
+        observed.state == FileEvidenceStateV1::Directory
+    };
+    let content_change_is_valid = !has(FileChangeKindV1::ContentChanged)
+        || (baseline.state == FileEvidenceStateV1::Regular
+            && observed.state == FileEvidenceStateV1::Regular);
+    let regular_size_changed = baseline.state == FileEvidenceStateV1::Regular
+        && observed.state == FileEvidenceStateV1::Regular
+        && baseline.size_bytes != observed.size_bytes;
+
+    has(FileChangeKindV1::Added) == (!baseline_present && observed_present)
+        && has(FileChangeKindV1::Removed) == (baseline_present && !observed_present)
+        && has(FileChangeKindV1::TypeChanged) == observed_has_wrong_target_type
+        && has(FileChangeKindV1::OwnerChanged) == owner_change_is_proven()
+        && has(FileChangeKindV1::PermissionsChanged) == permission_change_is_proven()
+        && content_change_is_valid
+        && (!regular_size_changed || has(FileChangeKindV1::ContentChanged))
 }
 
 fn valid_file_path_id(path_id: &str) -> bool {
@@ -1072,6 +1167,7 @@ fn valid_logical_file_path(path: &str) -> bool {
         return false;
     }
     FIXED_PATHS.contains(&path)
+        || is_directory_root_path(path)
         || DIRECT_CHILD_ROOTS.iter().any(|root| {
             path.strip_prefix(root)
                 .map(|basename| {
@@ -1109,6 +1205,13 @@ fn valid_file_evidence_metadata(
         && metadata.gid.is_none();
     match metadata.state {
         FileEvidenceStateV1::Absent => all_metadata_absent,
+        FileEvidenceStateV1::Directory => {
+            metadata.size_bytes.is_none()
+                && metadata.mtime_unix_seconds.is_none()
+                && metadata.mode.is_some()
+                && metadata.uid.is_some()
+                && metadata.gid.is_some()
+        }
         FileEvidenceStateV1::Regular => {
             allow_partial_regular
                 || (metadata.size_bytes.is_some()
@@ -1931,13 +2034,35 @@ mod tests {
             );
         }
 
+        for root in [
+            "/etc/sudoers.d",
+            "/etc/ssh/sshd_config.d",
+            "/etc/cron.d",
+            "/etc/cron.daily",
+            "/etc/cron.hourly",
+            "/etc/cron.weekly",
+        ] {
+            let mut payload = valid_file_evidence_payload();
+            payload["logical_path"] = serde_json::json!(root);
+            payload["change_kinds"] = serde_json::json!(["owner_changed", "permissions_changed"]);
+            for side in ["baseline_metadata", "observed_metadata"] {
+                payload[side]["state"] = serde_json::json!("directory");
+                payload[side]["size_bytes"] = serde_json::Value::Null;
+                payload[side]["mtime_unix_seconds"] = serde_json::Value::Null;
+            }
+            payload["observed_metadata"]["uid"] = serde_json::json!(1);
+            assert!(
+                parse_file_sensitive_changed_evidence(&payload.to_string()).is_some(),
+                "configured directory root should be accepted: {root}"
+            );
+        }
+
         let long_basename = format!("/etc/cron.d/{}", "x".repeat(256));
         for path in [
             "/",
             "etc/passwd",
             "/etc",
             "/etc/passwd/child",
-            "/etc/sudoers.d",
             "/etc/sudoers.d/",
             "/etc/sudoers.d/nested/child",
             "/etc/sudoers.d/../passwd",
@@ -1955,17 +2080,6 @@ mod tests {
             );
         }
 
-        let mut all_changes = valid_file_evidence_payload();
-        all_changes["change_kinds"] = serde_json::json!([
-            "added",
-            "content_changed",
-            "owner_changed",
-            "permissions_changed",
-            "removed",
-            "type_changed",
-            "unreadable",
-        ]);
-        assert!(parse_file_sensitive_changed_evidence(&all_changes.to_string()).is_some());
         for changes in [
             serde_json::json!([]),
             serde_json::json!(["permissions_changed", "content_changed"]),
@@ -1982,24 +2096,35 @@ mod tests {
             "symlink",
             "not_regular",
             "file_too_large",
-            "tracked_file_limit",
-            "scan_byte_limit",
-            "deadline_exceeded",
             "changed_during_read",
             "vanished_during_scan",
-            "directory_unreadable",
-            "path_not_utf8",
-            "path_too_long",
             "io_error",
         ] {
             let mut payload = valid_file_evidence_payload();
             payload["observation_error"] = serde_json::json!(error);
+            payload["change_kinds"] = serde_json::json!(["unreadable"]);
             for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
                 payload["observed_metadata"][field] = serde_json::Value::Null;
             }
             assert!(
                 parse_file_sensitive_changed_evidence(&payload.to_string()).is_some(),
                 "closed observation error should be accepted: {error}"
+            );
+        }
+        for aggregate_error in [
+            "tracked_file_limit",
+            "scan_byte_limit",
+            "deadline_exceeded",
+            "directory_unreadable",
+            "path_not_utf8",
+            "path_too_long",
+        ] {
+            let mut payload = valid_file_evidence_payload();
+            payload["observation_error"] = serde_json::json!(aggregate_error);
+            payload["change_kinds"] = serde_json::json!(["unreadable"]);
+            assert!(
+                parse_file_sensitive_changed_evidence(&payload.to_string()).is_none(),
+                "aggregate-only error must not project as a file event: {aggregate_error}"
             );
         }
         let mut unknown_error = valid_file_evidence_payload();
@@ -2010,18 +2135,152 @@ mod tests {
     #[test]
     fn file_evidence_v1_enforces_numeric_metadata_and_privacy_bounds() {
         let mut absent = valid_file_evidence_payload();
+        absent["logical_path"] = serde_json::json!("/etc/sudoers");
+        absent["change_kinds"] = serde_json::json!(["added"]);
         absent["baseline_metadata"]["state"] = serde_json::json!("absent");
         for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
             absent["baseline_metadata"][field] = serde_json::Value::Null;
         }
         assert!(parse_file_sensitive_changed_evidence(&absent.to_string()).is_some());
 
+        let mut directory = valid_file_evidence_payload();
+        directory["logical_path"] = serde_json::json!("/etc/sudoers.d");
+        directory["change_kinds"] = serde_json::json!(["owner_changed", "permissions_changed"]);
+        for side in ["baseline_metadata", "observed_metadata"] {
+            directory[side]["state"] = serde_json::json!("directory");
+            directory[side]["size_bytes"] = serde_json::Value::Null;
+            directory[side]["mtime_unix_seconds"] = serde_json::Value::Null;
+        }
+        directory["observed_metadata"]["uid"] = serde_json::json!(1);
+        assert!(parse_file_sensitive_changed_evidence(&directory.to_string()).is_some());
+
+        let mut absent_to_directory = directory.clone();
+        absent_to_directory["change_kinds"] = serde_json::json!(["added"]);
+        absent_to_directory["baseline_metadata"]["state"] = serde_json::json!("absent");
+        for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
+            absent_to_directory["baseline_metadata"][field] = serde_json::Value::Null;
+        }
+        assert!(parse_file_sensitive_changed_evidence(&absent_to_directory.to_string()).is_some());
+
+        let mut directory_to_absent = directory.clone();
+        directory_to_absent["change_kinds"] = serde_json::json!(["removed"]);
+        directory_to_absent["observed_metadata"]["state"] = serde_json::json!("absent");
+        for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
+            directory_to_absent["observed_metadata"][field] = serde_json::Value::Null;
+        }
+        assert!(parse_file_sensitive_changed_evidence(&directory_to_absent.to_string()).is_some());
+
+        let mut directory_metadata_change = directory.clone();
+        directory_metadata_change["change_kinds"] =
+            serde_json::json!(["owner_changed", "permissions_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&directory_metadata_change.to_string()).is_some()
+        );
+
+        let mut fixed_to_directory = valid_file_evidence_payload();
+        fixed_to_directory["change_kinds"] =
+            serde_json::json!(["permissions_changed", "type_changed"]);
+        fixed_to_directory["observed_metadata"]["state"] = serde_json::json!("directory");
+        fixed_to_directory["observed_metadata"]["size_bytes"] = serde_json::Value::Null;
+        fixed_to_directory["observed_metadata"]["mtime_unix_seconds"] = serde_json::Value::Null;
+        assert!(parse_file_sensitive_changed_evidence(&fixed_to_directory.to_string()).is_some());
+
+        let mut directory_to_regular = directory.clone();
+        directory_to_regular["change_kinds"] =
+            serde_json::json!(["permissions_changed", "type_changed"]);
+        directory_to_regular["observed_metadata"] =
+            valid_file_evidence_payload()["observed_metadata"].clone();
+        assert!(parse_file_sensitive_changed_evidence(&directory_to_regular.to_string()).is_some());
+
+        let mut fixed_to_directory_without_type_change = fixed_to_directory.clone();
+        fixed_to_directory_without_type_change["change_kinds"] =
+            serde_json::json!(["permissions_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(
+                &fixed_to_directory_without_type_change.to_string()
+            )
+            .is_none()
+        );
+
+        let mut directory_to_regular_without_type_change = directory_to_regular.clone();
+        directory_to_regular_without_type_change["change_kinds"] =
+            serde_json::json!(["permissions_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(
+                &directory_to_regular_without_type_change.to_string()
+            )
+            .is_none()
+        );
+
         let mut partial_observed = valid_file_evidence_payload();
         partial_observed["observation_error"] = serde_json::json!("permission_denied");
+        partial_observed["change_kinds"] = serde_json::json!(["unreadable"]);
         for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
             partial_observed["observed_metadata"][field] = serde_json::Value::Null;
         }
         assert!(parse_file_sensitive_changed_evidence(&partial_observed.to_string()).is_some());
+
+        let mut required_absent = absent.clone();
+        required_absent["logical_path"] = serde_json::json!("/etc/passwd");
+        assert!(parse_file_sensitive_changed_evidence(&required_absent.to_string()).is_none());
+
+        let mut child_added = absent.clone();
+        child_added["logical_path"] = serde_json::json!("/etc/cron.d/new-job");
+        assert!(parse_file_sensitive_changed_evidence(&child_added.to_string()).is_some());
+
+        let mut absent_to_wrong_type = child_added.clone();
+        absent_to_wrong_type["change_kinds"] = serde_json::json!(["added", "type_changed"]);
+        absent_to_wrong_type["observed_metadata"]["state"] = serde_json::json!("directory");
+        absent_to_wrong_type["observed_metadata"]["size_bytes"] = serde_json::Value::Null;
+        absent_to_wrong_type["observed_metadata"]["mtime_unix_seconds"] = serde_json::Value::Null;
+        assert!(parse_file_sensitive_changed_evidence(&absent_to_wrong_type.to_string()).is_some());
+
+        let mut expected_add_with_type_change = absent.clone();
+        expected_add_with_type_change["change_kinds"] =
+            serde_json::json!(["added", "type_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&expected_add_with_type_change.to_string())
+                .is_none()
+        );
+
+        let mut root_error = directory.clone();
+        root_error["change_kinds"] = serde_json::json!(["unreadable"]);
+        root_error["observation_error"] = serde_json::json!("permission_denied");
+        root_error["observed_metadata"]["state"] = serde_json::json!("absent");
+        for field in ["size_bytes", "mtime_unix_seconds", "mode", "uid", "gid"] {
+            root_error["observed_metadata"][field] = serde_json::Value::Null;
+        }
+        assert!(parse_file_sensitive_changed_evidence(&root_error.to_string()).is_none());
+
+        let mut error_without_unreadable = partial_observed.clone();
+        error_without_unreadable["change_kinds"] = serde_json::json!(["permissions_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&error_without_unreadable.to_string()).is_none()
+        );
+
+        let mut error_with_transition = partial_observed.clone();
+        error_with_transition["change_kinds"] = serde_json::json!(["added", "unreadable"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&error_with_transition.to_string()).is_none()
+        );
+
+        let mut missing_content_change = valid_file_evidence_payload();
+        missing_content_change["change_kinds"] = serde_json::json!(["permissions_changed"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&missing_content_change.to_string()).is_none()
+        );
+
+        let mut partial_owner_change = partial_observed.clone();
+        partial_owner_change["change_kinds"] = serde_json::json!(["owner_changed", "unreadable"]);
+        partial_owner_change["observed_metadata"]["uid"] = serde_json::json!(1);
+        assert!(parse_file_sensitive_changed_evidence(&partial_owner_change.to_string()).is_some());
+
+        let mut unreported_partial_owner_change = partial_owner_change.clone();
+        unreported_partial_owner_change["change_kinds"] = serde_json::json!(["unreadable"]);
+        assert!(
+            parse_file_sensitive_changed_evidence(&unreported_partial_owner_change.to_string())
+                .is_none()
+        );
 
         let mut invalid_payloads = Vec::new();
         let mut bad_path_id = valid_file_evidence_payload();
@@ -2066,6 +2325,26 @@ mod tests {
         let mut absent_with_metadata = absent.clone();
         absent_with_metadata["baseline_metadata"]["size_bytes"] = serde_json::json!(0);
         invalid_payloads.push(absent_with_metadata);
+
+        let mut directory_with_size = directory.clone();
+        directory_with_size["observed_metadata"]["size_bytes"] = serde_json::json!(4096);
+        invalid_payloads.push(directory_with_size);
+
+        let mut directory_without_owner = directory.clone();
+        directory_without_owner["observed_metadata"]["uid"] = serde_json::Value::Null;
+        invalid_payloads.push(directory_without_owner);
+
+        let mut directory_on_fixed_file = directory.clone();
+        directory_on_fixed_file["logical_path"] = serde_json::json!("/etc/passwd");
+        invalid_payloads.push(directory_on_fixed_file);
+
+        let mut regular_on_directory_root = valid_file_evidence_payload();
+        regular_on_directory_root["logical_path"] = serde_json::json!("/etc/sudoers.d");
+        invalid_payloads.push(regular_on_directory_root);
+
+        let mut directory_content_change = directory.clone();
+        directory_content_change["change_kinds"] = serde_json::json!(["content_changed"]);
+        invalid_payloads.push(directory_content_change);
 
         let mut partial_baseline = valid_file_evidence_payload();
         partial_baseline["observation_error"] = serde_json::json!("permission_denied");

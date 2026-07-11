@@ -51,8 +51,20 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
+use tracing::{Level, Metadata};
+use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
 const DISK_CLEANUP_ENV: &str = "MINI_OPS_ALLOW_DISK_CLEANUP";
+const RESTRICTED_LOG_TARGETS: &[&str] = &[
+    "bollard",
+    "h2",
+    "hyper",
+    "hyper_rustls",
+    "hyper_util",
+    "reqwest",
+    "rustls",
+    "tokio_rustls",
+];
 
 #[derive(Clone, Copy)]
 struct DiskCleanupGate {
@@ -106,12 +118,7 @@ async fn main() {
     // Initialize auth token in OnceLock — safe, called before any threads are spawned
     auth::init_token(auth_token);
 
-    // Initialize tracing with RUST_LOG support
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    init_tracing();
 
     // 1. Setup Database
     let configured_database_url = std::env::var("DATABASE_URL").ok();
@@ -182,8 +189,11 @@ async fn main() {
 
     let docker_service = match DockerService::new() {
         Ok(s) => Some(Arc::new(s)),
-        Err(e) => {
-            tracing::error!("Failed to initialize Docker service: {}", e);
+        Err(_) => {
+            tracing::error!(
+                docker_error = "initialization_failed",
+                "Docker integration unavailable"
+            );
             None
         }
     };
@@ -438,6 +448,27 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+fn init_tracing() {
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(filter_fn(dependency_log_allowed))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}
+
+fn dependency_log_allowed(metadata: &Metadata<'_>) -> bool {
+    let restricted = RESTRICTED_LOG_TARGETS.iter().any(|target| {
+        metadata.target() == *target
+            || metadata
+                .target()
+                .strip_prefix(target)
+                .is_some_and(|suffix| suffix.starts_with("::"))
+    });
+    !restricted || *metadata.level() <= Level::WARN
+}
+
 fn exit_with_runtime_error(context: &'static str, error: runtime::RuntimeError) -> ! {
     eprintln!(
         "CRITICAL: startup_error context={} code={}: {}",
@@ -677,7 +708,7 @@ async fn list_containers_handler(State(state): State<AppState>) -> Response {
     if let Some(docker) = &state.docker {
         match docker.list_containers().await {
             Ok(containers) => Json(containers).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "docker_list_failed").into_response(),
         }
     } else {
         (
@@ -692,6 +723,9 @@ async fn container_action_handler(
     State(state): State<AppState>,
     Path((id, action)): Path<(String, String)>,
 ) -> Response {
+    if !docker::is_valid_container_target(&id) {
+        return (StatusCode::BAD_REQUEST, "invalid_container_target").into_response();
+    }
     if let Some(docker) = &state.docker {
         let result = match action.as_str() {
             "start" => docker.start_container(&id).await,
@@ -708,7 +742,7 @@ async fn container_action_handler(
 
         match result {
             Ok(_) => StatusCode::OK.into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "docker_action_failed").into_response(),
         }
     } else {
         (
@@ -743,7 +777,10 @@ async fn docker_logs_sse_handler(
     use std::convert::Infallible;
     use tokio_stream::wrappers::ReceiverStream;
 
-    tracing::info!("SSE Stream requested for container: {}", id);
+    if !docker::is_valid_container_target(&id) {
+        return (StatusCode::BAD_REQUEST, "invalid_container_target").into_response();
+    }
+    tracing::info!("Docker SSE log stream requested");
 
     let docker = match &state.docker {
         Some(d) => d.clone(),
@@ -771,9 +808,12 @@ async fn docker_logs_sse_handler(
         while let Some(result) = stream.next().await {
             let event = match result {
                 Ok(line) => Event::default().data(line),
-                Err(e) => {
-                    tracing::error!("Log stream error for {}: {}", container_id, e);
-                    Event::default().data(format!("Error: {}", e))
+                Err(_) => {
+                    tracing::error!(
+                        docker_error = "log_stream_failed",
+                        "Docker log stream failed"
+                    );
+                    Event::default().data("Error: docker_log_stream_failed")
                 }
             };
             if tx.send(Ok(event)).await.is_err() {
@@ -1087,14 +1127,76 @@ mod tests {
         http::{Request as HttpRequest, header::CONTENT_TYPE},
     };
     use serde_json::Value;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::{self, Write};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tower::Service;
+
+    #[derive(Clone)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     struct SideEffectCounters {
         command_calls: AtomicUsize,
         history_writes: AtomicUsize,
         file_writes: AtomicUsize,
+    }
+
+    #[test]
+    fn dependency_log_ceiling_blocks_raw_debug_payloads() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedLogWriter(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("trace"))
+            .with(filter_fn(dependency_log_allowed))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(move || writer.clone()),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(
+                target: "bollard::docker",
+                payload = "BOLLARD_ENV_SENTINEL=secret",
+                "decoded inspect response"
+            );
+            tracing::trace!(
+                target: "reqwest::connect",
+                uri = "https://provider.invalid/bot123456:TELEGRAM_TOKEN_SENTINEL/send",
+                "request bytes"
+            );
+            tracing::warn!(target: "bollard::docker", code = "dependency_warning");
+            tracing::debug!(target: "mini_ops::tests", "app_debug_visible");
+        });
+
+        let output = String::from_utf8(
+            captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("captured logs should be UTF-8");
+        assert!(!output.contains("BOLLARD_ENV_SENTINEL"));
+        assert!(!output.contains("TELEGRAM_TOKEN_SENTINEL"));
+        assert!(output.contains("dependency_warning"));
+        assert!(output.contains("app_debug_visible"));
     }
 
     async fn counted_cleanup_handler(
