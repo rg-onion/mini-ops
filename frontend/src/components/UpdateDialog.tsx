@@ -92,12 +92,12 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
                     if (!eventData) continue;
 
                     appendLog(eventData);
-                    if (eventData.includes("Update complete!")) {
+                    if (eventData.includes("Source build complete")) {
                         setStatus("complete");
                         controller.abort();
                         return;
                     }
-                    if (eventData.includes("Update failed")) {
+                    if (eventData.includes("Source build failed")) {
                         setStatus("error");
                         controller.abort();
                         return;
@@ -146,12 +146,6 @@ export function UpdateDialog({ open, onOpenChange }: UpdateDialogProps) {
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [logs]);
-
-    useEffect(() => {
-        if (status !== "complete") return;
-        const timer = window.setTimeout(() => window.location.reload(), 5000);
-        return () => window.clearTimeout(timer);
-    }, [status]);
 
     const handleOpenChange = (nextOpen: boolean) => {
         if (!nextOpen) {

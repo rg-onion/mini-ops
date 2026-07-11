@@ -26,7 +26,7 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
   - **Trusted IPs**: Whitelist management for secure access.
 - **📊 System Monitoring**: CPU/RAM/Disk usage + metrics history.
 - **🔔 Alerts**: Telegram alerts for CPU and disk thresholds + security state changes.
-- **🧹 Disk Cleanup**: clean `target`, `node_modules`, Docker cache, and old journal logs.
+- **💾 Disk Analysis**: inspect build, dependency, Docker, and journal disk usage in a read-only dashboard.
 - **🌍 Localization**: Full support for English and Russian languages.
 
 ---
@@ -180,8 +180,11 @@ Production recommendations:
 - Put Mini-Ops behind HTTPS reverse proxy (Nginx/Caddy/Cloudflare Tunnel).
 - Avoid exposing port `8090` publicly without TLS.
 - Run service as dedicated non-root user whenever possible.
-- Keep dashboard-triggered updates disabled unless explicitly needed
-  (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default).
+- Keep the experimental web source-build endpoint disabled unless explicitly
+  needed (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default). It does not install or
+  restart the running service.
+- Disk cleanup is disabled by default and unavailable in the dashboard. Docker
+  cleanup cannot be enabled in this release.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
 

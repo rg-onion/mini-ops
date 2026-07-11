@@ -1,5 +1,6 @@
 use crate::history::{DeploymentRecord, HistoryManager};
 use axum::{
+    Json,
     extract::State,
     http::{StatusCode, header},
     response::{
@@ -8,6 +9,7 @@ use axum::{
     },
 };
 use futures_util::{StreamExt, stream};
+use serde::Serialize;
 use std::{
     collections::VecDeque,
     convert::Infallible,
@@ -18,6 +20,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::process::Child;
 
 const UPDATE_LOG_BUFFER_LIMIT: usize = 500;
 const WEB_UPDATE_ENV: &str = "MINI_OPS_ALLOW_WEB_UPDATE";
@@ -25,6 +28,26 @@ const WEB_UPDATE_TIMEOUT_ENV: &str = "MINI_OPS_WEB_UPDATE_TIMEOUT_SECS";
 const DEFAULT_WEB_UPDATE_TIMEOUT_SECS: u64 = 1800;
 const MIN_WEB_UPDATE_TIMEOUT_SECS: u64 = 60;
 const MAX_WEB_UPDATE_TIMEOUT_SECS: u64 = 86_400;
+
+#[derive(Serialize)]
+struct ApiErrorEnvelope {
+    error: ApiError,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    code: &'static str,
+}
+
+pub(crate) fn api_error_response(status: StatusCode, code: &'static str) -> Response {
+    (
+        status,
+        Json(ApiErrorEnvelope {
+            error: ApiError { code },
+        }),
+    )
+        .into_response()
+}
 
 #[derive(Clone)]
 pub struct DeploymentService {
@@ -82,16 +105,23 @@ impl DeploymentService {
     }
 
     async fn run_update_task(self, history: Arc<HistoryManager>, record_id: String) {
-        self.publish("🚀 Starting update process...").await;
+        self.publish("🚀 Starting experimental source build...")
+            .await;
 
         match self.run_update_command().await {
             Ok(()) => {
-                self.publish("✅ Update complete! Service restart may be required.")
-                    .await;
-                history.update_record_status(&record_id, "success", "Agent update completed");
+                self.publish(
+                    "✅ Source build complete; install and service restart are still required.",
+                )
+                .await;
+                history.update_record_status(
+                    &record_id,
+                    "success",
+                    "Source build complete; install and service restart required",
+                );
             }
             Err(e) => {
-                self.publish(format!("❌ Update failed: {}", e)).await;
+                self.publish(format!("❌ Source build failed: {}", e)).await;
                 history.update_record_status(&record_id, "failed", &e);
             }
         }
@@ -100,87 +130,26 @@ impl DeploymentService {
     }
 
     async fn run_update_command(&self) -> Result<(), String> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
 
         let mut cmd = Command::new("bash");
         cmd.arg("./scripts/update.sh");
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd.kill_on_drop(true);
+        cmd.process_group(0);
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
-            .map_err(|e| format!("Failed to start update script: {}", e))?;
-
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill().await;
-            return Err("Failed to open update stdout".to_string());
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill().await;
-            return Err("Failed to open update stderr".to_string());
-        };
-
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        let mut read_error = None;
+            .map_err(|_| "source_build_start_failed".to_string())?;
         let update_timeout = web_update_timeout();
-        let timeout = tokio::time::sleep(update_timeout);
-        tokio::pin!(timeout);
-
-        while (!stdout_done || !stderr_done) && read_error.is_none() {
-            tokio::select! {
-                _ = &mut timeout => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    return Err(format!(
-                        "Update timed out after {} seconds",
-                        update_timeout.as_secs()
-                    ));
-                }
-                result = stdout_reader.next_line(), if !stdout_done => {
-                    match result {
-                        Ok(Some(line)) => self.publish(format!("STDOUT: {}", line)).await,
-                        Ok(None) => stdout_done = true,
-                        Err(e) => read_error = Some(format!("Failed to read update stdout: {}", e)),
-                    }
-                }
-                result = stderr_reader.next_line(), if !stderr_done => {
-                    match result {
-                        Ok(Some(line)) => self.publish(format!("STDERR: {}", line)).await,
-                        Ok(None) => stderr_done = true,
-                        Err(e) => read_error = Some(format!("Failed to read update stderr: {}", e)),
-                    }
-                }
-            }
-        }
-
-        if let Some(e) = read_error {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(e);
-        }
-
-        let status = tokio::select! {
-            _ = &mut timeout => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(format!(
-                    "Update timed out after {} seconds",
-                    update_timeout.as_secs()
-                ));
-            }
-            status = child.wait() => {
-                status.map_err(|e| format!("Failed to wait on update script: {}", e))?
-            }
-        };
+        let status = wait_for_process_group(child, update_timeout).await?;
 
         if status.success() {
             Ok(())
         } else {
-            Err(format!("Update script exited with {}", status))
+            Err("source_build_command_failed".to_string())
         }
     }
 
@@ -192,6 +161,77 @@ impl DeploymentService {
         buffer.push_back(message);
         while buffer.len() > UPDATE_LOG_BUFFER_LIMIT {
             buffer.pop_front();
+        }
+    }
+}
+
+async fn wait_for_process_group(
+    mut child: Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let Some(process_group) = child.id() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err("source_build_wait_failed".to_string());
+    };
+    let mut guard = ProcessGroupGuard::new(process_group);
+
+    let result = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(_)) => {
+            terminate_process_group(&mut child, process_group).await;
+            Err("source_build_wait_failed".to_string())
+        }
+        Err(_) => {
+            terminate_process_group(&mut child, process_group).await;
+            Err("source_build_timed_out".to_string())
+        }
+    };
+
+    // The shell can exit while descendants still mutate checkout/build files.
+    // Clear the dedicated group before releasing the single-flight flag.
+    kill_process_group(process_group);
+    guard.disarm();
+    result
+}
+
+async fn terminate_process_group(child: &mut Child, process_group: u32) {
+    kill_process_group(process_group);
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn kill_process_group(process_group: u32) {
+    let Ok(process_group) = i32::try_from(process_group) else {
+        return;
+    };
+    // SAFETY: the negative PID targets only the dedicated process group created
+    // for this source-build job. ESRCH means it has already exited.
+    let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+}
+
+struct ProcessGroupGuard {
+    process_group: u32,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_group: u32) -> Self {
+        Self {
+            process_group,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(self.process_group);
         }
     }
 }
@@ -210,46 +250,55 @@ fn parse_web_update_timeout_secs(value: Option<&str>) -> u64 {
         .unwrap_or(DEFAULT_WEB_UPDATE_TIMEOUT_SECS)
 }
 
+fn web_update_enabled(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+fn trigger_update_response<F>(enabled: bool, start: F) -> Response
+where
+    F: FnOnce() -> Result<(), UpdateStartError>,
+{
+    if !enabled {
+        return api_error_response(StatusCode::FORBIDDEN, "capability_disabled");
+    }
+
+    match start() {
+        Ok(()) => (
+            StatusCode::OK,
+            "Source build triggered. Connect to the log stream for progress; install and restart remain manual.",
+        )
+            .into_response(),
+        Err(UpdateStartError::AlreadyRunning) => {
+            (StatusCode::CONFLICT, "A source build is already running.").into_response()
+        }
+    }
+}
+
 pub async fn trigger_update_handler(
     State(state): State<Arc<DeploymentService>>,
     State(history): State<Arc<HistoryManager>>,
 ) -> Response {
-    if std::env::var(WEB_UPDATE_ENV).as_deref() != Ok("true") {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "Web-triggered updates are disabled. Set {}=true to enable them explicitly.",
-                WEB_UPDATE_ENV
-            ),
-        )
-            .into_response();
-    }
+    let enabled = web_update_enabled(std::env::var(WEB_UPDATE_ENV).ok().as_deref());
 
-    let record = DeploymentRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: chrono::Utc::now(),
-        action: "update".to_string(),
-        details: "Agent Update Triggered".to_string(),
-        status: "in_progress".to_string(),
-        image_id: None, // Agent update is source-based for now
-        container_name: Some("mini-ops".to_string()),
-    };
+    trigger_update_response(enabled, || {
+        let record = DeploymentRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now(),
+            action: "update".to_string(),
+            details: "Experimental source build triggered".to_string(),
+            status: "in_progress".to_string(),
+            image_id: None,
+            container_name: Some("mini-ops".to_string()),
+        };
 
-    match state.start_update(history, record) {
-        Ok(()) => (
-            StatusCode::OK,
-            "Update triggered. Connect to stream for logs.",
-        )
-            .into_response(),
-        Err(UpdateStartError::AlreadyRunning) => {
-            (StatusCode::CONFLICT, "An update is already running.").into_response()
-        }
-    }
+        state.start_update(history, record)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn web_update_timeout_parser_uses_default_and_bounds() {
@@ -270,6 +319,80 @@ mod tests {
             MAX_WEB_UPDATE_TIMEOUT_SECS
         );
         assert_eq!(parse_web_update_timeout_secs(Some("120")), 120);
+    }
+
+    #[test]
+    fn web_update_gate_requires_exact_lowercase_true() {
+        assert!(web_update_enabled(Some("true")));
+        for value in [None, Some(""), Some(" true "), Some("TRUE"), Some("1")] {
+            assert!(!web_update_enabled(value));
+        }
+    }
+
+    #[test]
+    fn disabled_web_update_has_zero_start_history_or_file_side_effects() {
+        let command_calls = AtomicUsize::new(0);
+        let history_writes = AtomicUsize::new(0);
+        let file_writes = AtomicUsize::new(0);
+
+        let response = trigger_update_response(false, || {
+            command_calls.fetch_add(1, Ordering::SeqCst);
+            history_writes.fetch_add(1, Ordering::SeqCst);
+            file_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(command_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(history_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(file_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn source_build_timeout_terminates_descendant_process_group() {
+        let marker = std::env::temp_dir().join(format!(
+            "mini-ops-update-descendant-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let marker_arg = marker.to_string_lossy().to_string();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "/usr/bin/sleep 30 & printf '%s' \"$!\" > \"$1\"; wait",
+                "mini-ops-test",
+                marker_arg.as_str(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+
+        let child = command.spawn().expect("test process should start");
+        let error = wait_for_process_group(child, Duration::from_millis(500))
+            .await
+            .expect_err("test process should time out");
+        assert_eq!(error, "source_build_timed_out");
+
+        let descendant_pid = std::fs::read_to_string(&marker)
+            .expect("test shell should record descendant PID")
+            .parse::<i32>()
+            .expect("descendant PID should be numeric");
+        for _ in 0..50 {
+            // SAFETY: signal 0 only checks whether the fixture process exists.
+            if unsafe { libc::kill(descendant_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                let _ = std::fs::remove_file(&marker);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = std::fs::remove_file(&marker);
+        panic!("source-build descendant survived process-group termination");
     }
 }
 

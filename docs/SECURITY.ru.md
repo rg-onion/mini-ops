@@ -65,19 +65,30 @@ Mini-Ops обеспечивает мониторинг SSH-подключени�
 
 Mini-Ops не ограничивает частоту запросов ко всем API routes самостоятельно. Если dashboard доступен вне trusted network, используйте reverse proxy, VPN или edge-сервис с TLS и request throttling.
 
-## Web-triggered updates
+## Экспериментальная web-сборка исходников
 
 Endpoint `POST /api/deploy/webhook` остается защищенным через `AUTH_TOKEN`, но
 по умолчанию выключен. Включайте `MINI_OPS_ALLOW_WEB_UPDATE=true` только если
-этот хост должен принимать обновления из dashboard.
+этот хост должен принимать экспериментальные запросы на сборку исходников.
 
 Когда флаг включен, Mini-Ops запускает `scripts/update.sh` из локального git
 checkout. Скрипт отказывается работать вне git checkout и при tracked local
 changes, использует `git pull --ff-only`, ставит frontend dependencies из
 lockfile при наличии и собирает backend через `cargo build --release --locked`.
-Одновременно может идти только одно обновление, а `/api/deploy/logs` отдает
-последние строки update logs через SSE. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
-ограничивает runtime каждого web-triggered update (`1800` секунд по умолчанию).
+Одновременно может идти только одно обновление, а `/api/deploy/logs` передаёт
+через SSE bounded status events без raw command output. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
+ограничивает runtime каждой web-сборки (`1800` секунд по умолчанию). Успешный
+terminal state означает только завершение сборки исходников. Установка файла,
+перезапуск сервиса, health validation и rollback выполняются вручную; dashboard
+не показывает этот endpoint как готовое обновление агента.
+
+## Очистка диска
+
+Dashboard показывает использование диска, но не предлагает действий очистки.
+Server-side endpoint выключен, если не задано точное значение
+`MINI_OPS_ALLOW_DISK_CLEANUP=true`. Даже при включённом экспериментальном gate
+target `docker` всегда возвращает `403 operation_unavailable` и не может
+запустить `docker system prune -af`.
 
 ## События безопасности
 

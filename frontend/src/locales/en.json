@@ -4,12 +4,12 @@
         "containers": "Containers",
         "history": "History",
         "system": "System",
-        "update_agent": "Update Agent",
+        "update_agent": "Experimental Source Build",
         "logout": "Logout",
         "version": "Version",
         "loading": "Loading...",
         "error": "Error",
-        "confirm_update": "Start system update? This will rebuild the agent.",
+        "confirm_update": "Start an experimental source build? Installation and restart remain manual.",
         "cpu": "CPU",
         "ram": "RAM",
         "disk": "Disk",
@@ -115,9 +115,12 @@
         "clean": "Clean",
         "prune": "Prune",
         "vacuum": "Vacuum",
-        "note": "Note: Cleaning 'Rust Build' will make the next update slower.",
+        "note": "Usage analysis is read-only. Cleanup actions are not exposed in the dashboard.",
         "confirm_clean": "Are you sure you want to clean {{target}}?",
-        "prune_desc": "Prune unused images"
+        "prune_desc": "Docker data usage",
+        "analysis_only": "Read-only usage information",
+        "cleanup_unavailable": "Cleanup actions are disabled and are not exposed in the dashboard.",
+        "docker_unavailable": "Docker cleanup is unavailable in this release."
     },
     "security": {
         "title": "Security Audit",
@@ -160,12 +163,14 @@
         "no_snapshots": "No snapshots found. Create one before updating!"
     },
     "update": {
-        "title": "System Update",
-        "success_trigger": "Update triggered. Connecting to log stream...",
-        "success_complete": "Update complete. The page will reload in 5 seconds.",
+        "title": "Experimental Source Build",
+        "success_trigger": "Source build triggered. Connecting to the log stream...",
+        "success_complete": "Source build complete. Install the built artifact and restart the service manually to apply it.",
         "ws_connected": "Log stream connected.",
         "ws_closed": "Connection closed.",
-        "ws_error": "Log stream error."
+        "ws_error": "Log stream error.",
+        "unavailable": "Agent update unavailable",
+        "unavailable_detail": "The current experimental endpoint only builds source; it does not install, restart, health-check, or roll back the running agent."
     },
     "ssh": {
         "title": "SSH Security",

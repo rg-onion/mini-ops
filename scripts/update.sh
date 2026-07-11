@@ -4,7 +4,7 @@ IFS=$'\n\t'
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-echo "Starting update process..."
+echo "Starting experimental source build..."
 
 if [ ! -d ".git" ]; then
     echo "Refusing to update: current directory is not a git checkout." >&2
@@ -37,6 +37,6 @@ echo "Building backend..."
 # Note: cargo build might take a while.
 cargo build --release --locked
 
-echo "Update complete. Service restart required."
+echo "Source build complete. Install the built artifact and restart the service to apply it."
 # In a real systemd setup, we might do: sudo systemctl restart mini-ops
 # Here we just exit with success, hoping the supervisor handles it.

@@ -22,16 +22,18 @@ use rand::Rng;
 use auth::auth_middleware;
 use axum::{
     Json, Router,
-    extract::{FromRef, Path, Query, State},
+    extract::{FromRef, Path, Query, Request, State},
     http::{StatusCode, header},
-    middleware,
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::{delete, get, post},
 };
-use deployment::{DeploymentService, deploy_logs_sse_handler, trigger_update_handler};
+use deployment::{
+    DeploymentService, api_error_response, deploy_logs_sse_handler, trigger_update_handler,
+};
 use disk_ops::{DiskOps, DiskUsageBreakdown};
 use docker::DockerService;
 use history::HistoryManager;
@@ -43,6 +45,37 @@ use sqlx::sqlite::SqlitePoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
+
+const DISK_CLEANUP_ENV: &str = "MINI_OPS_ALLOW_DISK_CLEANUP";
+
+#[derive(Clone, Copy)]
+struct DiskCleanupGate {
+    enabled: bool,
+}
+
+impl DiskCleanupGate {
+    fn from_env() -> Self {
+        Self {
+            enabled: disk_cleanup_enabled(std::env::var(DISK_CLEANUP_ENV).ok().as_deref()),
+        }
+    }
+}
+
+fn disk_cleanup_enabled(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+async fn require_disk_cleanup(
+    State(gate): State<DiskCleanupGate>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !gate.enabled {
+        return api_error_response(StatusCode::FORBIDDEN, "capability_disabled");
+    }
+
+    next.run(request).await
+}
 
 #[derive(RustEmbed)]
 #[folder = "frontend/dist"]
@@ -300,7 +333,13 @@ async fn main() {
         )
         .route("/docker/containers/{id}/logs", get(docker_logs_sse_handler)) // SSE by default now
         .route("/disk/usage", get(get_disk_usage_handler))
-        .route("/disk/clean", post(clean_disk_handler))
+        .route(
+            "/disk/clean",
+            post(clean_disk_handler).route_layer(middleware::from_fn_with_state(
+                DiskCleanupGate::from_env(),
+                require_disk_cleanup,
+            )),
+        )
         .route("/deploy/webhook", post(trigger_update_handler))
         .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
@@ -686,7 +725,7 @@ async fn docker_logs_sse_handler(
 }
 
 async fn get_disk_usage_handler() -> Json<DiskUsageBreakdown> {
-    Json(DiskOps::get_usage("."))
+    Json(DiskOps::get_usage(".").await)
 }
 
 #[derive(serde::Deserialize)]
@@ -694,18 +733,42 @@ struct CleanRequest {
     target: String,
 }
 
+#[derive(Clone, Copy)]
+enum DiskCleanupTarget {
+    Target,
+    NodeModules,
+    Logs,
+}
+
 async fn clean_disk_handler(Json(payload): Json<CleanRequest>) -> Response {
-    let result = match payload.target.as_str() {
-        "target" => DiskOps::clean_target(".").await,
-        "node_modules" => DiskOps::clean_node_modules(".").await,
-        "docker" => DiskOps::clean_docker().await,
-        "logs" => DiskOps::clean_logs().await,
-        _ => Err("Invalid target".to_string()),
+    dispatch_disk_cleanup(&payload.target, |target| async move {
+        match target {
+            DiskCleanupTarget::Target => DiskOps::clean_target(".").await,
+            DiskCleanupTarget::NodeModules => DiskOps::clean_node_modules(".").await,
+            DiskCleanupTarget::Logs => DiskOps::clean_logs().await,
+        }
+    })
+    .await
+}
+
+async fn dispatch_disk_cleanup<F, Fut>(target: &str, execute: F) -> Response
+where
+    F: FnOnce(DiskCleanupTarget) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let target = match target {
+        "target" => DiskCleanupTarget::Target,
+        "node_modules" => DiskCleanupTarget::NodeModules,
+        "logs" => DiskCleanupTarget::Logs,
+        "docker" => {
+            return api_error_response(StatusCode::FORBIDDEN, "operation_unavailable");
+        }
+        _ => return api_error_response(StatusCode::BAD_REQUEST, "invalid_target"),
     };
 
-    match result {
+    match execute(target).await {
         Ok(msg) => (StatusCode::OK, msg).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(_) => api_error_response(StatusCode::INTERNAL_SERVER_ERROR, "operation_failed"),
     }
 }
 
@@ -880,5 +943,101 @@ async fn setup_ssh_alerts_handler() -> Response {
             }
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request as HttpRequest, header::CONTENT_TYPE},
+    };
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::Service;
+
+    #[derive(Default)]
+    struct SideEffectCounters {
+        command_calls: AtomicUsize,
+        history_writes: AtomicUsize,
+        file_writes: AtomicUsize,
+    }
+
+    async fn counted_cleanup_handler(
+        State(counters): State<Arc<SideEffectCounters>>,
+        Json(_payload): Json<CleanRequest>,
+    ) -> StatusCode {
+        counters.command_calls.fetch_add(1, Ordering::SeqCst);
+        counters.history_writes.fetch_add(1, Ordering::SeqCst);
+        counters.file_writes.fetch_add(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
+    async fn assert_error_code(response: Response, expected: &str) {
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded error body should be readable");
+        let value: Value =
+            serde_json::from_slice(&body).expect("error response should contain valid JSON");
+        assert_eq!(value["error"]["code"], expected);
+    }
+
+    #[test]
+    fn disk_cleanup_gate_requires_exact_lowercase_true() {
+        assert!(disk_cleanup_enabled(Some("true")));
+        for value in [None, Some(""), Some(" true "), Some("TRUE"), Some("1")] {
+            assert!(!disk_cleanup_enabled(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_malformed_disk_post_is_rejected_before_parsing_or_side_effects() {
+        let counters = Arc::new(SideEffectCounters::default());
+        let mut app = Router::new()
+            .route(
+                "/disk/clean",
+                post(counted_cleanup_handler).route_layer(middleware::from_fn_with_state(
+                    DiskCleanupGate { enabled: false },
+                    require_disk_cleanup,
+                )),
+            )
+            .with_state(counters.clone());
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/disk/clean")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{not-json"))
+            .expect("test request should build");
+
+        let response = Service::call(&mut app, request)
+            .await
+            .expect("test router should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_error_code(response, "capability_disabled").await;
+        assert_eq!(counters.command_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.history_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.file_writes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn docker_cleanup_is_unavailable_without_executor_side_effects() {
+        let counters = Arc::new(SideEffectCounters::default());
+        let captured = counters.clone();
+
+        let response = dispatch_disk_cleanup("docker", move |_target| async move {
+            captured.command_calls.fetch_add(1, Ordering::SeqCst);
+            captured.history_writes.fetch_add(1, Ordering::SeqCst);
+            captured.file_writes.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected".to_string())
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_error_code(response, "operation_unavailable").await;
+        assert_eq!(counters.command_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.history_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(counters.file_writes.load(Ordering::SeqCst), 0);
     }
 }

@@ -23,18 +23,29 @@ openssl rand -hex 32
 ### API Exposure
 Mini-Ops does not throttle all API routes itself. If the dashboard is reachable outside a trusted network, put it behind a reverse proxy, VPN, or edge service that provides TLS and request throttling.
 
-### Web-Triggered Updates
+### Experimental Web Source Builds
 The `POST /api/deploy/webhook` endpoint remains protected by `AUTH_TOKEN`, but
 it is disabled by default. Set `MINI_OPS_ALLOW_WEB_UPDATE=true` only when this
-host should accept dashboard-triggered source updates.
+host should accept an experimental source-build request.
 
 When enabled, Mini-Ops runs `scripts/update.sh` from the local checkout. The
 script refuses non-git directories and tracked local changes, uses
 `git pull --ff-only`, installs frontend dependencies from the lockfile when
 available, and builds the backend with `cargo build --release --locked`. Only
-one update can run at a time, and `/api/deploy/logs` streams recent update logs
-over SSE. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS` bounds each web-triggered update
-(`1800` seconds by default).
+one update can run at a time, and `/api/deploy/logs` streams bounded status
+events without raw command output. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS` bounds each web-triggered update
+(`1800` seconds by default). A successful terminal state means only that the
+source build completed. Installation, service restart, health validation, and
+rollback remain manual; the dashboard does not present this endpoint as an
+agent update action.
+
+### Disk Cleanup
+
+The dashboard reports disk usage but does not expose cleanup actions. The
+server-side cleanup endpoint is disabled unless
+`MINI_OPS_ALLOW_DISK_CLEANUP=true` is set exactly. Even with that experimental
+gate enabled, the `docker` target always returns `403 operation_unavailable`
+and cannot invoke `docker system prune -af`.
 
 ## 📝 SSH Monitoring
 

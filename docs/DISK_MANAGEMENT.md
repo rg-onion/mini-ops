@@ -1,32 +1,21 @@
 # Disk & Cache Management
 
-Mini-Ops helps keep your VPS clean by managing space occupied by caches and logs.
+The Disk Analyzer reports the current size of Rust build artifacts, frontend
+dependencies, Docker data, and system logs when each source is readable within
+the three-second command budget. Unavailable or timed-out values are shown as
+`Unknown`. The dashboard view is read-only and does not expose cleanup buttons.
 
-## 🧹 Cache Cleaning
+## Destructive operations
 
-In the "Disk Management" section, you can clean:
+Disk cleanup is disabled on the server by default. The experimental
+authenticated server-side API is available only when
+`MINI_OPS_ALLOW_DISK_CLEANUP=true` is set exactly. When enabled, it is limited
+to requests for Rust
+`target/`, `frontend/node_modules/`, and journald cleanup.
 
-1.  **Rust Build (`target/`)**:
-    - **Description**: Compilation artifacts (if you build on the server).
-    - **Size**: Can reach several GBs.
-    - **Impact**: Safe to delete. Next build will take longer.
+Docker cleanup is unavailable in this release, even when the experimental gate
+is enabled. `/api/disk/clean` returns `403 operation_unavailable` for the
+`docker` target and cannot invoke `docker system prune -af`.
 
-2.  **Frontend Cache (`node_modules/`)**:
-    - **Description**: Dependencies and build cache.
-    - **Impact**: Safe to delete if you are not actively developing on the server. `npm install` will restore them.
-
-3.  **Docker System**:
-    - **Action**: Equivalent to `docker system prune -af`.
-    - **Impact**: Removes stopped containers, unused networks, and dangling images.
-    - **Warning**: Make sure you don't need stopped containers!
-
-4.  **System Logs**:
-    - **Action**: Vacuum journald logs with `journalctl --vacuum-time=1d`
-      (keep roughly the last 24 hours).
-    - **Requirement**: Requires `root` or `sudo` privileges.
-
-## ⚠️ Notes for Non-Root Users
-
-If running as `miniops` user:
-- **System Logs**: Cleaning likely won't work (Permission Denied).
-- **Build/Frontend**: Works if the user owns the directories.
+The dashboard remains read-only even when the experimental server gate is
+enabled.
