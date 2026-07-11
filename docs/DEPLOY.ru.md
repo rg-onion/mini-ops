@@ -1,8 +1,68 @@
 # Деплой Mini-Ops
 
-Legacy-скрипты автоматического деплоя в этой версии выключены. Они завершаются
-до сборки, SSH-подключения, установки пакетов, изменения firewall, настройки PAM
-или перезапуска сервисов. Используйте ручную managed-systemd установку ниже.
+`scripts/bootstrap_server.sh` — поддерживаемый managed installer. Legacy
+entrypoints `deploy.sh` и `provision.sh` остаются выключенными и завершаются до
+build, network или mutation, указывая оператору на managed bootstrap. Ниже также
+сохранена ручная managed-systemd процедура.
+
+## Managed bootstrap
+
+Начинайте с детерминированного dry run. Validation завершается до build, DNS,
+SSH, установки пакетов или remote mutation:
+
+```bash
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  ./scripts/bootstrap_server.sh
+```
+
+Default plan собирает lockfiles, проверяет architecture артефакта, использует
+strict existing-host-key policy, устанавливает non-root сервис `miniops`,
+привязывает приложение к `127.0.0.1:3000` и выполняет paired backup/rollback с
+проверкой service, API, SQLite path, owner и mode. Он не устанавливает Docker
+или Nginx, не публикует HTTP, не меняет UFW, не добавляет Docker group и не
+изменяет PAM.
+
+Для существующей managed installation default сохраняет и нормализует текущий
+root-owned `.env`:
+
+```bash
+DEPLOY_HOST=server.example ./scripts/bootstrap_server.sh
+```
+
+Для fresh installation явно передайте сильный token и разрешите запись private
+environment file. Не передавайте token через command arguments и удалите его из
+environment после завершения installer:
+
+```bash
+AUTH_TOKEN="$(openssl rand -hex 32)"
+export AUTH_TOKEN
+DEPLOY_HOST=server.example \
+  DEPLOY_WRITE_ENV=1 \
+  ./scripts/bootstrap_server.sh
+unset AUTH_TOKEN
+```
+
+Remote account должен быть root либо иметь passwordless `sudo`; SSH работает
+non-interactive. Новый host key отклоняется, если явно не выбран
+`DEPLOY_ACCEPT_NEW_HOST_KEY=1`; полученный fingerprint нужно проверить отдельно.
+
+Каждая дополнительная mutation включается отдельно:
+
+- `DEPLOY_INSTALL_DOCKER=1` устанавливает/включает Docker;
+- `DEPLOY_ENABLE_DOCKER_INTEGRATION=1` выдаёт root-equivalent Docker group;
+- `DEPLOY_SETUP_NGINX=1` создаёт loopback listener;
+- `DEPLOY_EXPOSE_HTTP=1` дополнительно разрешает wildcard plain-HTTP listener;
+- `DEPLOY_ENABLE_SSH_ALERTS=1` изменяет PAM;
+- `DEPLOY_HARDENING=1` изменяет UFW и включает Fail2Ban.
+
+UFW path не поддерживает NAT/port forwarding. Он требует validated фактический
+SSH listener port, root-only snapshot, bounded systemd rollback timer, точную
+проверку rules и новое независимое SSH connection перед commit. При ошибке
+восстанавливаются исходные files/state и повторно проверяется SSH. При default
+`DEPLOY_HARDENING=0` firewall остаётся неизменным.
+
+## Ручная managed-systemd установка
 
 ## Локальная сборка
 

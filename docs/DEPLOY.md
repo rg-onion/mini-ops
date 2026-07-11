@@ -1,9 +1,68 @@
 # Deploying Mini-Ops
 
-The legacy automated deployment scripts are disabled in this release. They
-exit before building, opening SSH connections, installing packages, changing
-firewall rules, writing PAM configuration, or restarting services. Use the
-manual managed-systemd procedure below.
+`scripts/bootstrap_server.sh` is the supported managed installer. The legacy
+`deploy.sh` and `provision.sh` entrypoints remain disabled and exit before any
+build, network, or mutation; they point operators to the managed bootstrap.
+The manual managed-systemd procedure remains available below.
+
+## Managed bootstrap
+
+Start with a deterministic dry run. Validation finishes before build, DNS,
+SSH, package installation, or remote mutation:
+
+```bash
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  ./scripts/bootstrap_server.sh
+```
+
+The default plan builds from lockfiles, verifies the artifact architecture,
+uses strict existing-host-key checking, installs a non-root `miniops` service,
+binds the app to `127.0.0.1:3000`, and performs paired backup/rollback plus
+service, API, SQLite path, owner, and mode proofs. It does not install Docker or
+Nginx, expose HTTP, change UFW, add the Docker group, or write PAM.
+
+For an existing managed installation, the default preserves and normalizes its
+existing root-owned `.env`:
+
+```bash
+DEPLOY_HOST=server.example ./scripts/bootstrap_server.sh
+```
+
+For a fresh installation, explicitly provide a strong token and authorize the
+private environment-file write. Keep the token out of command arguments and
+unset it after the installer returns:
+
+```bash
+AUTH_TOKEN="$(openssl rand -hex 32)"
+export AUTH_TOKEN
+DEPLOY_HOST=server.example \
+  DEPLOY_WRITE_ENV=1 \
+  ./scripts/bootstrap_server.sh
+unset AUTH_TOKEN
+```
+
+The remote account must be root or have passwordless `sudo`; SSH is
+non-interactive. A new host key is rejected unless
+`DEPLOY_ACCEPT_NEW_HOST_KEY=1` is explicitly selected and the learned
+fingerprint is verified out of band.
+
+Every additional mutation is separately opt-in:
+
+- `DEPLOY_INSTALL_DOCKER=1` installs/enables Docker;
+- `DEPLOY_ENABLE_DOCKER_INTEGRATION=1` grants the root-equivalent Docker group;
+- `DEPLOY_SETUP_NGINX=1` creates a loopback listener;
+- `DEPLOY_EXPOSE_HTTP=1` additionally permits a wildcard plain-HTTP listener;
+- `DEPLOY_ENABLE_SSH_ALERTS=1` changes PAM;
+- `DEPLOY_HARDENING=1` changes UFW and enables Fail2Ban.
+
+The UFW path is unsupported behind NAT/port forwarding. It requires the
+validated actual SSH listener port, a root-only snapshot, a bounded systemd
+rollback timer, exact post-rule checks, and a new independent SSH connection
+before commit. Failure restores the original files/state and rechecks SSH.
+Firewall configuration is unchanged when `DEPLOY_HARDENING=0` (the default).
+
+## Manual managed-systemd installation
 
 ## Build locally
 

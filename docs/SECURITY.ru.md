@@ -205,8 +205,10 @@ TELEGRAM_CHAT_ID=ваш_id
 
 ### Deployment boundary
 
-Legacy-скрипты автоматического деплоя выключены и завершаются до build,
-network, firewall, PAM или service mutations. Поддерживаемый manual unit
-привязывает приложение к loopback, оставляет code/config root-owned, использует
-private state/runtime directories и не выдаёт доступ к Docker group. См.
-[DEPLOY.ru.md](DEPLOY.ru.md).
+Поддерживаемый managed bootstrap проверяет детерминированный dry run до build
+или network activity. Defaults привязывают приложение к loopback, оставляют
+code/config root-owned, используют private state/runtime directories и не
+меняют firewall, public HTTP, PAM, Docker installation или root-equivalent
+Docker-group access. Каждое расширение явно opt-in; UFW option использует
+bounded rollback timer и новое SSH connection перед commit. Legacy
+`deploy.sh`/`provision.sh` остаются hard-stop. См. [DEPLOY.ru.md](DEPLOY.ru.md).

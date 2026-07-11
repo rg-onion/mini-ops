@@ -35,9 +35,17 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 
 ### 1. Installation
 
-Build Mini-Ops from source, then follow the hardened manual systemd procedure
-in [docs/DEPLOY.md](docs/DEPLOY.md). Legacy automated deployment scripts are
-disabled and exit before local build, SSH, firewall, PAM, or service changes.
+Use the managed bootstrap only after reviewing its zero-mutation dry run:
+
+```bash
+DEPLOY_HOST=server.example DEPLOY_DRY_RUN=1 ./scripts/bootstrap_server.sh
+```
+
+Defaults keep the app on loopback and leave Docker, Nginx, UFW, public HTTP,
+Docker-group access, and PAM unchanged. The legacy `deploy.sh` and
+`provision.sh` entrypoints remain hard-stopped. See the actual invocation,
+explicit mutation flags, rollback boundaries, and manual alternative in
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### 2. Configuration (`.env`)
 

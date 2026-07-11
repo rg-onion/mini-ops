@@ -548,11 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_deploy_scripts_fail_before_build_or_network_activity() {
-        for script in [
-            "scripts/bootstrap_server.sh",
-            "scripts/deploy.sh",
-            "scripts/provision.sh",
-        ] {
+        for script in ["scripts/deploy.sh", "scripts/provision.sh"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(script);
             let output = tokio::process::Command::new("/bin/bash")
                 .arg(path)
@@ -568,6 +564,35 @@ mod tests {
                 "{script} must explain its hard stop"
             );
             assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_bootstrap_dry_run_keeps_safe_defaults_without_network() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/bootstrap_server.sh");
+        let output = tokio::process::Command::new("/bin/bash")
+            .arg(path)
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("DEPLOY_HOST", "192.0.2.10")
+            .env("DEPLOY_DRY_RUN", "1")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("run managed bootstrap dry-run fixture");
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let plan = String::from_utf8_lossy(&output.stdout);
+        for boundary in [
+            "app-user=miniops app-bind=127.0.0.1:3000",
+            "host-key=strict-existing-key",
+            "docker=unchanged nginx=disabled firewall=unchanged ssh-alerts=disabled",
+            "network=not-executed build=not-executed mutation=not-executed",
+        ] {
+            assert!(
+                plan.contains(boundary),
+                "missing dry-run boundary: {boundary}"
+            );
         }
     }
 

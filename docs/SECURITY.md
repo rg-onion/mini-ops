@@ -175,8 +175,10 @@ value.
 
 ### Deployment boundary
 
-Legacy automated deployment scripts are disabled and exit before build,
-network, firewall, PAM, or service mutations. The supported manual unit binds
-the application to loopback, keeps code/config root-owned, uses private
-state/runtime directories, and does not grant Docker-group access. See
-[DEPLOY.md](DEPLOY.md).
+The supported managed bootstrap validates a deterministic dry run before build
+or network activity. Its defaults bind the app to loopback, keep code/config
+root-owned, use private state/runtime directories, and leave firewall, public
+HTTP, PAM, Docker installation, and root-equivalent Docker-group access
+unchanged. Each expansion is explicit; the UFW option uses a bounded rollback
+timer and a new SSH connection before commit. Legacy `deploy.sh` and
+`provision.sh` remain hard-stopped. See [DEPLOY.md](DEPLOY.md).

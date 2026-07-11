@@ -31,10 +31,17 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 
 ### 1. Установка
 
-Соберите Mini-Ops из исходного кода и выполните hardened manual systemd
-процедуру из [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md). Legacy-скрипты
-автоматического деплоя выключены и завершаются до сборки, SSH, firewall, PAM
-или изменений сервиса.
+Используйте managed bootstrap только после zero-mutation dry run:
+
+```bash
+DEPLOY_HOST=server.example DEPLOY_DRY_RUN=1 ./scripts/bootstrap_server.sh
+```
+
+Defaults оставляют приложение на loopback и не меняют Docker, Nginx, UFW,
+public HTTP, Docker-group access или PAM. Legacy entrypoints `deploy.sh` и
+`provision.sh` остаются hard-stop. Actual invocation, explicit mutation flags,
+rollback boundaries и ручная альтернатива описаны в
+[docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
 
 ### 2. Конфигурация (`.env`)
 
