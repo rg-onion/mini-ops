@@ -203,6 +203,50 @@ Unknown или incomplete facts остаются видимыми как `WARN` 
 payload не умеет честно представить unknown values без misleading zero/healthy
 полей.
 
+## Контроль целостности sensitive files
+
+Polling целостности sensitive files — отдельный opt-in collector. Он включается
+через `SECURITY_FILE_INTEGRITY_ENABLED=true`; default — `false`. Collector
+обязан работать от непривилегированного service account. Явное включение при
+effective UID `0` fail-closed завершает startup с redacted code
+`unsupported_runtime_identity` до создания integrity tables, worker task или
+чтения файлов. Shipped managed unit работает как `miniops` и сохраняет
+`ProtectHome=true`.
+
+Начальный allowlist включает `/etc/passwd`, `/etc/group`, `/etc/sudoers`,
+`/etc/ssh/sshd_config`, `/etc/crontab` и direct children каталогов
+`/etc/sudoers.d`, `/etc/ssh/sshd_config.d`, `/etc/cron.d`,
+`/etc/cron.daily`, `/etc/cron.hourly` и `/etc/cron.weekly`. Collector не делает
+recursion, не следует symlink, не читает devices/FIFO/sockets и не обходит
+network/FUSE или unclassified filesystems. Permission denial, небезопасный тип
+файла, неизвестная файловая система, timeout или превышение лимита дают
+`degraded` coverage, но никогда clean result. Authorized keys в home/root
+намеренно не входят в эту low-privilege boundary.
+
+Первый допустимый scan создаёт локальный trust-on-first-use baseline. Contents
+обычных файлов на каждом scan потоково хешируются SHA-256; 32-byte digest
+хранится только в private SQLite integrity tables. Contents, excerpts, digests,
+symlink targets и raw OS/SQL errors не возвращаются через API и не попадают в
+security-event evidence, Telegram или Cloud Push. Drift metadata или content
+создаёт bounded event `file.sensitive_changed`. Acknowledge оставляет incident
+активным и никогда не меняет baseline.
+
+Authenticated Security page и API показывают aggregate states `disabled`,
+`initializing`, `healthy`, `drift` и `degraded`. Принятие полного current
+snapshot — отдельное подтверждаемое whole-snapshot действие с CAS baseline и
+observation generations; stale запрос получает `409`. Логическая corruption
+baseline требует отдельного подтверждаемого re-enrollment и свежего complete
+observation. Оба действия никогда не запускаются автоматически после package
+update. Структурная SQLite corruption остаётся restore-from-backup condition.
+
+`SECURITY_FILE_INTEGRITY_INTERVAL_SECS` по умолчанию равен `300` и clamp-ится в
+`60..86400`. Каждый single-flight scan ограничен `256` distinct path IDs,
+`1 MiB` на файл, `8 MiB` суммарно, streaming buffer `64 KiB` и deadline
+`15 секунд`. Current baseline/observation имеют encoded cap `256 KiB` и не
+создают per-poll history. Unchanged healthy scan не пишет SQLite. Collector не
+добавляет check в общий audit, не меняет security score и не расширяет Cloud
+Push schema.
+
 ## Baseline listening ports
 
 Mini-Ops показывает listening sockets, которые не входят в локальный baseline

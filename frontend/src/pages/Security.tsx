@@ -1,3 +1,4 @@
+import { FileIntegrityCard } from "@/components/FileIntegrityCard";
 import { SecurityCard } from "@/components/SecurityCard";
 import { SecurityEventsCard } from "@/components/SecurityEventsCard";
 import { ShieldAlert } from "lucide-react";
@@ -17,6 +18,7 @@ export default function SecurityPage() {
 
             <div className="grid gap-4">
                 <SecurityEventsCard />
+                <FileIntegrityCard />
                 <SecurityCard />
             </div>
         </div>

@@ -178,6 +178,8 @@
             "ssh": "Источник {{ip}} · {{method}}",
             "notification": "Переполнение очереди уведомлений · активных {{liveLimit}} · завершённых {{terminalLimit}}",
             "file": "Файл {{path}} · {{changes}}",
+            "file_integrity_coverage": "Целостность sensitive-файлов · {{reason}} · недоступных целей {{unavailable}}",
+            "file_integrity_reenrolled": "Baseline целостности зарегистрирован заново · поколение {{oldGeneration}} → {{newGeneration}}",
             "file_change": {
                 "added": "добавлен",
                 "content_changed": "содержимое изменено",
@@ -186,6 +188,88 @@
                 "removed": "удалён",
                 "type_changed": "тип изменён",
                 "unreadable": "недоступен для чтения"
+            }
+        },
+        "file_integrity": {
+            "title": "Целостность sensitive-файлов",
+            "loading": "Загрузка статуса целостности файлов...",
+            "load_error": "Не удалось загрузить статус целостности файлов. Достоверный результат недоступен.",
+            "unavailable": "Недоступно",
+            "not_scanned": "Сканирование ещё не выполнялось",
+            "tracked_files": "Отслеживаемые пути",
+            "drift_files": "Пути с расхождениями",
+            "unavailable_targets": "Недоступные цели",
+            "baseline_generation": "Поколение baseline",
+            "observed_generation": "Поколение observation",
+            "last_scan": "Последнее сканирование",
+            "coverage_issues": "Проблемы покрытия",
+            "status": {
+                "disabled": "Выключено",
+                "initializing": "Инициализация",
+                "healthy": "Без расхождений",
+                "drift": "Обнаружены расхождения",
+                "degraded": "Деградировано"
+            },
+            "detail": {
+                "disabled": "Polling включается явно. Задайте SECURITY_FILE_INTEGRITY_ENABLED=true, чтобы его запустить.",
+                "initializing": "Collector ожидает первое bounded-сканирование.",
+                "healthy": "Текущее наблюдение совпадает с доверенным baseline при полном покрытии.",
+                "drift": "Один или несколько отслеживаемых путей отличаются от доверенного baseline.",
+                "degraded": "Надёжно подтвердить покрытие или целостность baseline не удалось. Это не healthy-результат."
+            },
+            "reason": {
+                "coverage_unavailable": "Некоторые настроенные цели нельзя безопасно наблюдать.",
+                "limit_exceeded": "Достигнут ресурсный лимит; результат не был молча усечён до healthy.",
+                "deadline_exceeded": "Превышен bounded deadline сканирования.",
+                "baseline_corrupt": "Локальный manifest baseline несогласован. Проверьте хост перед повторной регистрацией.",
+                "unsupported_algorithm": "Сохранённый алгоритм digest не поддерживается этой версией binary.",
+                "database_restore_required": "Базу состояния целостности должен восстановить администратор из доверенной резервной копии.",
+                "internal_error": "Внутренняя ошибка целостности не позволила получить достоверный результат."
+            },
+            "coverage_error": {
+                "permission_denied": "Недостаточно прав",
+                "symlink": "Symlink отклонён",
+                "not_regular": "Неожиданный тип файла",
+                "file_too_large": "Файл превышает лимит размера",
+                "changed_during_read": "Файл изменился во время чтения",
+                "vanished_during_scan": "Путь исчез во время сканирования",
+                "io_error": "Ошибка bounded file I/O",
+                "tracked_file_limit": "Достигнут лимит отслеживаемых путей",
+                "scan_byte_limit": "Достигнут лимит байтов на сканирование",
+                "deadline_exceeded": "Превышен deadline сканирования",
+                "directory_unreadable": "Каталог нельзя перечислить",
+                "path_not_utf8": "Путь не является корректным UTF-8",
+                "path_too_long": "Путь превышает лимит длины",
+                "network_filesystem": "Сетевая или FUSE-файловая система отклонена",
+                "filesystem_unclassified": "Тип файловой системы не входит в allowlist",
+                "untrusted_new_coverage": "Новые наблюдаемые цели отсутствуют в baseline",
+                "no_observable_targets": "Обязательные цели недоступны для наблюдения"
+            },
+            "trust": {
+                "button": "Доверять текущему состоянию",
+                "title": "Принять весь текущий snapshot?",
+                "description": "Принять observed generation {{observedGeneration}} как новый whole-snapshot baseline вместо текущего поколения {{baselineGeneration}}? Соответствующие инциденты будут закрыты. Обычный acknowledge события никогда не меняет baseline.",
+                "confirm": "Доверять текущему состоянию",
+                "success": "Текущий snapshot целостности принят как доверенный."
+            },
+            "reenroll": {
+                "button": "Зарегистрировать baseline заново",
+                "title": "Зарегистрировать повреждённый baseline заново?",
+                "description": "Заменить повреждённый baseline в state revision {{stateRevision}} полным observed generation {{observedGeneration}}? Это создаёт новую trust-on-first-use границу и не доказывает чистоту текущих файлов.",
+                "confirm": "Зарегистрировать baseline заново",
+                "success": "Baseline целостности зарегистрирован заново из проверенного observation."
+            },
+            "action_error": {
+                "safe": "Действие не выполнено. Изменение baseline не подтверждено.",
+                "invalid_request": "Запрос отклонён. Закройте диалог и проверьте текущий статус.",
+                "stale_generation": "Состояние целостности изменилось. Закройте диалог и проверьте обновлённые поколения перед новым подтверждением.",
+                "not_initialized": "Baseline ещё не инициализирован. Проверьте текущий статус.",
+                "no_drift": "Текущих расхождений для принятия нет. Проверьте обновлённый статус.",
+                "observation_not_trustable": "Текущее наблюдение неполно или небезопасно для принятия.",
+                "feature_disabled": "Polling целостности файлов выключен.",
+                "recovery_not_required": "Восстановление baseline больше не требуется. Проверьте текущий статус.",
+                "unsupported_algorithm": "Эта версия binary не может безопасно заменить baseline с неподдерживаемым алгоритмом.",
+                "internal_error": "Безопасно завершить действие не удалось. Можно повторить запрос с тем же зафиксированным snapshot."
             }
         },
         "test_sent": "Тестовое уведомление отправлено!",

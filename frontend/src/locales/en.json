@@ -178,6 +178,8 @@
             "ssh": "Source {{ip}} · {{method}}",
             "notification": "Notification backpressure · live {{liveLimit}} · terminal {{terminalLimit}}",
             "file": "File {{path}} · {{changes}}",
+            "file_integrity_coverage": "Sensitive-file integrity · {{reason}} · unavailable targets {{unavailable}}",
+            "file_integrity_reenrolled": "Integrity baseline re-enrolled · generation {{oldGeneration}} → {{newGeneration}}",
             "file_change": {
                 "added": "added",
                 "content_changed": "content changed",
@@ -186,6 +188,88 @@
                 "removed": "removed",
                 "type_changed": "type changed",
                 "unreadable": "unreadable"
+            }
+        },
+        "file_integrity": {
+            "title": "Sensitive-file integrity",
+            "loading": "Loading file-integrity status...",
+            "load_error": "File-integrity status could not be loaded. No integrity result is available.",
+            "unavailable": "Unavailable",
+            "not_scanned": "Not scanned yet",
+            "tracked_files": "Tracked paths",
+            "drift_files": "Paths with drift",
+            "unavailable_targets": "Unavailable targets",
+            "baseline_generation": "Baseline generation",
+            "observed_generation": "Observed generation",
+            "last_scan": "Last scan",
+            "coverage_issues": "Coverage issues",
+            "status": {
+                "disabled": "Disabled",
+                "initializing": "Initializing",
+                "healthy": "Healthy",
+                "drift": "Drift detected",
+                "degraded": "Degraded"
+            },
+            "detail": {
+                "disabled": "Polling is opt-in. Set SECURITY_FILE_INTEGRITY_ENABLED=true to enable it.",
+                "initializing": "The collector is waiting for its first bounded scan.",
+                "healthy": "The current observation matches the trusted baseline with full coverage.",
+                "drift": "One or more tracked paths differ from the trusted baseline.",
+                "degraded": "Coverage or baseline integrity could not be established safely. This is not a healthy result."
+            },
+            "reason": {
+                "coverage_unavailable": "Some configured targets could not be observed safely.",
+                "limit_exceeded": "A configured resource limit was reached; the result was not truncated into a healthy state.",
+                "deadline_exceeded": "The bounded scan deadline was exceeded.",
+                "baseline_corrupt": "The local baseline manifest is inconsistent. Review the host before re-enrollment.",
+                "unsupported_algorithm": "The stored digest algorithm is not supported by this binary.",
+                "database_restore_required": "The integrity database requires an administrator restore from a trusted backup.",
+                "internal_error": "An internal integrity error prevented a trustworthy result."
+            },
+            "coverage_error": {
+                "permission_denied": "Permission denied",
+                "symlink": "Symlink refused",
+                "not_regular": "Unexpected file type",
+                "file_too_large": "File exceeds the size limit",
+                "changed_during_read": "File changed during the read",
+                "vanished_during_scan": "Path vanished during the scan",
+                "io_error": "Bounded file I/O failed",
+                "tracked_file_limit": "Tracked-path limit reached",
+                "scan_byte_limit": "Per-scan byte limit reached",
+                "deadline_exceeded": "Scan deadline exceeded",
+                "directory_unreadable": "Directory cannot be enumerated",
+                "path_not_utf8": "Path is not valid UTF-8",
+                "path_too_long": "Path exceeds the length limit",
+                "network_filesystem": "Network or FUSE filesystem refused",
+                "filesystem_unclassified": "Filesystem type is not allowlisted",
+                "untrusted_new_coverage": "Newly observable coverage is not in the baseline",
+                "no_observable_targets": "Required targets are not observable"
+            },
+            "trust": {
+                "button": "Trust current state",
+                "title": "Trust the current whole snapshot?",
+                "description": "Accept observed generation {{observedGeneration}} as the new whole-snapshot baseline (current baseline {{baselineGeneration}})? This resolves matching incidents. Acknowledging an event alone never changes the baseline.",
+                "confirm": "Trust current state",
+                "success": "The current integrity snapshot is now trusted."
+            },
+            "reenroll": {
+                "button": "Re-enroll baseline",
+                "title": "Re-enroll a corrupt baseline?",
+                "description": "Replace the corrupt baseline at state revision {{stateRevision}} with complete observed generation {{observedGeneration}}? This creates a new trust-on-first-use boundary and does not prove that the current files are clean.",
+                "confirm": "Re-enroll baseline",
+                "success": "The integrity baseline was re-enrolled from the reviewed observation."
+            },
+            "action_error": {
+                "safe": "The integrity action failed. No baseline change was confirmed.",
+                "invalid_request": "The request was rejected. Close this dialog and review the current status.",
+                "stale_generation": "The integrity state changed. Close this dialog and review the refreshed generations before confirming again.",
+                "not_initialized": "No baseline has been initialized. Review the current status.",
+                "no_drift": "There is no current drift to trust. Review the refreshed status.",
+                "observation_not_trustable": "The current observation is incomplete or unsafe to trust.",
+                "feature_disabled": "File-integrity polling is disabled.",
+                "recovery_not_required": "Baseline recovery is no longer required. Review the current status.",
+                "unsupported_algorithm": "This binary cannot safely replace a baseline that uses an unsupported algorithm.",
+                "internal_error": "The action could not be completed safely. You can retry without changing the captured snapshot."
             }
         },
         "test_sent": "Test notification sent!",

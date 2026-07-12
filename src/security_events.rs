@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -24,6 +25,9 @@ const MAX_AUDIT_METADATA_VALUE_BYTES: usize = 4 * 1024;
 const MAX_AUDIT_METADATA_TOTAL_BYTES: usize = 48 * 1024;
 const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_FILE_TIMESTAMP: i64 = 253_402_300_799;
+const FILE_INTEGRITY_EVENT_TOUCH_SECONDS: i64 = 60 * 60;
+const FILE_INTEGRITY_PATH_DOMAIN: &[u8] = b"mini-ops:file-integrity:path:v1\0";
+const FILE_INTEGRITY_COVERAGE_EVENT_KEY: &str = "file:integrity_coverage_degraded";
 const SECURITY_EVENT_LIST_COLUMNS: &str =
     "SELECT id, event_key, event_type, severity, title, message,
             CASE
@@ -39,6 +43,7 @@ const SECURITY_EVENT_LIST_COLUMNS: &str =
             END AS evidence_payload_invalid,
             evidence_schema_version, status, first_seen, last_seen,
             acknowledged_at, resolved_at,
+            notification_seq,
             notification_delivery_status, notification_delivery_attempts,
             notification_delivery_updated_at, notification_delivery_error_code
      FROM security_events";
@@ -96,6 +101,16 @@ enum KnownSecurityEventEvidenceV1 {
         data: FileSensitiveChangedEvidenceV1,
         error_code: (),
     },
+    #[serde(rename = "file.integrity_coverage_degraded")]
+    FileIntegrityCoverageDegraded {
+        data: FileIntegrityCoverageDegradedEvidenceV1,
+        error_code: (),
+    },
+    #[serde(rename = "file.integrity_baseline_reenrolled")]
+    FileIntegrityBaselineReenrolled {
+        data: FileIntegrityBaselineReenrolledEvidenceV1,
+        error_code: (),
+    },
 }
 
 impl KnownSecurityEventEvidenceV1 {
@@ -107,6 +122,8 @@ impl KnownSecurityEventEvidenceV1 {
             Self::SshUntrustedSourceIp { data, .. } => serde_json::to_string(data),
             Self::NotificationDeliveryDegraded { data, .. } => serde_json::to_string(data),
             Self::FileSensitiveChanged { data, .. } => serde_json::to_string(data),
+            Self::FileIntegrityCoverageDegraded { data, .. } => serde_json::to_string(data),
+            Self::FileIntegrityBaselineReenrolled { data, .. } => serde_json::to_string(data),
         }
     }
 }
@@ -205,6 +222,108 @@ pub enum FileObservationErrorV1 {
     IoError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileIntegrityDegradedReasonV1 {
+    CoverageUnavailable,
+    LimitExceeded,
+    DeadlineExceeded,
+    BaselineCorrupt,
+    UnsupportedAlgorithm,
+    DatabaseRestoreRequired,
+    InternalError,
+}
+
+impl FileIntegrityDegradedReasonV1 {
+    const fn severity(self) -> &'static str {
+        match self {
+            Self::BaselineCorrupt
+            | Self::UnsupportedAlgorithm
+            | Self::DatabaseRestoreRequired
+            | Self::InternalError => "high",
+            Self::CoverageUnavailable | Self::LimitExceeded | Self::DeadlineExceeded => "medium",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileIntegrityCoverageErrorCodeV1 {
+    ChangedDuringRead,
+    DeadlineExceeded,
+    DirectoryUnreadable,
+    FileTooLarge,
+    FilesystemUnclassified,
+    IoError,
+    NetworkFilesystem,
+    NoObservableTargets,
+    NotRegular,
+    PathNotUtf8,
+    PathTooLong,
+    PermissionDenied,
+    ScanByteLimit,
+    Symlink,
+    TrackedFileLimit,
+    UntrustedNewCoverage,
+    VanishedDuringScan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileIntegrityCoverageErrorCountV1 {
+    pub(crate) code: FileIntegrityCoverageErrorCodeV1,
+    pub(crate) count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileIntegrityCoverageDegradedEvidenceV1 {
+    pub(crate) degraded_reason: FileIntegrityDegradedReasonV1,
+    pub(crate) state_revision: u64,
+    pub(crate) baseline_generation: u64,
+    pub(crate) observed_generation: u64,
+    pub(crate) observation_complete: bool,
+    pub(crate) observed_at: i64,
+    pub(crate) tracked_file_count: u64,
+    pub(crate) drift_file_count: u64,
+    pub(crate) unavailable_target_count: u64,
+    pub(crate) error_counts: Vec<FileIntegrityCoverageErrorCountV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FileIntegrityReenrollReasonV1 {
+    BaselineCorrupt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileIntegrityBaselineReenrolledEvidenceV1 {
+    pub(crate) reason: FileIntegrityReenrollReasonV1,
+    pub(crate) old_baseline_generation: u64,
+    pub(crate) new_baseline_generation: u64,
+    pub(crate) state_revision: u64,
+    pub(crate) observed_generation: u64,
+    pub(crate) reenrolled_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIntegrityDriftEventText<'a> {
+    pub(crate) title: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) notification: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileIntegrityEventMutation {
+    Noop,
+    Opened,
+    Reopened,
+    Updated,
+    HourlyTouched,
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SecurityEvent {
     pub id: i64,
@@ -224,6 +343,22 @@ pub struct SecurityEvent {
     pub notification_delivery_attempts: Option<i64>,
     pub notification_delivery_updated_at: Option<i64>,
     pub notification_delivery_error_code: Option<String>,
+}
+
+struct StoredSecurityEventContext<'a> {
+    event_key: &'a str,
+    event_type: &'a str,
+    severity: &'a str,
+    status: &'a str,
+    first_seen: i64,
+    last_seen: i64,
+    acknowledged_at: Option<i64>,
+    resolved_at: Option<i64>,
+    notification_seq: i64,
+    notification_delivery_status: Option<&'a str>,
+    notification_delivery_attempts: Option<i64>,
+    notification_delivery_updated_at: Option<i64>,
+    notification_delivery_error_code: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -289,6 +424,445 @@ impl SecurityEventService {
         ensure_notification_columns(db).await?;
         NotificationOutbox::init_schema(db).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn upsert_file_integrity_drift_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        outbox: &NotificationOutbox,
+        evidence: &FileSensitiveChangedEvidenceV1,
+        text: FileIntegrityDriftEventText<'_>,
+        material_changed: bool,
+        now: i64,
+    ) -> Result<FileIntegrityEventMutation, sqlx::Error> {
+        validate_file_integrity_drift_input(
+            evidence,
+            text.title,
+            text.message,
+            text.notification,
+            now,
+        )?;
+        let event_key = format!("file:sensitive_changed:{}", evidence.path_id);
+        let evidence_json = serialize_integrity_evidence(evidence)?;
+        let existing = sqlx::query(
+            "SELECT event_type, status, last_seen
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        let (mutation, should_notify) = match existing {
+            None => {
+                sqlx::query(
+                    "INSERT INTO security_events (
+                        event_key, event_type, severity, title, message, evidence_json,
+                        evidence_schema_version, status, first_seen, last_seen,
+                        acknowledged_at, resolved_at
+                     ) VALUES (?, 'file.sensitive_changed', 'high', ?, ?, ?, 1,
+                               'open', ?, ?, NULL, NULL)",
+                )
+                .bind(&event_key)
+                .bind(text.title)
+                .bind(text.message)
+                .bind(&evidence_json)
+                .bind(now)
+                .bind(now)
+                .execute(&mut **transaction)
+                .await?;
+                (FileIntegrityEventMutation::Opened, true)
+            }
+            Some(row) => {
+                let event_type: String = row.try_get("event_type")?;
+                let status: String = row.try_get("status")?;
+                let last_seen: i64 = row.try_get("last_seen")?;
+                if event_type != "file.sensitive_changed" {
+                    return Err(invalid_integrity_event_input());
+                }
+                match status.as_str() {
+                    "resolved" => {
+                        sqlx::query(
+                            "UPDATE security_events
+                             SET event_type = 'file.sensitive_changed', severity = 'high',
+                                 title = ?, message = ?, evidence_json = ?,
+                                 evidence_schema_version = 1, status = 'open',
+                                 first_seen = ?, last_seen = ?, acknowledged_at = NULL,
+                                 resolved_at = NULL
+                             WHERE event_key = ? AND status = 'resolved'",
+                        )
+                        .bind(text.title)
+                        .bind(text.message)
+                        .bind(&evidence_json)
+                        .bind(now)
+                        .bind(now)
+                        .bind(&event_key)
+                        .execute(&mut **transaction)
+                        .await?;
+                        (FileIntegrityEventMutation::Reopened, true)
+                    }
+                    "acknowledged" if material_changed => {
+                        sqlx::query(
+                            "UPDATE security_events
+                             SET severity = 'high', title = ?, message = ?,
+                                 evidence_json = ?, evidence_schema_version = 1,
+                                 status = 'open', last_seen = ?, acknowledged_at = NULL,
+                                 resolved_at = NULL
+                             WHERE event_key = ? AND status = 'acknowledged'",
+                        )
+                        .bind(text.title)
+                        .bind(text.message)
+                        .bind(&evidence_json)
+                        .bind(now)
+                        .bind(&event_key)
+                        .execute(&mut **transaction)
+                        .await?;
+                        (FileIntegrityEventMutation::Reopened, true)
+                    }
+                    "open" if material_changed => {
+                        sqlx::query(
+                            "UPDATE security_events
+                             SET severity = 'high', title = ?, message = ?,
+                                 evidence_json = ?, evidence_schema_version = 1,
+                                 last_seen = ?, resolved_at = NULL
+                             WHERE event_key = ? AND status = 'open'",
+                        )
+                        .bind(text.title)
+                        .bind(text.message)
+                        .bind(&evidence_json)
+                        .bind(now)
+                        .bind(&event_key)
+                        .execute(&mut **transaction)
+                        .await?;
+                        (FileIntegrityEventMutation::Updated, false)
+                    }
+                    "open" | "acknowledged"
+                        if now.saturating_sub(last_seen) >= FILE_INTEGRITY_EVENT_TOUCH_SECONDS =>
+                    {
+                        sqlx::query(
+                            "UPDATE security_events SET last_seen = ?
+                             WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+                        )
+                        .bind(now)
+                        .bind(&event_key)
+                        .execute(&mut **transaction)
+                        .await?;
+                        (FileIntegrityEventMutation::HourlyTouched, false)
+                    }
+                    "open" | "acknowledged" => (FileIntegrityEventMutation::Noop, false),
+                    _ => return Err(invalid_integrity_event_input()),
+                }
+            }
+        };
+
+        if should_notify {
+            enqueue_file_integrity_notification_in_transaction(
+                transaction,
+                outbox,
+                &event_key,
+                "file.sensitive_changed",
+                text.notification,
+                now,
+            )
+            .await?;
+        }
+        Ok(mutation)
+    }
+
+    pub(crate) async fn resolve_file_integrity_drift_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        outbox: &NotificationOutbox,
+        path_id: &str,
+        logical_path: &str,
+        notification_text: &str,
+        now: i64,
+    ) -> Result<FileIntegrityEventMutation, sqlx::Error> {
+        if file_integrity_path_id(logical_path).as_deref() != Some(path_id)
+            || !valid_file_integrity_notification_text(notification_text, logical_path, path_id)
+            || !valid_integrity_timestamp(now)
+        {
+            return Err(invalid_integrity_event_input());
+        }
+        let event_key = format!("file:sensitive_changed:{path_id}");
+        let existing =
+            sqlx::query("SELECT event_type, status FROM security_events WHERE event_key = ?")
+                .bind(&event_key)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let Some(row) = existing else {
+            return Ok(FileIntegrityEventMutation::Noop);
+        };
+        let event_type: String = row.try_get("event_type")?;
+        let status: String = row.try_get("status")?;
+        if event_type != "file.sensitive_changed" {
+            return Err(invalid_integrity_event_input());
+        }
+        if status == "resolved" {
+            return Ok(FileIntegrityEventMutation::Noop);
+        }
+        if !matches!(status.as_str(), "open" | "acknowledged") {
+            return Err(invalid_integrity_event_input());
+        }
+        let updated = sqlx::query(
+            "UPDATE security_events
+             SET status = 'resolved', last_seen = ?, resolved_at = ?
+             WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&event_key)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(invalid_integrity_event_input());
+        }
+        enqueue_file_integrity_notification_in_transaction(
+            transaction,
+            outbox,
+            &event_key,
+            "file.sensitive_changed.resolved",
+            notification_text,
+            now,
+        )
+        .await?;
+        Ok(FileIntegrityEventMutation::Resolved)
+    }
+
+    pub(crate) async fn upsert_file_integrity_coverage_degraded_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        evidence: &FileIntegrityCoverageDegradedEvidenceV1,
+        title: &str,
+        message: &str,
+        now: i64,
+    ) -> Result<FileIntegrityEventMutation, sqlx::Error> {
+        let evidence_json = serialize_integrity_evidence(evidence)?;
+        if parse_file_integrity_coverage_degraded_evidence(&evidence_json).as_ref()
+            != Some(evidence)
+            || !valid_integrity_event_text(title, 256)
+            || !valid_integrity_event_text(message, 2 * 1024)
+            || !valid_integrity_timestamp(now)
+        {
+            return Err(invalid_integrity_event_input());
+        }
+        let severity = evidence.degraded_reason.severity();
+        let existing = sqlx::query(
+            "SELECT event_type, severity, evidence_json, evidence_schema_version,
+                    status, last_seen, notification_seq,
+                    notification_delivery_status, notification_delivery_attempts,
+                    notification_delivery_updated_at, notification_delivery_error_code
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        let Some(row) = existing else {
+            sqlx::query(
+                "INSERT INTO security_events (
+                    event_key, event_type, severity, title, message, evidence_json,
+                    evidence_schema_version, status, first_seen, last_seen,
+                    acknowledged_at, resolved_at, notification_seq
+                 ) VALUES (?, 'file.integrity_coverage_degraded', ?, ?, ?, ?, 1,
+                           'open', ?, ?, NULL, NULL, 0)",
+            )
+            .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+            .bind(severity)
+            .bind(title)
+            .bind(message)
+            .bind(&evidence_json)
+            .bind(now)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(FileIntegrityEventMutation::Opened);
+        };
+
+        let event_type: String = row.try_get("event_type")?;
+        let old_severity: String = row.try_get("severity")?;
+        let status: String = row.try_get("status")?;
+        let last_seen: i64 = row.try_get("last_seen")?;
+        if event_type != "file.integrity_coverage_degraded" {
+            return Err(invalid_integrity_event_input());
+        }
+        if status == "resolved" {
+            sqlx::query(
+                "UPDATE security_events
+                 SET severity = ?, title = ?, message = ?, evidence_json = ?,
+                     evidence_schema_version = 1, status = 'open', first_seen = ?,
+                     last_seen = ?, acknowledged_at = NULL, resolved_at = NULL,
+                     notification_seq = 0, notification_delivery_status = NULL,
+                     notification_delivery_attempts = NULL,
+                     notification_delivery_updated_at = NULL,
+                     notification_delivery_error_code = NULL
+                 WHERE event_key = ? AND status = 'resolved'",
+            )
+            .bind(severity)
+            .bind(title)
+            .bind(message)
+            .bind(&evidence_json)
+            .bind(now)
+            .bind(now)
+            .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(FileIntegrityEventMutation::Reopened);
+        }
+        if !matches!(status.as_str(), "open" | "acknowledged") {
+            return Err(invalid_integrity_event_input());
+        }
+
+        let old_evidence = if row.try_get::<i64, _>("evidence_schema_version")? == 1 {
+            row.try_get::<String, _>("evidence_json")
+                .ok()
+                .and_then(|stored| parse_file_integrity_coverage_degraded_evidence(&stored))
+        } else {
+            None
+        };
+        let notification_state_is_clean = row.try_get::<i64, _>("notification_seq")? == 0
+            && row
+                .try_get::<Option<String>, _>("notification_delivery_status")?
+                .is_none()
+            && row
+                .try_get::<Option<i64>, _>("notification_delivery_attempts")?
+                .is_none()
+            && row
+                .try_get::<Option<i64>, _>("notification_delivery_updated_at")?
+                .is_none()
+            && row
+                .try_get::<Option<String>, _>("notification_delivery_error_code")?
+                .is_none();
+        let material_changed = old_evidence
+            .as_ref()
+            .map(|old| coverage_materially_differs(old, evidence))
+            .unwrap_or(true)
+            || !notification_state_is_clean;
+        if material_changed {
+            let escalated = old_severity != "high" && severity == "high";
+            sqlx::query(
+                "UPDATE security_events
+                 SET severity = ?, title = ?, message = ?, evidence_json = ?,
+                     evidence_schema_version = 1,
+                     status = CASE WHEN ? THEN 'open' ELSE status END,
+                     last_seen = ?,
+                     acknowledged_at = CASE WHEN ? THEN NULL ELSE acknowledged_at END,
+                     resolved_at = NULL, notification_seq = 0,
+                     notification_delivery_status = NULL,
+                     notification_delivery_attempts = NULL,
+                     notification_delivery_updated_at = NULL,
+                     notification_delivery_error_code = NULL
+                 WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+            )
+            .bind(severity)
+            .bind(title)
+            .bind(message)
+            .bind(&evidence_json)
+            .bind(escalated)
+            .bind(now)
+            .bind(escalated)
+            .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(if escalated {
+                FileIntegrityEventMutation::Reopened
+            } else {
+                FileIntegrityEventMutation::Updated
+            });
+        }
+        if now.saturating_sub(last_seen) >= FILE_INTEGRITY_EVENT_TOUCH_SECONDS {
+            sqlx::query(
+                "UPDATE security_events SET last_seen = ?
+                 WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+            )
+            .bind(now)
+            .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+            .execute(&mut **transaction)
+            .await?;
+            return Ok(FileIntegrityEventMutation::HourlyTouched);
+        }
+        Ok(FileIntegrityEventMutation::Noop)
+    }
+
+    pub(crate) async fn resolve_file_integrity_coverage_degraded_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        now: i64,
+    ) -> Result<FileIntegrityEventMutation, sqlx::Error> {
+        if !valid_integrity_timestamp(now) {
+            return Err(invalid_integrity_event_input());
+        }
+        let existing =
+            sqlx::query("SELECT event_type, status FROM security_events WHERE event_key = ?")
+                .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let Some(row) = existing else {
+            return Ok(FileIntegrityEventMutation::Noop);
+        };
+        if row.try_get::<String, _>("event_type")? != "file.integrity_coverage_degraded" {
+            return Err(invalid_integrity_event_input());
+        }
+        let status: String = row.try_get("status")?;
+        if status == "resolved" {
+            return Ok(FileIntegrityEventMutation::Noop);
+        }
+        if !matches!(status.as_str(), "open" | "acknowledged") {
+            return Err(invalid_integrity_event_input());
+        }
+        let updated = sqlx::query(
+            "UPDATE security_events
+             SET status = 'resolved', last_seen = ?, resolved_at = ?,
+                 notification_seq = 0, notification_delivery_status = NULL,
+                 notification_delivery_attempts = NULL,
+                 notification_delivery_updated_at = NULL,
+                 notification_delivery_error_code = NULL
+             WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(invalid_integrity_event_input());
+        }
+        Ok(FileIntegrityEventMutation::Resolved)
+    }
+
+    pub(crate) async fn insert_file_integrity_baseline_reenrolled_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        evidence: &FileIntegrityBaselineReenrolledEvidenceV1,
+        title: &str,
+        message: &str,
+    ) -> Result<(), sqlx::Error> {
+        let evidence_json = serialize_integrity_evidence(evidence)?;
+        if parse_file_integrity_baseline_reenrolled_evidence(&evidence_json).as_ref()
+            != Some(evidence)
+            || !valid_integrity_event_text(title, 256)
+            || !valid_integrity_event_text(message, 2 * 1024)
+        {
+            return Err(invalid_integrity_event_input());
+        }
+        let event_key = format!(
+            "file:integrity_baseline_reenrolled:{}",
+            evidence.state_revision
+        );
+        sqlx::query(
+            "INSERT INTO security_events (
+                event_key, event_type, severity, title, message, evidence_json,
+                evidence_schema_version, status, first_seen, last_seen,
+                acknowledged_at, resolved_at, notification_seq,
+                notification_delivery_status, notification_delivery_attempts,
+                notification_delivery_updated_at, notification_delivery_error_code
+             ) VALUES (?, 'file.integrity_baseline_reenrolled', 'info', ?, ?, ?, 1,
+                       'resolved', ?, ?, NULL, ?, 0, NULL, NULL, NULL, NULL)",
+        )
+        .bind(event_key)
+        .bind(title)
+        .bind(message)
+        .bind(evidence_json)
+        .bind(evidence.reenrolled_at)
+        .bind(evidence.reenrolled_at)
+        .bind(evidence.reenrolled_at)
+        .execute(&mut **transaction)
+        .await?;
         Ok(())
     }
 
@@ -790,11 +1364,27 @@ impl SecurityEventService {
     }
 
     fn event_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SecurityEvent, sqlx::Error> {
+        let event_key: String = row.try_get("event_key")?;
         let event_type: String = row.try_get("event_type")?;
+        let severity: String = row.try_get("severity")?;
+        let status: String = row.try_get("status")?;
+        let first_seen: i64 = row.try_get("first_seen")?;
+        let last_seen: i64 = row.try_get("last_seen")?;
+        let acknowledged_at: Option<i64> = row.try_get("acknowledged_at")?;
+        let resolved_at: Option<i64> = row.try_get("resolved_at")?;
+        let notification_seq: i64 = row.try_get("notification_seq")?;
+        let notification_delivery_status: Option<String> =
+            row.try_get("notification_delivery_status")?;
+        let notification_delivery_attempts: Option<i64> =
+            row.try_get("notification_delivery_attempts")?;
+        let notification_delivery_updated_at: Option<i64> =
+            row.try_get("notification_delivery_updated_at")?;
+        let notification_delivery_error_code: Option<String> =
+            row.try_get("notification_delivery_error_code")?;
         let stored_evidence: Option<Vec<u8>> = row.try_get("bounded_evidence_bytes")?;
         let evidence_payload_invalid: i64 = row.try_get("evidence_payload_invalid")?;
         let evidence_schema_version: i64 = row.try_get("evidence_schema_version")?;
-        let (evidence_json, evidence) = if evidence_schema_version
+        let (mut evidence_json, mut evidence) = if evidence_schema_version
             != CURRENT_EVIDENCE_SCHEMA_VERSION
         {
             invalid_evidence_projection(
@@ -821,26 +1411,146 @@ impl SecurityEventService {
             )
         };
 
+        let context = StoredSecurityEventContext {
+            event_key: &event_key,
+            event_type: &event_type,
+            severity: &severity,
+            status: &status,
+            first_seen,
+            last_seen,
+            acknowledged_at,
+            resolved_at,
+            notification_seq,
+            notification_delivery_status: notification_delivery_status.as_deref(),
+            notification_delivery_attempts,
+            notification_delivery_updated_at,
+            notification_delivery_error_code: notification_delivery_error_code.as_deref(),
+        };
+        if !valid_stored_security_event_context(&context, &evidence) {
+            (evidence_json, evidence) = invalid_evidence_projection(
+                evidence_schema_version,
+                &event_type,
+                SecurityEventEvidenceErrorCode::InvalidStoredPayload,
+            );
+        }
+
         Ok(SecurityEvent {
             id: row.try_get("id")?,
-            event_key: row.try_get("event_key")?,
+            event_key,
             event_type,
-            severity: row.try_get("severity")?,
+            severity,
             title: row.try_get("title")?,
             message: row.try_get("message")?,
             evidence_json,
             evidence,
-            status: row.try_get("status")?,
-            first_seen: row.try_get("first_seen")?,
-            last_seen: row.try_get("last_seen")?,
-            acknowledged_at: row.try_get("acknowledged_at")?,
-            resolved_at: row.try_get("resolved_at")?,
-            notification_delivery_status: row.try_get("notification_delivery_status")?,
-            notification_delivery_attempts: row.try_get("notification_delivery_attempts")?,
-            notification_delivery_updated_at: row.try_get("notification_delivery_updated_at")?,
-            notification_delivery_error_code: row.try_get("notification_delivery_error_code")?,
+            status,
+            first_seen,
+            last_seen,
+            acknowledged_at,
+            resolved_at,
+            notification_delivery_status,
+            notification_delivery_attempts,
+            notification_delivery_updated_at,
+            notification_delivery_error_code,
         })
     }
+}
+
+fn validate_file_integrity_drift_input(
+    evidence: &FileSensitiveChangedEvidenceV1,
+    title: &str,
+    message: &str,
+    notification_text: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let evidence_json = serialize_integrity_evidence(evidence)?;
+    if parse_file_sensitive_changed_evidence(&evidence_json).as_ref() != Some(evidence)
+        || !valid_file_sensitive_event_identity(
+            &format!("file:sensitive_changed:{}", evidence.path_id),
+            evidence,
+        )
+        || !valid_integrity_event_text(title, 256)
+        || !valid_integrity_event_text(message, 2 * 1024)
+        || !valid_file_integrity_notification_text(
+            notification_text,
+            &evidence.logical_path,
+            &evidence.path_id,
+        )
+        || !valid_integrity_timestamp(now)
+    {
+        return Err(invalid_integrity_event_input());
+    }
+    Ok(())
+}
+
+fn serialize_integrity_evidence<T: Serialize>(evidence: &T) -> Result<String, sqlx::Error> {
+    serde_json::to_string(evidence).map_err(|_| invalid_integrity_event_input())
+}
+
+fn valid_integrity_event_text(value: &str, max_bytes: usize) -> bool {
+    valid_bounded_text(value, max_bytes, false) && !contains_private_legacy_marker(value)
+}
+
+fn valid_file_integrity_notification_text(value: &str, logical_path: &str, path_id: &str) -> bool {
+    if value.trim().is_empty()
+        || value.len() > 1536
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        || value.contains(logical_path)
+        || value.contains(path_id)
+    {
+        return false;
+    }
+    let lowered = value.to_ascii_lowercase();
+    !lowered.contains("/etc")
+        && !lowered.contains("path-v1:")
+        && !lowered.contains("content_digest")
+        && !lowered.contains("sha256")
+        && !lowered.contains("sha-256")
+        && !contains_private_legacy_marker(value)
+}
+
+fn valid_integrity_timestamp(value: i64) -> bool {
+    (0..=MAX_FILE_TIMESTAMP).contains(&value)
+}
+
+fn coverage_materially_differs(
+    old: &FileIntegrityCoverageDegradedEvidenceV1,
+    new: &FileIntegrityCoverageDegradedEvidenceV1,
+) -> bool {
+    old.degraded_reason != new.degraded_reason
+        || old.observation_complete != new.observation_complete
+        || old.tracked_file_count != new.tracked_file_count
+        || old.drift_file_count != new.drift_file_count
+        || old.unavailable_target_count != new.unavailable_target_count
+        || old.error_counts != new.error_counts
+}
+
+async fn enqueue_file_integrity_notification_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    outbox: &NotificationOutbox,
+    event_key: &str,
+    kind: &str,
+    notification_text: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let sequence = next_notification_sequence(transaction, event_key).await?;
+    let event = NotificationEvent::file_integrity_transition(
+        event_key,
+        sequence,
+        kind,
+        notification_text,
+        now,
+    );
+    let outcome = outbox
+        .enqueue_in_transaction(transaction, &event, now)
+        .await?;
+    update_enqueue_summary(transaction, event_key, sequence, &outcome, now).await
+}
+
+fn invalid_integrity_event_input() -> sqlx::Error {
+    sqlx::Error::Protocol("invalid file integrity event input".to_string())
 }
 
 fn project_stored_evidence(
@@ -899,6 +1609,22 @@ fn project_stored_evidence(
                 }
             })
         }
+        "file.integrity_coverage_degraded" => {
+            parse_file_integrity_coverage_degraded_evidence(stored_evidence).map(|data| {
+                KnownSecurityEventEvidenceV1::FileIntegrityCoverageDegraded {
+                    data,
+                    error_code: (),
+                }
+            })
+        }
+        "file.integrity_baseline_reenrolled" => {
+            parse_file_integrity_baseline_reenrolled_evidence(stored_evidence).map(|data| {
+                KnownSecurityEventEvidenceV1::FileIntegrityBaselineReenrolled {
+                    data,
+                    error_code: (),
+                }
+            })
+        }
         _ => None,
     };
 
@@ -945,6 +1671,82 @@ fn invalid_evidence_projection(
             },
         )),
     )
+}
+
+fn valid_stored_security_event_context(
+    context: &StoredSecurityEventContext<'_>,
+    evidence: &SecurityEventEvidence,
+) -> bool {
+    let SecurityEventEvidenceProjection::Known(known) = &evidence.0 else {
+        return true;
+    };
+    match &known.kind {
+        KnownSecurityEventEvidenceV1::FileSensitiveChanged { data, .. } => {
+            valid_integrity_status_context(context)
+                && context.severity == "high"
+                && valid_file_sensitive_event_identity(context.event_key, data)
+        }
+        KnownSecurityEventEvidenceV1::FileIntegrityCoverageDegraded { data, .. } => {
+            valid_integrity_status_context(context)
+                && context.event_key == FILE_INTEGRITY_COVERAGE_EVENT_KEY
+                && context.severity == data.degraded_reason.severity()
+                && integrity_event_has_no_notification_state(context)
+        }
+        KnownSecurityEventEvidenceV1::FileIntegrityBaselineReenrolled { data, .. } => {
+            let expected_key =
+                format!("file:integrity_baseline_reenrolled:{}", data.state_revision);
+            context.event_key == expected_key
+                && context.event_type == "file.integrity_baseline_reenrolled"
+                && context.severity == "info"
+                && context.status == "resolved"
+                && context.first_seen == data.reenrolled_at
+                && context.last_seen == data.reenrolled_at
+                && context.resolved_at == Some(data.reenrolled_at)
+                && context.acknowledged_at.is_none()
+                && integrity_event_has_no_notification_state(context)
+        }
+        _ => true,
+    }
+}
+
+fn valid_integrity_status_context(context: &StoredSecurityEventContext<'_>) -> bool {
+    if !(0..=MAX_FILE_TIMESTAMP).contains(&context.first_seen)
+        || !(0..=MAX_FILE_TIMESTAMP).contains(&context.last_seen)
+        || context.first_seen > context.last_seen
+        || context
+            .acknowledged_at
+            .is_some_and(|value| !(0..=MAX_FILE_TIMESTAMP).contains(&value))
+        || context
+            .resolved_at
+            .is_some_and(|value| !(0..=MAX_FILE_TIMESTAMP).contains(&value))
+    {
+        return false;
+    }
+    match context.status {
+        "open" => context.acknowledged_at.is_none() && context.resolved_at.is_none(),
+        "acknowledged" => context.acknowledged_at.is_some() && context.resolved_at.is_none(),
+        "resolved" => context.resolved_at.is_some(),
+        _ => false,
+    }
+}
+
+fn integrity_event_has_no_notification_state(context: &StoredSecurityEventContext<'_>) -> bool {
+    context.notification_seq == 0
+        && context.notification_delivery_status.is_none()
+        && context.notification_delivery_attempts.is_none()
+        && context.notification_delivery_updated_at.is_none()
+        && context.notification_delivery_error_code.is_none()
+}
+
+fn valid_file_sensitive_event_identity(
+    event_key: &str,
+    evidence: &FileSensitiveChangedEvidenceV1,
+) -> bool {
+    let Some(expected_path_id) = file_integrity_path_id(&evidence.logical_path) else {
+        return false;
+    };
+    evidence.path_id == expected_path_id
+        && event_key == format!("file:sensitive_changed:{}", evidence.path_id)
 }
 
 fn parse_audit_evidence(event_type: &str, stored: &str) -> Option<AuditEventEvidenceV1> {
@@ -1033,6 +1835,58 @@ fn parse_file_sensitive_changed_evidence(stored: &str) -> Option<FileSensitiveCh
             .contains(&FileChangeKindV1::ContentChanged)
             && (evidence.baseline_metadata.state == FileEvidenceStateV1::Directory
                 || evidence.observed_metadata.state == FileEvidenceStateV1::Directory))
+    {
+        return None;
+    }
+    Some(evidence)
+}
+
+fn parse_file_integrity_coverage_degraded_evidence(
+    stored: &str,
+) -> Option<FileIntegrityCoverageDegradedEvidenceV1> {
+    let evidence: FileIntegrityCoverageDegradedEvidenceV1 = serde_json::from_str(stored).ok()?;
+    let counts_are_bounded = evidence.tracked_file_count <= 256
+        && evidence.drift_file_count <= evidence.tracked_file_count
+        && evidence.unavailable_target_count <= 256;
+    let revisions_are_bounded = evidence.state_revision <= JS_MAX_SAFE_INTEGER
+        && evidence.baseline_generation <= JS_MAX_SAFE_INTEGER
+        && evidence.observed_generation <= JS_MAX_SAFE_INTEGER;
+    let error_counts_are_valid = evidence.error_counts.len() <= 24
+        && evidence
+            .error_counts
+            .windows(2)
+            .all(|pair| pair[0].code < pair[1].code)
+        && evidence
+            .error_counts
+            .iter()
+            .all(|entry| (1..=256).contains(&entry.count))
+        && evidence
+            .error_counts
+            .iter()
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.count))
+            .is_some_and(|total| total <= 256);
+    if !counts_are_bounded
+        || !revisions_are_bounded
+        || !(0..=MAX_FILE_TIMESTAMP).contains(&evidence.observed_at)
+        || !error_counts_are_valid
+    {
+        return None;
+    }
+    Some(evidence)
+}
+
+fn parse_file_integrity_baseline_reenrolled_evidence(
+    stored: &str,
+) -> Option<FileIntegrityBaselineReenrolledEvidenceV1> {
+    let evidence: FileIntegrityBaselineReenrolledEvidenceV1 = serde_json::from_str(stored).ok()?;
+    if evidence.old_baseline_generation == 0
+        || evidence.old_baseline_generation > JS_MAX_SAFE_INTEGER
+        || evidence.new_baseline_generation == 0
+        || evidence.new_baseline_generation > JS_MAX_SAFE_INTEGER
+        || evidence.state_revision > JS_MAX_SAFE_INTEGER
+        || evidence.observed_generation == 0
+        || evidence.observed_generation > JS_MAX_SAFE_INTEGER
+        || !(0..=MAX_FILE_TIMESTAMP).contains(&evidence.reenrolled_at)
     {
         return None;
     }
@@ -1135,6 +1989,24 @@ fn valid_file_path_id(path_id: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+pub(crate) fn file_integrity_path_id(logical_path: &str) -> Option<String> {
+    if !valid_logical_file_path(logical_path) {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(FILE_INTEGRITY_PATH_DOMAIN);
+    hasher.update(logical_path.as_bytes());
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut path_id = String::with_capacity("path-v1:".len() + digest.len() * 2);
+    path_id.push_str("path-v1:");
+    for byte in digest {
+        path_id.push(char::from(HEX[usize::from(byte >> 4)]));
+        path_id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Some(path_id)
 }
 
 fn valid_logical_file_path(path: &str) -> bool {
@@ -1565,7 +2437,7 @@ mod tests {
 
     fn valid_file_evidence_payload() -> serde_json::Value {
         serde_json::json!({
-            "path_id": format!("path-v1:{}", "a".repeat(64)),
+            "path_id": file_integrity_path_id("/etc/passwd").expect("frozen path should hash"),
             "logical_path": "/etc/passwd",
             "change_kinds": ["content_changed", "permissions_changed"],
             "baseline_generation": 1,
@@ -1821,7 +2693,10 @@ mod tests {
         let file_payload = valid_file_evidence_payload().to_string();
         insert_stored_event(
             &service,
-            "file:sensitive_changed:path-v1:fixture",
+            &format!(
+                "file:sensitive_changed:{}",
+                file_integrity_path_id("/etc/passwd").unwrap()
+            ),
             "file.sensitive_changed",
             &file_payload,
             1,
@@ -3116,5 +3991,545 @@ mod tests {
         assert_eq!(active[0].first_seen, active[0].last_seen);
         assert!(active[0].first_seen > 1);
         assert!(active[0].resolved_at.is_none());
+    }
+
+    fn valid_file_integrity_drift_evidence() -> FileSensitiveChangedEvidenceV1 {
+        serde_json::from_value(valid_file_evidence_payload()).unwrap()
+    }
+
+    fn file_integrity_drift_text(notification: &str) -> FileIntegrityDriftEventText<'_> {
+        FileIntegrityDriftEventText {
+            title: "Sensitive file changed",
+            message: "Open the local Security page.",
+            notification,
+        }
+    }
+
+    fn valid_coverage_evidence(
+        reason: FileIntegrityDegradedReasonV1,
+    ) -> FileIntegrityCoverageDegradedEvidenceV1 {
+        FileIntegrityCoverageDegradedEvidenceV1 {
+            degraded_reason: reason,
+            state_revision: 2,
+            baseline_generation: 1,
+            observed_generation: 2,
+            observation_complete: false,
+            observed_at: 1_700_000_100,
+            tracked_file_count: 2,
+            drift_file_count: 1,
+            unavailable_target_count: 1,
+            error_counts: vec![FileIntegrityCoverageErrorCountV1 {
+                code: FileIntegrityCoverageErrorCodeV1::PermissionDenied,
+                count: 1,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn integrity_drift_transitions_are_atomic_and_each_enqueue_is_durable() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        let evidence = valid_file_integrity_drift_evidence();
+        let notification = "Sensitive-file integrity changed: severity high, count 1";
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                true,
+                1_700_000_101,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Opened
+        );
+        transaction.commit().await.unwrap();
+
+        let event = service.list(Some("active"), 10).await.unwrap().remove(0);
+        assert_valid_evidence(&event);
+        assert!(service.acknowledge(event.id).await.unwrap());
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                true,
+                1_700_000_102,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Reopened
+        );
+        assert_eq!(
+            SecurityEventService::resolve_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence.path_id,
+                &evidence.logical_path,
+                "Sensitive-file integrity recovered: severity high, count 1",
+                1_700_000_103,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Resolved
+        );
+        transaction.commit().await.unwrap();
+
+        let sequences: Vec<i64> = sqlx::query_scalar(
+            "SELECT source_event_seq FROM notification_outbox
+             WHERE source_event_key = ? ORDER BY source_event_seq",
+        )
+        .bind(format!("file:sensitive_changed:{}", evidence.path_id))
+        .fetch_all(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(sequences, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn caller_rollback_removes_integrity_event_and_outbox_together() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        let evidence = valid_file_integrity_drift_evidence();
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        SecurityEventService::upsert_file_integrity_drift_in_transaction(
+            &mut transaction,
+            &outbox,
+            &evidence,
+            file_integrity_drift_text("Sensitive-file integrity changed: severity high, count 1"),
+            true,
+            1_700_000_101,
+        )
+        .await
+        .unwrap();
+        transaction.rollback().await.unwrap();
+
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_events")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        assert_eq!((event_count, outbox_count), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn integrity_state_events_project_strictly_without_notifications() {
+        let service = test_service().await;
+        let coverage = valid_coverage_evidence(FileIntegrityDegradedReasonV1::CoverageUnavailable);
+        let reenrolled = FileIntegrityBaselineReenrolledEvidenceV1 {
+            reason: FileIntegrityReenrollReasonV1::BaselineCorrupt,
+            old_baseline_generation: 1,
+            new_baseline_generation: 2,
+            state_revision: 3,
+            observed_generation: 2,
+            reenrolled_at: 1_700_000_110,
+        };
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        SecurityEventService::upsert_file_integrity_coverage_degraded_in_transaction(
+            &mut transaction,
+            &coverage,
+            "Integrity coverage degraded",
+            "Open the local Security page.",
+            1_700_000_100,
+        )
+        .await
+        .unwrap();
+        SecurityEventService::insert_file_integrity_baseline_reenrolled_in_transaction(
+            &mut transaction,
+            &reenrolled,
+            "Integrity baseline re-enrolled",
+            "A new local trust baseline was explicitly enrolled.",
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let events = service.list(None, 10).await.unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert_valid_evidence(event);
+            assert!(event.notification_delivery_status.is_none());
+        }
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+    }
+
+    #[tokio::test]
+    async fn integrity_outer_identity_mismatch_is_sanitized() {
+        let service = test_service().await;
+        let payload = valid_file_evidence_payload().to_string();
+        insert_stored_event(
+            &service,
+            "file:sensitive_changed:path-v1:wrong",
+            "file.sensitive_changed",
+            &payload,
+            1,
+        )
+        .await;
+        let event = service.list(None, 1).await.unwrap().remove(0);
+        assert_unavailable_evidence(
+            &event,
+            1,
+            "file.sensitive_changed",
+            SecurityEventEvidenceErrorCode::InvalidStoredPayload,
+        );
+        let public = serde_json::to_string(&event).unwrap();
+        assert!(!public.contains("content_digest"));
+    }
+
+    #[tokio::test]
+    async fn integrity_drift_identical_hourly_and_acknowledged_materiality_are_bounded() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        let evidence = valid_file_integrity_drift_evidence();
+        let event_key = format!("file:sensitive_changed:{}", evidence.path_id);
+        let notification = "Sensitive-file integrity changed: severity high, count 1";
+        let now = Utc::now().timestamp();
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                true,
+                now,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Opened
+        );
+        transaction.commit().await.unwrap();
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                false,
+                now + 1,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Noop
+        );
+        transaction.commit().await.unwrap();
+
+        let unchanged: (i64, i64, String) = sqlx::query_as(
+            "SELECT last_seen, notification_seq, evidence_json
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(unchanged.0, now);
+        assert_eq!(unchanged.1, 1);
+        assert_eq!(unchanged.2, serde_json::to_string(&evidence).unwrap());
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                false,
+                now + FILE_INTEGRITY_EVENT_TOUCH_SECONDS,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::HourlyTouched
+        );
+        transaction.commit().await.unwrap();
+
+        sqlx::query(
+            "UPDATE security_events
+             SET status = 'acknowledged', acknowledged_at = ?
+             WHERE event_key = ?",
+        )
+        .bind(now + FILE_INTEGRITY_EVENT_TOUCH_SECONDS)
+        .bind(&event_key)
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(notification),
+                false,
+                now + FILE_INTEGRITY_EVENT_TOUCH_SECONDS + 1,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Noop
+        );
+        transaction.commit().await.unwrap();
+
+        let acknowledged: (String, Option<i64>, i64) = sqlx::query_as(
+            "SELECT status, acknowledged_at, notification_seq
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(acknowledged.0, "acknowledged");
+        assert!(acknowledged.1.is_some());
+        assert_eq!(acknowledged.2, 1);
+
+        let mut changed = evidence.clone();
+        changed.observed_metadata.size_bytes = Some(2_050);
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &changed,
+                file_integrity_drift_text(notification),
+                true,
+                now + FILE_INTEGRITY_EVENT_TOUCH_SECONDS + 2,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Reopened
+        );
+        transaction.commit().await.unwrap();
+
+        let reopened: (String, Option<i64>, i64, String) = sqlx::query_as(
+            "SELECT status, acknowledged_at, notification_seq, evidence_json
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(reopened.0, "open");
+        assert!(reopened.1.is_none());
+        assert_eq!(reopened.2, 2);
+        assert_eq!(reopened.3, serde_json::to_string(&changed).unwrap());
+
+        let outbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_outbox WHERE source_event_key = ?",
+        )
+        .bind(event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(outbox_count, 2);
+    }
+
+    #[tokio::test]
+    async fn integrity_coverage_escalation_preserves_ack_and_never_enqueues() {
+        let service = test_service().await;
+        let now = Utc::now().timestamp();
+        let mut coverage =
+            valid_coverage_evidence(FileIntegrityDegradedReasonV1::CoverageUnavailable);
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_coverage_degraded_in_transaction(
+                &mut transaction,
+                &coverage,
+                "Integrity coverage degraded",
+                "Open the local Security page.",
+                now,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Opened
+        );
+        transaction.commit().await.unwrap();
+
+        sqlx::query(
+            "UPDATE security_events
+             SET status = 'acknowledged', acknowledged_at = ?
+             WHERE event_key = ?",
+        )
+        .bind(now)
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        coverage.state_revision += 1;
+        coverage.observed_generation += 1;
+        coverage.observed_at += 1;
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_coverage_degraded_in_transaction(
+                &mut transaction,
+                &coverage,
+                "Integrity coverage degraded",
+                "Open the local Security page.",
+                now + 1,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Noop
+        );
+        transaction.commit().await.unwrap();
+
+        coverage.degraded_reason = FileIntegrityDegradedReasonV1::BaselineCorrupt;
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_coverage_degraded_in_transaction(
+                &mut transaction,
+                &coverage,
+                "Integrity coverage degraded",
+                "Open the local Security page.",
+                now + 2,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Reopened
+        );
+        transaction.commit().await.unwrap();
+
+        let escalated: (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT severity, status, acknowledged_at
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(escalated.0, "high");
+        assert_eq!(escalated.1, "open");
+        assert!(escalated.2.is_none());
+
+        sqlx::query(
+            "UPDATE security_events
+             SET status = 'acknowledged', acknowledged_at = ?
+             WHERE event_key = ?",
+        )
+        .bind(now + 2)
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .execute(&service.db)
+        .await
+        .unwrap();
+
+        coverage.degraded_reason = FileIntegrityDegradedReasonV1::CoverageUnavailable;
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_coverage_degraded_in_transaction(
+                &mut transaction,
+                &coverage,
+                "Integrity coverage degraded",
+                "Open the local Security page.",
+                now + 3,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Updated
+        );
+        transaction.commit().await.unwrap();
+
+        let deescalated: (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT severity, status, acknowledged_at
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(deescalated.0, "medium");
+        assert_eq!(deescalated.1, "acknowledged");
+        assert_eq!(deescalated.2, Some(now + 2));
+
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::resolve_file_integrity_coverage_degraded_in_transaction(
+                &mut transaction,
+                now + 4,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Resolved
+        );
+        transaction.commit().await.unwrap();
+
+        let resolved: (String, Option<i64>, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, resolved_at, notification_delivery_status, notification_seq
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(FILE_INTEGRITY_COVERAGE_EVENT_KEY)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(resolved.0, "resolved");
+        assert_eq!(resolved.1, Some(now + 4));
+        assert!(resolved.2.is_none());
+        assert_eq!(resolved.3, 0);
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_integrity_notification_is_recorded_without_an_outbox_row() {
+        let service = test_service().await;
+        let outbox = NotificationOutbox::new(
+            service.db.clone(),
+            Arc::new(NotificationService::disabled_for_tests()),
+        );
+        let evidence = valid_file_integrity_drift_evidence();
+        let event_key = format!("file:sensitive_changed:{}", evidence.path_id);
+        let now = Utc::now().timestamp();
+        let mut transaction = service.db.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        assert_eq!(
+            SecurityEventService::upsert_file_integrity_drift_in_transaction(
+                &mut transaction,
+                &outbox,
+                &evidence,
+                file_integrity_drift_text(
+                    "Sensitive-file integrity changed: severity high, count 1",
+                ),
+                true,
+                now,
+            )
+            .await
+            .unwrap(),
+            FileIntegrityEventMutation::Opened
+        );
+        transaction.commit().await.unwrap();
+
+        let delivery: (i64, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT notification_seq, notification_delivery_status,
+                    notification_delivery_attempts, notification_delivery_error_code
+             FROM security_events WHERE event_key = ?",
+        )
+        .bind(event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(delivery.0, 1);
+        assert_eq!(delivery.1.as_deref(), Some("disabled"));
+        assert_eq!(delivery.2, Some(0));
+        assert!(delivery.3.is_none());
+        let outbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(&service.db)
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 0);
     }
 }

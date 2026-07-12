@@ -185,6 +185,50 @@ is missing, degraded, or older than twice the audit interval, because its
 current security payload cannot express unknown values without misleading
 zero/healthy fields.
 
+## Sensitive-File Integrity
+
+Sensitive-file integrity polling is a separate opt-in collector. Enable it with
+`SECURITY_FILE_INTEGRITY_ENABLED=true`; the default is `false`. The collector
+must run as a non-root service account. Explicit enablement while Mini-Ops has
+effective UID `0` fails startup with the redacted code
+`unsupported_runtime_identity` before integrity tables, worker tasks, or file
+reads are created. The shipped managed unit runs as `miniops` and keeps
+`ProtectHome=true`.
+
+The initial allowlist covers `/etc/passwd`, `/etc/group`, `/etc/sudoers`,
+`/etc/ssh/sshd_config`, `/etc/crontab`, and direct children of
+`/etc/sudoers.d`, `/etc/ssh/sshd_config.d`, `/etc/cron.d`,
+`/etc/cron.daily`, `/etc/cron.hourly`, and `/etc/cron.weekly`. It never recurses,
+follows symlinks, reads devices/FIFOs/sockets, or traverses network/FUSE or
+unclassified filesystems. Permission denial, an unsafe file type, an unknown
+filesystem, timeout, or a capacity limit produces `degraded` coverage, never a
+clean result. Home and root authorized-key files are intentionally outside this
+low-privilege coverage boundary.
+
+The first eligible scan creates a local trust-on-first-use baseline. Regular
+file contents are streamed through SHA-256 on every scan; the 32-byte digest is
+stored only in the private SQLite integrity tables. Contents, excerpts,
+digests, symlink targets, and raw OS/SQL errors are never returned by the API or
+written to security-event evidence, Telegram messages, or Cloud Push. Metadata
+and content drift create bounded `file.sensitive_changed` events. Acknowledge
+keeps the incident active and never changes the baseline.
+
+The authenticated Security page and API expose aggregate states
+`disabled`, `initializing`, `healthy`, `drift`, and `degraded`. Accepting a
+complete current snapshot is a separate confirmed whole-snapshot action with
+baseline/observation generation CAS; stale requests return `409`. Logical
+baseline corruption requires a distinct confirmed re-enrollment action and a
+fresh complete observation. Neither action runs automatically after package
+updates. Structural SQLite corruption remains a restore-from-backup condition.
+
+`SECURITY_FILE_INTEGRITY_INTERVAL_SECS` defaults to `300` and is clamped to
+`60..86400`. Each single-flight scan is limited to `256` distinct path IDs,
+`1 MiB` per file, `8 MiB` total bytes, a `64 KiB` streaming buffer, and a
+`15 second` deadline. Current baseline/observation data has a `256 KiB` encoded
+cap and no per-poll history. An unchanged healthy scan does not write SQLite.
+This collector does not add a general audit check, change the security score,
+or extend the Cloud Push schema.
+
 ## Listening Port Baseline
 
 Mini-Ops reports listening sockets that are not part of the local expected-port

@@ -4,6 +4,7 @@ mod cloud_push;
 mod deployment;
 mod disk_ops;
 mod docker;
+mod file_integrity;
 mod history;
 mod i18n;
 mod metrics;
@@ -41,13 +42,17 @@ use deployment::{
 };
 use disk_ops::{DiskOps, DiskUsageBreakdown};
 use docker::DockerService;
+use file_integrity::{
+    FileIntegrityConfig, FileIntegrityOperationError, FileIntegrityService, ReEnrollRequest,
+    TrustCurrentStateRequest,
+};
 use history::HistoryManager;
 use metrics::{MetricsState, SystemStats};
 use notifications::{
     NotificationEvent, NotificationOutbox, NotificationOutcome, NotificationService,
 };
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -106,6 +111,17 @@ async fn main() {
     if runtime_mode == runtime::RuntimeMode::Standalone {
         dotenvy::dotenv().ok();
     }
+
+    let file_integrity_config = FileIntegrityConfig::from_env().unwrap_or_else(|error| {
+        eprintln!("CRITICAL: file_integrity_configuration: {}", error.code());
+        std::process::exit(1);
+    });
+    file_integrity_config
+        .validate_runtime_identity(runtime::effective_uid())
+        .unwrap_or_else(|error| {
+            eprintln!("CRITICAL: file_integrity_configuration: {}", error.code());
+            std::process::exit(1);
+        });
 
     let auth_token = match resolve_auth_token(runtime_mode) {
         Ok(token) => token,
@@ -186,6 +202,20 @@ async fn main() {
     let security_events = Arc::new(SecurityEventService::new(pool.clone()));
     let notification_outbox =
         Arc::new(NotificationOutbox::new(pool.clone(), notifications.clone()));
+    let file_integrity = if file_integrity_config.enabled() {
+        FileIntegrityService::initialize_enabled(
+            pool.clone(),
+            Arc::clone(&notification_outbox),
+            file_integrity_config,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("CRITICAL: file_integrity_initialization: {}", error.code());
+            std::process::exit(1);
+        })
+    } else {
+        FileIntegrityService::disabled()
+    };
 
     let docker_service = match DockerService::new() {
         Ok(s) => Some(Arc::new(s)),
@@ -222,6 +252,7 @@ async fn main() {
     .unwrap_or_else(|error| exit_with_runtime_error("internal_token_write", error));
 
     let _notification_worker = Arc::clone(&notification_outbox).start();
+    let _file_integrity_worker = Arc::clone(&file_integrity).start();
 
     // Start the monitor only after all fail-fast runtime state is ready.
     let security_monitor = Arc::new(SecurityMonitor::new(
@@ -399,6 +430,18 @@ async fn main() {
         .route("/deploy/webhook", post(trigger_update_handler))
         .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
+        .route(
+            "/security/file-integrity/status",
+            get(get_file_integrity_status_handler),
+        )
+        .route(
+            "/security/file-integrity/trust-current-state",
+            post(trust_file_integrity_state_handler),
+        )
+        .route(
+            "/security/file-integrity/re-enroll",
+            post(re_enroll_file_integrity_handler),
+        )
         .route("/security/events", get(get_security_events_handler))
         .route(
             "/security/events/{id}/ack",
@@ -433,6 +476,7 @@ async fn main() {
             ssh_alerts: ssh_alerts_service,
             security_events,
             security_snapshots,
+            file_integrity,
         });
 
     let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -638,6 +682,7 @@ struct AppState {
     ssh_alerts: Arc<SshAlertsService>,
     security_events: Arc<SecurityEventService>,
     security_snapshots: Arc<SecuritySnapshotService>,
+    file_integrity: Arc<FileIntegrityService>,
 }
 
 impl FromRef<AppState> for Arc<DeploymentService> {
@@ -970,6 +1015,57 @@ fn security_audit_snapshot_response(
     response
 }
 
+async fn get_file_integrity_status_handler(State(state): State<AppState>) -> Response {
+    match state.file_integrity.status().await {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => api_error_response(StatusCode::INTERNAL_SERVER_ERROR, error.code()),
+    }
+}
+
+async fn trust_file_integrity_state_handler(
+    State(state): State<AppState>,
+    request: Request,
+) -> Response {
+    let payload = match read_bounded_json_body::<TrustCurrentStateRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => return file_integrity_operation_error_response(error),
+    };
+    match state.file_integrity.trust_current_state(payload).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => file_integrity_operation_error_response(error),
+    }
+}
+
+async fn re_enroll_file_integrity_handler(
+    State(state): State<AppState>,
+    request: Request,
+) -> Response {
+    let payload = match read_bounded_json_body::<ReEnrollRequest>(request).await {
+        Ok(payload) => payload,
+        Err(error) => return file_integrity_operation_error_response(error),
+    };
+    match state.file_integrity.re_enroll(payload).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => file_integrity_operation_error_response(error),
+    }
+}
+
+async fn read_bounded_json_body<T: DeserializeOwned>(
+    request: Request,
+) -> Result<T, FileIntegrityOperationError> {
+    const MAX_BODY_BYTES: usize = 1024;
+    let bytes = axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|_| FileIntegrityOperationError::invalid_request())?;
+    serde_json::from_slice(&bytes).map_err(|_| FileIntegrityOperationError::invalid_request())
+}
+
+fn file_integrity_operation_error_response(error: FileIntegrityOperationError) -> Response {
+    let status =
+        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(error.response_body())).into_response()
+}
+
 #[derive(Deserialize)]
 struct SecurityEventsParams {
     status: Option<String>,
@@ -1216,6 +1312,66 @@ mod tests {
         let value: Value =
             serde_json::from_slice(&body).expect("error response should contain valid JSON");
         assert_eq!(value["error"]["code"], expected);
+    }
+
+    #[tokio::test]
+    async fn file_integrity_action_body_is_exact_and_bounded() {
+        let request = HttpRequest::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"expected_baseline_generation":1,"expected_observed_generation":2,"confirmation":"trust_current_state"}"#,
+            ))
+            .expect("request should build");
+        let parsed = read_bounded_json_body::<TrustCurrentStateRequest>(request)
+            .await
+            .expect("exact request should parse");
+        assert_eq!(parsed.expected_baseline_generation, 1);
+        assert_eq!(parsed.expected_observed_generation, 2);
+
+        let unknown = HttpRequest::builder()
+            .body(Body::from(
+                r#"{"expected_baseline_generation":1,"expected_observed_generation":2,"confirmation":"trust_current_state","extra":true}"#,
+            ))
+            .expect("request should build");
+        assert_eq!(
+            read_bounded_json_body::<TrustCurrentStateRequest>(unknown)
+                .await
+                .expect_err("unknown field must fail")
+                .code(),
+            file_integrity::FileIntegrityOperationErrorCode::InvalidRequest
+        );
+
+        let oversized = HttpRequest::builder()
+            .body(Body::from(vec![b'x'; 1025]))
+            .expect("request should build");
+        assert!(
+            read_bounded_json_body::<TrustCurrentStateRequest>(oversized)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn file_integrity_invalid_request_envelope_is_exact_and_redacted() {
+        let response =
+            file_integrity_operation_error_response(FileIntegrityOperationError::invalid_request());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("bounded response body");
+        let value: Value = serde_json::from_slice(&body).expect("valid JSON envelope");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "error": {
+                    "code": "invalid_request",
+                    "status": null,
+                    "state_revision": null,
+                    "baseline_generation": null,
+                    "observed_generation": null
+                }
+            })
+        );
     }
 
     #[test]

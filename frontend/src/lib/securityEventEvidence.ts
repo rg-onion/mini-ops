@@ -1,5 +1,10 @@
 import type {
     AuditSecurityEventEvidenceData,
+    FileIntegrityBaselineReenrolledEvidenceData,
+    FileIntegrityCoverageDegradedEvidenceData,
+    FileIntegrityCoverageErrorCode,
+    FileIntegrityDegradedReason,
+    FileIntegrityErrorCount,
     NotificationDeliveryErrorCode,
     NotificationDeliveryStatus,
     NotificationSecurityEventEvidenceData,
@@ -100,6 +105,40 @@ const FILE_OBSERVATION_ERRORS = new Set<SensitiveFileObservationError>([
     "changed_during_read",
     "vanished_during_scan",
     "io_error",
+]);
+const FILE_INTEGRITY_DEGRADED_REASONS = new Set<FileIntegrityDegradedReason>([
+    "coverage_unavailable",
+    "limit_exceeded",
+    "deadline_exceeded",
+    "baseline_corrupt",
+    "unsupported_algorithm",
+    "database_restore_required",
+    "internal_error",
+]);
+const HIGH_INTEGRITY_DEGRADED_REASONS = new Set<FileIntegrityDegradedReason>([
+    "baseline_corrupt",
+    "unsupported_algorithm",
+    "database_restore_required",
+    "internal_error",
+]);
+const FILE_INTEGRITY_COVERAGE_ERRORS = new Set<FileIntegrityCoverageErrorCode>([
+    "permission_denied",
+    "symlink",
+    "not_regular",
+    "file_too_large",
+    "changed_during_read",
+    "vanished_during_scan",
+    "io_error",
+    "tracked_file_limit",
+    "scan_byte_limit",
+    "deadline_exceeded",
+    "directory_unreadable",
+    "path_not_utf8",
+    "path_too_long",
+    "network_filesystem",
+    "filesystem_unclassified",
+    "untrusted_new_coverage",
+    "no_observable_targets",
 ]);
 const FIXED_FILE_PATHS = new Set([
     "/etc/passwd",
@@ -559,6 +598,101 @@ function readFileData(value: unknown): SensitiveFileChangedEvidenceData | null {
         : null;
 }
 
+function readIntegrityErrorCounts(value: unknown): FileIntegrityErrorCount[] | null {
+    if (!Array.isArray(value) || value.length > 24) return null;
+
+    const result: FileIntegrityErrorCount[] = [];
+    let previousCode: string | null = null;
+    let total = 0;
+    for (const item of value) {
+        if (!isRecord(item) || !hasExactKeys(item, ["code", "count"])) return null;
+        if (
+            typeof item.code !== "string"
+            || !FILE_INTEGRITY_COVERAGE_ERRORS.has(item.code as FileIntegrityCoverageErrorCode)
+            || !isSafeInteger(item.count, 1, 256)
+            || (previousCode !== null && previousCode >= item.code)
+        ) return null;
+
+        total += item.count;
+        if (total > 256) return null;
+        previousCode = item.code;
+        result.push({ code: item.code as FileIntegrityCoverageErrorCode, count: item.count });
+    }
+    return result;
+}
+
+function readIntegrityCoverageData(value: unknown): FileIntegrityCoverageDegradedEvidenceData | null {
+    if (!isRecord(value) || !hasExactKeys(value, [
+        "baseline_generation",
+        "degraded_reason",
+        "drift_file_count",
+        "error_counts",
+        "observation_complete",
+        "observed_at",
+        "observed_generation",
+        "state_revision",
+        "tracked_file_count",
+        "unavailable_target_count",
+    ])) return null;
+
+    const errorCounts = readIntegrityErrorCounts(value.error_counts);
+    if (
+        typeof value.degraded_reason !== "string"
+        || !FILE_INTEGRITY_DEGRADED_REASONS.has(value.degraded_reason as FileIntegrityDegradedReason)
+        || !isSafeInteger(value.state_revision, 0)
+        || !isSafeInteger(value.baseline_generation, 0)
+        || !isSafeInteger(value.observed_generation, 0)
+        || typeof value.observation_complete !== "boolean"
+        || !isTimestamp(value.observed_at)
+        || !isSafeInteger(value.tracked_file_count, 0, 256)
+        || !isSafeInteger(value.drift_file_count, 0, 256)
+        || value.drift_file_count > value.tracked_file_count
+        || !isSafeInteger(value.unavailable_target_count, 0, 256)
+        || errorCounts === null
+    ) return null;
+
+    return {
+        degraded_reason: value.degraded_reason as FileIntegrityDegradedReason,
+        state_revision: value.state_revision,
+        baseline_generation: value.baseline_generation,
+        observed_generation: value.observed_generation,
+        observation_complete: value.observation_complete,
+        observed_at: value.observed_at,
+        tracked_file_count: value.tracked_file_count,
+        drift_file_count: value.drift_file_count,
+        unavailable_target_count: value.unavailable_target_count,
+        error_counts: errorCounts,
+    };
+}
+
+function readIntegrityReenrolledData(value: unknown): FileIntegrityBaselineReenrolledEvidenceData | null {
+    if (!isRecord(value) || !hasExactKeys(value, [
+        "new_baseline_generation",
+        "observed_generation",
+        "old_baseline_generation",
+        "reason",
+        "reenrolled_at",
+        "state_revision",
+    ])) return null;
+    if (
+        value.reason !== "baseline_corrupt"
+        || !isSafeInteger(value.old_baseline_generation, 1)
+        || !isSafeInteger(value.new_baseline_generation, 1)
+        || !isSafeInteger(value.state_revision, 0)
+        || !isSafeInteger(value.observed_generation, 1)
+        || !isTimestamp(value.reenrolled_at)
+    ) return null;
+
+    return {
+        reason: "baseline_corrupt",
+        old_baseline_generation: value.old_baseline_generation,
+        new_baseline_generation: value.new_baseline_generation,
+        state_revision: value.state_revision,
+        observed_generation: value.observed_generation,
+        reenrolled_at: value.reenrolled_at,
+    };
+}
+
 function fallbackEvidence(raw: unknown, eventType: string): SecurityEventEvidence {
     const schemaVersion = isRecord(raw)
         && isSafeInteger(raw.schema_version, 1, 65_535)
@@ -628,6 +762,18 @@ export function decodeSecurityEventEvidence(raw: unknown, eventType: string): Se
             ? { schema_version: 1, kind: eventType, data, error_code: null }
             : fallbackEvidence(raw, eventType);
     }
+    if (eventType === "file.integrity_coverage_degraded") {
+        const data = readIntegrityCoverageData(raw.data);
+        return data
+            ? { schema_version: 1, kind: eventType, data, error_code: null }
+            : fallbackEvidence(raw, eventType);
+    }
+    if (eventType === "file.integrity_baseline_reenrolled") {
+        const data = readIntegrityReenrolledData(raw.data);
+        return data
+            ? { schema_version: 1, kind: eventType, data, error_code: null }
+            : fallbackEvidence(raw, eventType);
+    }
     return fallbackEvidence(raw, eventType);
 }
 
@@ -671,7 +817,7 @@ export function decodeSecurityEvent(raw: unknown): SecurityEvent | null {
         || !isNullableDeliveryErrorCode(raw.notification_delivery_error_code)
     ) return null;
 
-    return {
+    const event: SecurityEvent = {
         id: raw.id,
         event_key: raw.event_key,
         event_type: raw.event_type,
@@ -690,4 +836,52 @@ export function decodeSecurityEvent(raw: unknown): SecurityEvent | null {
         notification_delivery_updated_at: raw.notification_delivery_updated_at ?? null,
         notification_delivery_error_code: raw.notification_delivery_error_code ?? null,
     };
+    return validIntegrityEventContext(event) ? event : null;
+}
+
+function hasNoNotificationState(event: SecurityEvent): boolean {
+    return event.notification_delivery_status === null
+        && event.notification_delivery_attempts === null
+        && event.notification_delivery_updated_at === null
+        && event.notification_delivery_error_code === null;
+}
+
+function hasValidIntegrityStatusTimestamps(event: SecurityEvent): boolean {
+    if (event.status === "open") {
+        return event.acknowledged_at === null && event.resolved_at === null;
+    }
+    if (event.status === "acknowledged") {
+        return event.acknowledged_at !== null && event.resolved_at === null;
+    }
+    return event.resolved_at !== null;
+}
+
+function validIntegrityEventContext(event: SecurityEvent): boolean {
+    if (event.evidence.error_code !== null) return true;
+
+    if (event.evidence.kind === "file.sensitive_changed") {
+        return event.event_key === `file:sensitive_changed:${event.evidence.data.path_id}`
+            && event.severity === "high"
+            && hasValidIntegrityStatusTimestamps(event);
+    }
+    if (event.evidence.kind === "file.integrity_coverage_degraded") {
+        const highSeverity = HIGH_INTEGRITY_DEGRADED_REASONS.has(event.evidence.data.degraded_reason);
+        return event.event_key === "file:integrity_coverage_degraded"
+            && event.severity === (highSeverity ? "high" : "medium")
+            && hasValidIntegrityStatusTimestamps(event)
+            && hasNoNotificationState(event);
+    }
+    if (event.evidence.kind === "file.integrity_baseline_reenrolled") {
+        const timestamp = event.evidence.data.reenrolled_at;
+        return event.event_key
+                === `file:integrity_baseline_reenrolled:${event.evidence.data.state_revision}`
+            && event.severity === "info"
+            && event.status === "resolved"
+            && event.first_seen === timestamp
+            && event.last_seen === timestamp
+            && event.acknowledged_at === null
+            && event.resolved_at === timestamp
+            && hasNoNotificationState(event);
+    }
+    return true;
 }

@@ -96,6 +96,24 @@ function EvidenceSummary({ event }: { event: SecurityEvent }) {
                     })}
                 </span>
             );
+        case "file.integrity_coverage_degraded":
+            return (
+                <span>
+                    {t("security.evidence.file_integrity_coverage", {
+                        reason: t(`security.file_integrity.reason.${evidence.data.degraded_reason}`),
+                        unavailable: evidence.data.unavailable_target_count,
+                    })}
+                </span>
+            );
+        case "file.integrity_baseline_reenrolled":
+            return (
+                <span>
+                    {t("security.evidence.file_integrity_reenrolled", {
+                        oldGeneration: evidence.data.old_baseline_generation,
+                        newGeneration: evidence.data.new_baseline_generation,
+                    })}
+                </span>
+            );
     }
 }
 

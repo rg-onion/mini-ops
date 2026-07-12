@@ -57,6 +57,128 @@ export type SensitiveFileObservationError =
     | "vanished_during_scan"
     | "io_error";
 
+export type FileIntegrityStatusValue = "disabled" | "initializing" | "healthy" | "drift" | "degraded";
+
+export type FileIntegrityCoverageStatus = "disabled" | "initializing" | "full" | "degraded";
+
+export type FileIntegrityDegradedReason =
+    | "coverage_unavailable"
+    | "limit_exceeded"
+    | "deadline_exceeded"
+    | "baseline_corrupt"
+    | "unsupported_algorithm"
+    | "database_restore_required"
+    | "internal_error";
+
+export type FileIntegrityCoverageErrorCode =
+    | "permission_denied"
+    | "symlink"
+    | "not_regular"
+    | "file_too_large"
+    | "changed_during_read"
+    | "vanished_during_scan"
+    | "io_error"
+    | "tracked_file_limit"
+    | "scan_byte_limit"
+    | "deadline_exceeded"
+    | "directory_unreadable"
+    | "path_not_utf8"
+    | "path_too_long"
+    | "network_filesystem"
+    | "filesystem_unclassified"
+    | "untrusted_new_coverage"
+    | "no_observable_targets";
+
+export interface FileIntegrityErrorCount {
+    code: FileIntegrityCoverageErrorCode;
+    count: number;
+}
+
+export interface FileIntegrityCoverage {
+    status: FileIntegrityCoverageStatus;
+    unavailable_target_count: number;
+    error_counts: FileIntegrityErrorCount[];
+}
+
+export interface FileIntegrityStatus {
+    schema_version: 1;
+    status: FileIntegrityStatusValue;
+    state_revision: number | null;
+    baseline_generation: number | null;
+    observed_generation: number | null;
+    observation_complete: boolean;
+    trust_available: boolean;
+    re_enroll_available: boolean;
+    degraded_reason: FileIntegrityDegradedReason | null;
+    last_scan_at: number | null;
+    tracked_file_count: number;
+    drift_file_count: number;
+    coverage: FileIntegrityCoverage;
+}
+
+export interface FileIntegrityCoverageDegradedEvidenceData {
+    degraded_reason: FileIntegrityDegradedReason;
+    state_revision: number;
+    baseline_generation: number;
+    observed_generation: number;
+    observation_complete: boolean;
+    observed_at: number;
+    tracked_file_count: number;
+    drift_file_count: number;
+    unavailable_target_count: number;
+    error_counts: FileIntegrityErrorCount[];
+}
+
+export interface FileIntegrityBaselineReenrolledEvidenceData {
+    reason: "baseline_corrupt";
+    old_baseline_generation: number;
+    new_baseline_generation: number;
+    state_revision: number;
+    observed_generation: number;
+    reenrolled_at: number;
+}
+
+export interface FileIntegrityTrustResult {
+    result: "trusted";
+    status: "healthy";
+    state_revision: number;
+    baseline_generation: number;
+    observed_generation: number;
+    trusted_at: number;
+    resolved_event_count: number;
+}
+
+export interface FileIntegrityReenrollResult {
+    result: "reenrolled";
+    status: "healthy";
+    state_revision: number;
+    baseline_generation: number;
+    observed_generation: number;
+    reenrolled_at: number;
+    resolved_event_count: number;
+}
+
+export type FileIntegrityActionErrorCode =
+    | "invalid_request"
+    | "stale_generation"
+    | "not_initialized"
+    | "no_drift"
+    | "observation_not_trustable"
+    | "feature_disabled"
+    | "recovery_not_required"
+    | "unsupported_algorithm"
+    | "internal_error";
+
+export interface FileIntegrityActionErrorEnvelope {
+    error: {
+        code: FileIntegrityActionErrorCode;
+        status: FileIntegrityStatusValue | null;
+        state_revision: number | null;
+        baseline_generation: number | null;
+        observed_generation: number | null;
+    };
+}
+
 export type SensitiveFileCompleteEvidenceMetadata =
     | {
         state: "absent";
@@ -144,6 +266,18 @@ export type KnownSecurityEventEvidence =
         schema_version: 1;
         kind: "file.sensitive_changed";
         data: SensitiveFileChangedEvidenceData;
+        error_code: null;
+    }
+    | {
+        schema_version: 1;
+        kind: "file.integrity_coverage_degraded";
+        data: FileIntegrityCoverageDegradedEvidenceData;
+        error_code: null;
+    }
+    | {
+        schema_version: 1;
+        kind: "file.integrity_baseline_reenrolled";
+        data: FileIntegrityBaselineReenrolledEvidenceData;
         error_code: null;
     };
 

@@ -374,7 +374,7 @@ fn owned_private_regular_file(metadata: &fs::Metadata) -> bool {
     owned_regular_file(metadata) && metadata.permissions().mode() & 0o077 == 0
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

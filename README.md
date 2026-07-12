@@ -23,6 +23,7 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 - **🛡️ Security Auditor**:
   - **SSH Monitoring**: Telegram alerts on login (PAM hook).
   - **Hardening Checks**: Audits SSH config, Fail2Ban status, UFW firewall, and listening ports.
+  - **Sensitive-File Integrity**: opt-in, low-privilege drift detection with a local private baseline.
   - **Trusted IPs**: Whitelist management for secure access.
 - **📊 System Monitoring**: CPU/RAM/Disk usage + metrics history.
 - **🔔 Alerts**: Telegram alerts for CPU and disk thresholds + security state changes.
