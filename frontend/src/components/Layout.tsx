@@ -5,7 +5,7 @@ import { Button } from "./ui/button";
 import { useState, useEffect } from "react";
 import { DiskManager } from "./DiskManager";
 import { Toaster } from "sonner";
-import { apiFetch } from "@/api";
+import { apiFetch, clearAuthToken } from "@/api";
 import { useTranslation } from "react-i18next";
 
 interface LayoutProps {
@@ -30,7 +30,7 @@ export default function Layout({ children }: LayoutProps) {
     const isActive = (path: string) => location.pathname === path;
 
     const handleLogout = () => {
-        localStorage.removeItem("auth_token");
+        clearAuthToken();
         window.location.href = "/login";
     };
 
