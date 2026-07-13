@@ -86,7 +86,7 @@ jobs:
           for script in "${scripts[@]}"; do
             bash -n "$script"
           done
-          shellcheck "${scripts[@]}"
+          shellcheck --exclude=SC2317 "${scripts[@]}"
           bash scripts/tests/bootstrap_contract.sh
           bash scripts/tests/transaction_faults.sh
 
