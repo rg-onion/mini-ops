@@ -31,6 +31,26 @@ deploy_validate_port() {
     fi
 }
 
+deploy_validate_extra_listen_ip() {
+    local value="$1"
+    local octet
+    local -a octets
+
+    [[ -z "$value" ]] && return 0
+    if [[ ! "$value" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        deploy_error "DEPLOY_NGINX_EXTRA_LISTEN_IP must be a canonical IPv4 address"
+    fi
+    IFS='.' read -r -a octets <<< "$value"
+    for octet in "${octets[@]}"; do
+        if [[ ! "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || (( 10#$octet > 255 )); then
+            deploy_error "DEPLOY_NGINX_EXTRA_LISTEN_IP must be a canonical IPv4 address"
+        fi
+    done
+    if (( 10#${octets[0]} == 0 || 10#${octets[0]} == 127 || 10#${octets[0]} >= 224 )); then
+        deploy_error "DEPLOY_NGINX_EXTRA_LISTEN_IP must be a non-wildcard unicast address outside loopback"
+    fi
+}
+
 deploy_validate_user() {
     local name="$1"
     local value="$2"
@@ -112,6 +132,7 @@ deploy_validate_config() {
     deploy_validate_port "DEPLOY_SSH_PORT" "$DEPLOY_SSH_PORT"
     deploy_validate_port "DEPLOY_APP_PORT" "$DEPLOY_APP_PORT"
     deploy_validate_port "DEPLOY_NGINX_PORT" "$DEPLOY_NGINX_PORT"
+    deploy_validate_extra_listen_ip "$DEPLOY_NGINX_EXTRA_LISTEN_IP"
     deploy_validate_no_control "DEPLOY_TARGET_DIR" "$DEPLOY_TARGET_DIR"
 
     case "$DEPLOY_MODE" in
@@ -152,6 +173,12 @@ deploy_validate_config() {
     fi
     if [[ "$DEPLOY_EXPOSE_HTTP" == "1" && "$DEPLOY_SETUP_NGINX" != "1" ]]; then
         deploy_error "DEPLOY_EXPOSE_HTTP=1 requires DEPLOY_SETUP_NGINX=1; direct app exposure is unsupported"
+    fi
+    if [[ -n "$DEPLOY_NGINX_EXTRA_LISTEN_IP" && "$DEPLOY_SETUP_NGINX" != "1" ]]; then
+        deploy_error "DEPLOY_NGINX_EXTRA_LISTEN_IP requires DEPLOY_SETUP_NGINX=1"
+    fi
+    if [[ -n "$DEPLOY_NGINX_EXTRA_LISTEN_IP" && "$DEPLOY_EXPOSE_HTTP" == "1" ]]; then
+        deploy_error "DEPLOY_NGINX_EXTRA_LISTEN_IP cannot be combined with DEPLOY_EXPOSE_HTTP=1"
     fi
     if [[ "$DEPLOY_SETUP_NGINX" == "1" && "$DEPLOY_APP_PORT" == "$DEPLOY_NGINX_PORT" ]]; then
         deploy_error "DEPLOY_NGINX_PORT must differ from DEPLOY_APP_PORT"
@@ -194,6 +221,9 @@ deploy_print_warnings() {
     if [[ "$DEPLOY_EXPOSE_HTTP" == "1" ]]; then
         deploy_warning "public wildcard plain-HTTP Nginx listener explicitly enabled"
     fi
+    if [[ -n "$DEPLOY_NGINX_EXTRA_LISTEN_IP" ]]; then
+        deploy_warning "additional exact plain-HTTP Nginx listener explicitly enabled at ${DEPLOY_NGINX_EXTRA_LISTEN_IP}:${DEPLOY_NGINX_PORT}"
+    fi
     if [[ "$DEPLOY_HARDENING" == "1" ]]; then
         deploy_warning "UFW/Fail2Ban mutation explicitly enabled; the bounded rollback transaction is mandatory"
     fi
@@ -229,15 +259,19 @@ deploy_render_nginx() {
     local app_port="$1"
     local nginx_port="$2"
     local expose_http="$3"
-    local listen_address="127.0.0.1:"
+    local extra_listen_ip="${4:-}"
+    local listen_directives="    listen 127.0.0.1:${nginx_port};"
 
     if [[ "$expose_http" == "1" ]]; then
-        listen_address=""
+        listen_directives="    listen ${nginx_port};"
+    elif [[ -n "$extra_listen_ip" ]]; then
+        printf -v listen_directives '%s\n    listen %s:%s;' \
+            "$listen_directives" "$extra_listen_ip" "$nginx_port"
     fi
 
     cat <<EOF
 server {
-    listen ${listen_address}${nginx_port};
+${listen_directives}
     server_name _;
     server_tokens off;
 
@@ -282,6 +316,8 @@ deploy_print_plan() {
     if [[ "$DEPLOY_SETUP_NGINX" == "1" ]]; then
         if [[ "$DEPLOY_EXPOSE_HTTP" == "1" ]]; then
             nginx_plan="wildcard-plain-http:${DEPLOY_NGINX_PORT}"
+        elif [[ -n "$DEPLOY_NGINX_EXTRA_LISTEN_IP" ]]; then
+            nginx_plan="loopback+exact:127.0.0.1:${DEPLOY_NGINX_PORT},${DEPLOY_NGINX_EXTRA_LISTEN_IP}:${DEPLOY_NGINX_PORT}"
         else
             nginx_plan="loopback-only:127.0.0.1:${DEPLOY_NGINX_PORT}"
         fi

@@ -68,6 +68,9 @@ non-interactive. Новый host key отклоняется, если явно �
 - `DEPLOY_INSTALL_DOCKER=1` устанавливает/включает Docker;
 - `DEPLOY_ENABLE_DOCKER_INTEGRATION=1` выдаёт root-equivalent Docker group;
 - `DEPLOY_SETUP_NGINX=1` создаёт loopback listener;
+- `DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1` добавляет один exact non-wildcard
+  listener рядом с loopback, например для явно управляемого Docker edge;
+  требует `DEPLOY_SETUP_NGINX=1` и несовместим с `DEPLOY_EXPOSE_HTTP=1`;
 - `DEPLOY_EXPOSE_HTTP=1` дополнительно разрешает wildcard plain-HTTP listener;
 - `DEPLOY_ENABLE_SSH_ALERTS=1` изменяет PAM;
 - `DEPLOY_HARDENING=1` изменяет UFW и включает Fail2Ban.
@@ -77,6 +80,11 @@ SSH listener port, root-only snapshot, bounded systemd rollback timer, точн�
 проверку rules и новое независимое SSH connection перед commit. При ошибке
 восстанавливаются исходные files/state и повторно проверяется SSH. При default
 `DEPLOY_HARDENING=0` firewall остаётся неизменным.
+
+Extra listen IP должен уже существовать на host к моменту запуска Nginx. Если
+им владеет Docker-managed bridge, operator также должен упорядочить Nginx после
+Docker (например root-owned systemd drop-in). Bootstrap после restart проверяет
+exact loopback и extra sockets и отклоняет wildcard или неожиданные listeners.
 
 ## Ручная managed-systemd установка
 
