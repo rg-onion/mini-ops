@@ -20,6 +20,7 @@ DEPLOY_ENABLE_DOCKER_INTEGRATION="${DEPLOY_ENABLE_DOCKER_INTEGRATION:-0}"
 DEPLOY_SETUP_NGINX="${DEPLOY_SETUP_NGINX:-0}"
 DEPLOY_EXPOSE_HTTP="${DEPLOY_EXPOSE_HTTP:-0}"
 DEPLOY_NGINX_PORT="${DEPLOY_NGINX_PORT:-8090}"
+DEPLOY_NGINX_EXTRA_LISTEN_IP="${DEPLOY_NGINX_EXTRA_LISTEN_IP:-}"
 DEPLOY_APP_PORT="${DEPLOY_APP_PORT:-3000}"
 DEPLOY_ENABLE_SSH_ALERTS="${DEPLOY_ENABLE_SSH_ALERTS:-0}"
 DEPLOY_HARDENING="${DEPLOY_HARDENING:-0}"
@@ -567,7 +568,8 @@ chmod 0600 "$LOCAL_STAGE/mini-ops.service"
 
 if [[ "$DEPLOY_SETUP_NGINX" == "1" ]]; then
     deploy_render_nginx "$DEPLOY_APP_PORT" "$DEPLOY_NGINX_PORT" \
-        "$DEPLOY_EXPOSE_HTTP" > "$LOCAL_STAGE/mini-ops.nginx"
+        "$DEPLOY_EXPOSE_HTTP" "$DEPLOY_NGINX_EXTRA_LISTEN_IP" \
+        > "$LOCAL_STAGE/mini-ops.nginx"
     chmod 0600 "$LOCAL_STAGE/mini-ops.nginx"
 fi
 
@@ -757,7 +759,8 @@ remote_root \
     "$DEPLOY_ENABLE_DOCKER_INTEGRATION" \
     "$DEPLOY_SETUP_NGINX" \
     "$DEPLOY_NGINX_PORT" \
-    "$DEPLOY_EXPOSE_HTTP" <<'REMOTE_INSTALL'
+    "$DEPLOY_EXPOSE_HTTP" \
+    "$DEPLOY_NGINX_EXTRA_LISTEN_IP" <<'REMOTE_INSTALL'
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LC_ALL=C
@@ -773,6 +776,7 @@ DOCKER_INTEGRATION="$6"
 SETUP_NGINX="$7"
 NGINX_PORT="$8"
 EXPOSE_HTTP="$9"
+EXTRA_LISTEN_IP="${10}"
 TARGET=/opt/mini-ops
 STATE=/var/lib/mini-ops
 STATE_QUARANTINE_BASE=/var/lib/mini-ops-bootstrap
@@ -1768,17 +1772,20 @@ if [[ "$SETUP_NGINX" == 1 ]]; then
     systemctl enable nginx
     systemctl restart nginx
     systemctl is-active --quiet nginx
-    ss -H -ltn | awk -v wanted="$NGINX_PORT" -v expose="$EXPOSE_HTTP" '
+    ss -H -ltn | awk -v wanted="$NGINX_PORT" -v expose="$EXPOSE_HTTP" \
+        -v extra="$EXTRA_LISTEN_IP" '
         {
             local=$4
             sub(/^.*:/, "", local)
             if (local != wanted) next
-            if ($4 ~ /^127[.]/ || $4 ~ /^\[::1\]:/) loopback=1
-            else public=1
+            if ($4 == "127.0.0.1:" wanted) loopback=1
+            else if (extra != "" && $4 == extra ":" wanted) exact=1
+            else unexpected=1
         }
         END {
-            if (expose == 1) exit !public
-            exit !(loopback && !public)
+            if (expose == 1) exit !unexpected
+            if (extra != "") exit !(loopback && exact && !unexpected)
+            exit !(loopback && !unexpected)
         }
     '
 fi

@@ -123,6 +123,14 @@ run_invalid invalid-target DEPLOY_TARGET_DIR=/tmp/mini-ops
 assert_contains "$TMP_ROOT/invalid-target.err" 'normalized managed path /opt/mini-ops'
 run_invalid direct-exposure DEPLOY_EXPOSE_HTTP=1
 assert_contains "$TMP_ROOT/direct-exposure.err" 'requires DEPLOY_SETUP_NGINX=1'
+run_invalid extra-listener-without-nginx DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1
+assert_contains "$TMP_ROOT/extra-listener-without-nginx.err" 'requires DEPLOY_SETUP_NGINX=1'
+run_invalid invalid-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=172.017.0.1
+assert_contains "$TMP_ROOT/invalid-extra-listener.err" 'must be a canonical IPv4 address'
+run_invalid wildcard-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=0.0.0.0
+assert_contains "$TMP_ROOT/wildcard-extra-listener.err" 'must be a non-wildcard unicast address outside loopback'
+run_invalid conflicting-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_EXPOSE_HTTP=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1
+assert_contains "$TMP_ROOT/conflicting-extra-listener.err" 'cannot be combined with DEPLOY_EXPOSE_HTTP=1'
 run_invalid root-without-override DEPLOY_APP_USER=root
 assert_contains "$TMP_ROOT/root-without-override.err" 'requires DEPLOY_ALLOW_ROOT_SERVICE=1'
 run_invalid unsafe-rollback DEPLOY_UFW_ROLLBACK_SECS=0
@@ -190,7 +198,7 @@ assert_not_contains "$TMP_ROOT/default.service" 'ReadWritePaths=/opt/mini-ops'
 deploy_render_unit "$UNIT_TEMPLATE" miniops 1 > "$TMP_ROOT/docker.service"
 assert_contains "$TMP_ROOT/docker.service" 'SupplementaryGroups=docker'
 
-deploy_render_nginx 3000 8090 0 > "$TMP_ROOT/loopback.nginx"
+deploy_render_nginx 3000 8090 0 '' > "$TMP_ROOT/loopback.nginx"
 assert_contains "$TMP_ROOT/loopback.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'proxy_pass http://127.0.0.1:3000;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'server_tokens off;'
@@ -202,12 +210,17 @@ assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Permissions-Policy "camer
 assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Opener-Policy "same-origin" always;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Resource-Policy "same-origin" always;'
 assert_not_contains "$TMP_ROOT/loopback.nginx" 'Strict-Transport-Security'
-deploy_render_nginx 3000 8090 1 > "$TMP_ROOT/public.nginx"
+deploy_render_nginx 3000 8090 1 '' > "$TMP_ROOT/public.nginx"
 assert_contains "$TMP_ROOT/public.nginx" 'listen 8090;'
 assert_not_contains "$TMP_ROOT/public.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/public.nginx" "frame-ancestors 'none'"
 assert_contains "$TMP_ROOT/public.nginx" 'add_header X-Frame-Options "DENY" always;'
 assert_not_contains "$TMP_ROOT/public.nginx" 'Strict-Transport-Security'
+
+deploy_render_nginx 3000 8090 0 172.17.0.1 > "$TMP_ROOT/edge.nginx"
+assert_contains "$TMP_ROOT/edge.nginx" 'listen 127.0.0.1:8090;'
+assert_contains "$TMP_ROOT/edge.nginx" 'listen 172.17.0.1:8090;'
+assert_not_contains "$TMP_ROOT/edge.nginx" 'listen 8090;'
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     sed \

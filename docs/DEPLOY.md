@@ -68,6 +68,10 @@ Every additional mutation is separately opt-in:
 - `DEPLOY_INSTALL_DOCKER=1` installs/enables Docker;
 - `DEPLOY_ENABLE_DOCKER_INTEGRATION=1` grants the root-equivalent Docker group;
 - `DEPLOY_SETUP_NGINX=1` creates a loopback listener;
+- `DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1` adds one exact non-wildcard
+  listener alongside loopback, for example for an explicitly managed Docker
+  edge; it requires `DEPLOY_SETUP_NGINX=1` and cannot be combined with
+  `DEPLOY_EXPOSE_HTTP=1`;
 - `DEPLOY_EXPOSE_HTTP=1` additionally permits a wildcard plain-HTTP listener;
 - `DEPLOY_ENABLE_SSH_ALERTS=1` changes PAM;
 - `DEPLOY_HARDENING=1` changes UFW and enables Fail2Ban.
@@ -77,6 +81,12 @@ validated actual SSH listener port, a root-only snapshot, a bounded systemd
 rollback timer, exact post-rule checks, and a new independent SSH connection
 before commit. Failure restores the original files/state and rechecks SSH.
 Firewall configuration is unchanged when `DEPLOY_HARDENING=0` (the default).
+
+The extra listen IP must already exist on the host when Nginx starts. If a
+Docker-managed bridge owns it, the operator must also order Nginx after Docker
+(for example with a root-owned systemd drop-in). The bootstrap verifies the
+exact loopback and extra sockets after restart and rejects wildcard or
+unexpected listeners.
 
 ## Manual managed-systemd installation
 
