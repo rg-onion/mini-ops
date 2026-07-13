@@ -24,6 +24,7 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
@@ -35,7 +36,7 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -56,7 +57,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_REF^{commit}")"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
           version="${RELEASE_TAG#v}"
           test "$RELEASE_TAG" = "v${version}"
           test "$version" = "$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
