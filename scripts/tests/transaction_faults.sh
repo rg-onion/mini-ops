@@ -705,6 +705,10 @@ grep -Fq 'rollback DEGRADED' "$BOOTSTRAP" || fail 'UFW degraded rollback classif
 # shellcheck disable=SC2016
 grep -Fq 'timeout 5 pgrep -u "$app_uid"' "$BOOTSTRAP" || fail 'service-UID process fail-stop is absent'
 # shellcheck disable=SC2016
+grep -Fq 'MANAGED_TREE_PROOF_TIMEOUT_SECS=30' "$BOOTSTRAP" || fail 'managed tree proof timeout does not cover bounded procfs retries'
+# shellcheck disable=SC2016
+grep -Fq 'timeout "$MANAGED_TREE_PROOF_TIMEOUT_SECS" /bin/bash "$TX_HELPER" --assert-no-open-tree "$directory"' "$BOOTSTRAP" || fail 'managed tree proof does not use its bounded timeout'
+# shellcheck disable=SC2016
 grep -Fq 'tx_assert_existing_directory_components "$directory"' "$BOOTSTRAP" || fail 'SSH-alert ancestor proof is absent'
 # shellcheck disable=SC2016
 grep -Fq 'atomic_symlink "$(< "$SNAPSHOT/nginx-enabled-target")" "$NGINX_ENABLED"' "$BOOTSTRAP" || fail 'exact Nginx enabled-link rollback is absent'

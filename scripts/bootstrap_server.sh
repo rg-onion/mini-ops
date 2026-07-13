@@ -784,6 +784,7 @@ NGINX_SITE=/etc/nginx/sites-available/mini-ops
 NGINX_ENABLED=/etc/nginx/sites-enabled/mini-ops
 NGINX_DEFAULT=/etc/nginx/sites-enabled/default
 TX_HELPER="$STAGE/filesystem_transaction.sh"
+MANAGED_TREE_PROOF_TIMEOUT_SECS=30
 SNAPSHOT=""
 SERVICE_WAS_ACTIVE=0
 SERVICE_WAS_ENABLED=0
@@ -954,7 +955,9 @@ assert_no_open_managed_tree() {
     local status
 
     set +e
-    timeout 5 /bin/bash "$TX_HELPER" --assert-no-open-tree "$directory"
+    # A complete procfs sweep can exceed five seconds on container hosts, and
+    # the helper may take up to three fail-safe snapshots for transient races.
+    timeout "$MANAGED_TREE_PROOF_TIMEOUT_SECS" /bin/bash "$TX_HELPER" --assert-no-open-tree "$directory"
     status=$?
     set -e
     case "$status" in
