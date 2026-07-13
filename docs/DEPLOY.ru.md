@@ -5,6 +5,22 @@ entrypoints `deploy.sh` и `provision.sh` остаются выключенны�
 build, network или mutation, указывая оператору на managed bootstrap. Ниже также
 сохранена ручная managed-systemd процедура.
 
+## Tagged release archive
+
+Поддерживаемый GitHub release asset содержит prebuilt binary по пути
+`target/release/mini-ops`, tracked scripts, примеры конфигурации и публичную
+документацию. Проверьте `SHA256SUMS` и GitHub attestation по
+[RELEASING.ru.md](RELEASING.ru.md), затем оставьте локальную сборку выключенной:
+
+```bash
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  DEPLOY_RUN_LOCAL_BUILD=0 \
+  ./scripts/bootstrap_server.sh
+```
+
+Dry run остаётся обязательным до указания host или разрешения mutation.
+
 ## Managed bootstrap
 
 Начинайте с детерминированного dry run. Validation завершается до build, DNS,

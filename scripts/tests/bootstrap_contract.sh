@@ -193,9 +193,21 @@ assert_contains "$TMP_ROOT/docker.service" 'SupplementaryGroups=docker'
 deploy_render_nginx 3000 8090 0 > "$TMP_ROOT/loopback.nginx"
 assert_contains "$TMP_ROOT/loopback.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'proxy_pass http://127.0.0.1:3000;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'server_tokens off;'
+assert_contains "$TMP_ROOT/loopback.nginx" "frame-ancestors 'none'"
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header X-Content-Type-Options "nosniff" always;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header X-Frame-Options "DENY" always;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Referrer-Policy "no-referrer" always;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Permissions-Policy "camera=(), geolocation=(), microphone=(), payment=(), usb=()" always;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Opener-Policy "same-origin" always;'
+assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Resource-Policy "same-origin" always;'
+assert_not_contains "$TMP_ROOT/loopback.nginx" 'Strict-Transport-Security'
 deploy_render_nginx 3000 8090 1 > "$TMP_ROOT/public.nginx"
 assert_contains "$TMP_ROOT/public.nginx" 'listen 8090;'
 assert_not_contains "$TMP_ROOT/public.nginx" 'listen 127.0.0.1:8090;'
+assert_contains "$TMP_ROOT/public.nginx" "frame-ancestors 'none'"
+assert_contains "$TMP_ROOT/public.nginx" 'add_header X-Frame-Options "DENY" always;'
+assert_not_contains "$TMP_ROOT/public.nginx" 'Strict-Transport-Security'
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     sed \

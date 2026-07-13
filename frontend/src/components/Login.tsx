@@ -4,10 +4,12 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useTranslation } from "react-i18next";
 import { Languages } from "lucide-react";
-import { BASE_URL, clearAuthToken, getAuthHeaders } from "@/api";
+import { useNavigate } from "react-router-dom";
+import { BASE_URL, clearAuthToken, getAuthHeaders, setAuthToken } from "@/api";
 
 export default function Login() {
     const { t, i18n } = useTranslation();
+    const navigate = useNavigate();
     const [token, setToken] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [isVerifying, setIsVerifying] = useState(false);
@@ -32,8 +34,8 @@ export default function Login() {
                 return;
             }
 
-            localStorage.setItem("auth_token", nextToken);
-            window.location.href = "/";
+            setAuthToken(nextToken);
+            navigate("/", { replace: true });
         } catch {
             clearAuthToken();
             setError(t("login.verify_error"));

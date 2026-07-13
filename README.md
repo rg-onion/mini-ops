@@ -36,6 +36,10 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 
 ### 1. Installation
 
+For tagged OSS releases, download the binary archive, `SHA256SUMS`, and SBOM
+from the same GitHub Release and verify them before use. See
+[docs/RELEASING.md](docs/RELEASING.md).
+
 Use the managed bootstrap only after reviewing its zero-mutation dry run:
 
 ```bash
@@ -97,8 +101,8 @@ installation and verification commands in [docs/DEPLOY.md](docs/DEPLOY.md).
 ## 🛠 Development
 
 ### Prerequisites
-- **Rust** (latest stable)
-- **Node.js** (v20+)
+- **Rust** (`1.93.0`)
+- **Node.js** (`24.17.0`) and **npm** (`12.0.1`)
 - **Docker**
 
 ### Local Setup

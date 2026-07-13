@@ -32,6 +32,10 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 
 ### 1. Установка
 
+Для tagged OSS releases скачивайте binary archive, `SHA256SUMS` и SBOM из
+одного GitHub Release и проверяйте их перед использованием. Подробнее:
+[docs/RELEASING.ru.md](docs/RELEASING.ru.md).
+
 Используйте managed bootstrap только после zero-mutation dry run:
 
 ```bash
@@ -93,8 +97,8 @@ Shipped unit оставляет код и конфигурацию root-owned, �
 ## 🛠 Разработка
 
 ### Требования
-- **Rust** (последний stable)
-- **Node.js** (v20+)
+- **Rust** (`1.93.0`)
+- **Node.js** (`24.17.0`) и **npm** (`12.0.1`)
 - **Docker**
 
 ### Локальный запуск

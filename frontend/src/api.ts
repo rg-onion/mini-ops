@@ -1,9 +1,22 @@
 export const BASE_URL = "/api";
 const AUTH_TOKEN_KEY = "auth_token";
+let authToken: string | null = null;
+
+function clearLegacyStoredAuthToken() {
+    for (const storage of [localStorage, sessionStorage]) {
+        try {
+            storage.removeItem(AUTH_TOKEN_KEY);
+        } catch {
+            // Storage can be unavailable by browser policy; memory-only auth remains usable.
+        }
+    }
+}
+
+clearLegacyStoredAuthToken();
 
 /** Returns auth + lang headers without making a request. Use for streaming (SSE) fetch calls. */
 export function getAuthHeaders(tokenOverride?: string): Record<string, string> {
-    const token = tokenOverride ?? localStorage.getItem(AUTH_TOKEN_KEY);
+    const token = tokenOverride ?? authToken;
     const lang = localStorage.getItem("i18nextLng") || "en";
     return {
         "Accept-Language": lang,
@@ -11,8 +24,14 @@ export function getAuthHeaders(tokenOverride?: string): Record<string, string> {
     };
 }
 
+export function setAuthToken(token: string) {
+    clearLegacyStoredAuthToken();
+    authToken = token;
+}
+
 export function clearAuthToken() {
-    localStorage.removeItem(AUTH_TOKEN_KEY);
+    authToken = null;
+    clearLegacyStoredAuthToken();
 }
 
 export function handleUnauthorizedResponse(response: Response): boolean {

@@ -23,6 +23,23 @@ openssl rand -hex 32
 ### API Exposure
 Mini-Ops does not throttle all API routes itself. If the dashboard is reachable outside a trusted network, put it behind a reverse proxy, VPN, or edge service that provides TLS and request throttling.
 
+The embedded HTML applies a restrictive same-origin Content Security Policy and
+does not load third-party browser resources. The supported Nginx renderer adds
+the equivalent response CSP plus clickjacking, MIME-sniffing, referrer,
+permissions, and cross-origin isolation headers. It deliberately does not add
+HSTS because TLS termination is outside Mini-Ops. Keep the direct Axum listener
+on loopback; an external reverse proxy must preserve these headers or provide
+an equivalent policy.
+
+The dashboard keeps the bearer token only in JavaScript module memory after a
+successful login and removes the legacy `auth_token` key from both
+`localStorage` and `sessionStorage`. Reloading, closing the
+tab, or opening a new independent tab requires login again. This limits
+credential persistence but is not equivalent to an `HttpOnly` server
+session: script execution in the active page can still act with that page's
+authority, so CSP remains defense-in-depth rather than the primary control.
+CLI/API clients continue to use `Authorization: Bearer`.
+
 ### Experimental Web Source Builds
 The `POST /api/deploy/webhook` endpoint remains protected by `AUTH_TOKEN`, but
 it is disabled by default. Set `MINI_OPS_ALLOW_WEB_UPDATE=true` only when this

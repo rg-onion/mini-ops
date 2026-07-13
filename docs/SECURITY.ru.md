@@ -95,6 +95,24 @@ proxy/curlrc behavior. Повторные уведомления огранич�
 
 Mini-Ops не ограничивает частоту запросов ко всем API routes самостоятельно. Если dashboard доступен вне trusted network, используйте reverse proxy, VPN или edge-сервис с TLS и request throttling.
 
+Embedded HTML применяет строгую same-origin Content Security Policy и не
+загружает third-party browser resources. Поддерживаемый Nginx renderer добавляет
+эквивалентный response CSP, а также clickjacking, MIME-sniffing, referrer,
+permissions и cross-origin isolation headers. HSTS намеренно не добавляется,
+поскольку TLS termination находится вне Mini-Ops. Оставляйте direct Axum
+listener на loopback; внешний reverse proxy должен сохранять эти headers или
+задавать эквивалентную policy.
+
+После успешного login dashboard хранит bearer token только в памяти JavaScript
+module и удаляет legacy key `auth_token` из
+`localStorage` и `sessionStorage`. Reload, закрытие tab или
+открытие нового независимого tab требует повторного login. Это ограничивает
+persistence credential, но не эквивалентно server session с
+`HttpOnly`: script execution в активной странице всё ещё может
+действовать с её полномочиями, поэтому CSP остаётся defense-in-depth, а не
+основным control. CLI/API clients продолжают использовать
+`Authorization: Bearer`.
+
 ## Экспериментальная web-сборка исходников
 
 Endpoint `POST /api/deploy/webhook` остается защищенным через `AUTH_TOKEN`, но

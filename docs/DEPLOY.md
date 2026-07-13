@@ -5,6 +5,22 @@
 build, network, or mutation; they point operators to the managed bootstrap.
 The manual managed-systemd procedure remains available below.
 
+## Tagged release archive
+
+The supported GitHub release asset contains the prebuilt binary at
+`target/release/mini-ops` together with tracked scripts, configuration examples,
+and public documentation. Verify `SHA256SUMS` and the GitHub attestation as
+described in [RELEASING.md](RELEASING.md), then keep local compilation disabled:
+
+```bash
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  DEPLOY_RUN_LOCAL_BUILD=0 \
+  ./scripts/bootstrap_server.sh
+```
+
+The dry run remains mandatory before providing a host or authorizing mutation.
+
 ## Managed bootstrap
 
 Start with a deterministic dry run. Validation finishes before build, DNS,
