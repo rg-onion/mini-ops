@@ -3,10 +3,9 @@ import { LayoutDashboard, Box, Settings, LogOut, Terminal, History as HistoryIco
 import type { LucideIcon } from "lucide-react";
 import { Button } from "./ui/button";
 import { useState, useEffect } from "react";
-import { UpdateDialog } from "./UpdateDialog";
 import { DiskManager } from "./DiskManager";
 import { Toaster } from "sonner";
-import { apiFetch } from "@/api";
+import { apiFetch, clearAuthToken } from "@/api";
 import { useTranslation } from "react-i18next";
 
 interface LayoutProps {
@@ -22,7 +21,6 @@ interface NavItem {
 export default function Layout({ children }: LayoutProps) {
     const { t, i18n } = useTranslation();
     const location = useLocation();
-    const [showUpdateDialog, setShowUpdateDialog] = useState(false);
     const [version, setVersion] = useState<string>("...");
 
     useEffect(() => {
@@ -31,14 +29,8 @@ export default function Layout({ children }: LayoutProps) {
 
     const isActive = (path: string) => location.pathname === path;
 
-    const handleUpdate = () => {
-        if (confirm(t('common.confirm_update'))) {
-            setShowUpdateDialog(true);
-        }
-    };
-
     const handleLogout = () => {
-        localStorage.removeItem("auth_token");
+        clearAuthToken();
         window.location.href = "/login";
     };
 
@@ -91,13 +83,17 @@ export default function Layout({ children }: LayoutProps) {
                             {t('common.system')}
                         </div>
                         <DiskManager />
-                        <button
-                            onClick={handleUpdate}
-                            className="w-full flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground text-left transition-all mt-1"
+                        <div
+                            aria-disabled="true"
+                            className="mt-1 flex w-full cursor-not-allowed items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium text-muted-foreground/70"
+                            title={t('update.unavailable_detail')}
                         >
                             <Settings className="h-4 w-4" />
-                            {t('common.update_agent')}
-                        </button>
+                            {t('update.unavailable')}
+                        </div>
+                        <p className="px-3 text-[11px] leading-4 text-muted-foreground">
+                            {t('update.unavailable_detail')}
+                        </p>
                     </div>
                 </nav>
 
@@ -178,7 +174,6 @@ export default function Layout({ children }: LayoutProps) {
 
             </div>
 
-            <UpdateDialog open={showUpdateDialog} onOpenChange={setShowUpdateDialog} />
             <Toaster position="top-right" />
         </div>
     );

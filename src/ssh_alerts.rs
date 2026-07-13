@@ -1,12 +1,10 @@
-use crate::notifications::NotificationService;
+use crate::notifications::{EnqueueOutcome, NotificationOutbox, NotificationService};
 use crate::security_events::SecurityEventService;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 /// Validates that the given string is a syntactically correct IPv4 or IPv6 address.
 /// Rejects hostnames, CIDR ranges, and other arbitrary input.
@@ -51,10 +49,9 @@ pub struct SshAlertsService {
     db: SqlitePool,
     notifier: Arc<NotificationService>,
     security_events: Arc<SecurityEventService>,
+    notification_outbox: Arc<NotificationOutbox>,
     retention_days: i64,
     internal_token: Mutex<String>,
-    // IP -> last_alert_time
-    rate_limiter: Mutex<HashMap<String, Instant>>,
 }
 
 impl SshAlertsService {
@@ -62,15 +59,16 @@ impl SshAlertsService {
         db: SqlitePool,
         notifier: Arc<NotificationService>,
         security_events: Arc<SecurityEventService>,
+        notification_outbox: Arc<NotificationOutbox>,
         retention_days: i64,
     ) -> Self {
         Self {
             db,
             notifier,
             security_events,
+            notification_outbox,
             retention_days,
             internal_token: Mutex::new(String::new()),
-            rate_limiter: Mutex::new(HashMap::new()),
         }
     }
 
@@ -80,7 +78,7 @@ impl SshAlertsService {
     }
 
     /// Обрабатывает событие успешного входа по SSH.
-    /// Проверяет токен, baseline доверенных IP и применяет rate limiting к уведомлению.
+    /// Проверяет токен и baseline доверенных IP; durable outbox применяет cooldown.
     pub async fn handle_login(&self, mut event: SshLoginEvent, token: &str) -> Result<(), String> {
         {
             let t = self.internal_token.lock().unwrap();
@@ -97,68 +95,66 @@ impl SshAlertsService {
 
         let is_trusted = match self.is_trusted_ip(&event.ip).await {
             Ok(is_trusted) => is_trusted,
-            Err(e) => {
-                tracing::warn!("Failed to check trusted SSH source IP baseline: {}", e);
+            Err(_) => {
+                tracing::warn!(
+                    event_error = "database",
+                    "Failed to check trusted SSH source IP baseline"
+                );
                 false
             }
         };
 
         if is_trusted {
             tracing::info!("Skipping notification for trusted IP: {}", event.ip);
-            if let Err(e) = self
+            if self
                 .security_events
                 .resolve_ssh_source_ip_event(&event.ip)
                 .await
+                .is_err()
             {
-                tracing::warn!("Failed to resolve SSH source IP security event: {}", e);
+                tracing::warn!(
+                    event_error = "database",
+                    "Failed to resolve SSH source IP security event"
+                );
             }
             self.log_to_db(&event, false).await;
             return Ok(());
         }
 
-        let rate_limited = self.is_rate_limited(&event.ip);
-        self.log_to_db(&event, !rate_limited).await;
-        if let Err(e) = self
-            .security_events
-            .raise_ssh_source_ip_event(&event.user, &event.ip, &event.method, event.timestamp)
-            .await
-        {
-            tracing::warn!("Failed to raise SSH source IP security event: {}", e);
-        }
-
-        if rate_limited {
-            tracing::info!("Rate limiting SSH alert for IP: {}", event.ip);
-            return Ok(());
-        }
-
-        // Send Notification
         let date_str = DateTime::from_timestamp(event.timestamp, 0)
             .unwrap_or_default()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-
-        let msg_tg = format!(
-            "🔐 *SSH Login Detected*\n\n*User:* `{}`\n*IP:* `{}`\n*Method:* `{}`\n*Time:* `{}`",
-            escape_markdown_code(&event.user),
-            escape_markdown_code(&event.ip),
-            escape_markdown_code(&event.method),
-            escape_markdown_code(&date_str)
+        let message = format!(
+            "SSH Login Detected\n\nUser: {}\nIP: {}\nMethod: {}\nTime: {}",
+            event.user, event.ip, event.method, date_str
         );
-
-        self.notifier.send_alert(&msg_tg).await;
+        let rendered = self.notifier.render_alert_text(&message);
+        let notified = match self
+            .security_events
+            .raise_ssh_source_ip_event_with_notification(
+                &event.user,
+                &event.ip,
+                &event.method,
+                event.timestamp,
+                &self.notification_outbox,
+                &rendered,
+            )
+            .await
+        {
+            Ok(Some(EnqueueOutcome::Pending { .. })) => true,
+            Ok(_) => false,
+            Err(_) => {
+                tracing::warn!(
+                    event_error = "database",
+                    "Failed to persist SSH source event and notification"
+                );
+                false
+            }
+        };
+        self.log_to_db(&event, notified).await;
 
         Ok(())
-    }
-
-    fn is_rate_limited(&self, ip: &str) -> bool {
-        let mut limiter = self.rate_limiter.lock().unwrap();
-        if let Some(last) = limiter.get(ip)
-            && last.elapsed() < Duration::from_secs(10)
-        {
-            return true;
-        }
-        limiter.insert(ip.to_string(), Instant::now());
-        false
     }
 
     async fn is_trusted_ip(&self, ip: &str) -> Result<bool, sqlx::Error> {
@@ -181,7 +177,7 @@ impl SshAlertsService {
         .bind(notified)
         .execute(&self.db)
         .await
-        .map_err(|e| tracing::error!("Failed to save SSH log: {}", e));
+        .map_err(|_| tracing::error!(event_error = "database", "Failed to save SSH log"));
 
         match crate::retention::prune_ssh_logins(
             &self.db,
@@ -192,7 +188,10 @@ impl SshAlertsService {
         {
             Ok(rows) if rows > 0 => tracing::info!("Pruned {} old SSH login rows", rows),
             Ok(_) => {}
-            Err(e) => tracing::warn!("Failed to prune old SSH login rows: {}", e),
+            Err(_) => tracing::warn!(
+                event_error = "database",
+                "Failed to prune old SSH login rows"
+            ),
         }
     }
 
@@ -286,10 +285,6 @@ fn validate_bounded_field(name: &str, value: &str, max_len: usize) -> Result<(),
     Ok(())
 }
 
-fn escape_markdown_code(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('`', "\\`")
-}
-
 fn normalize_ip(ip: &str) -> Result<String, String> {
     ip.parse::<IpAddr>()
         .map(|ip| ip.to_string())
@@ -301,7 +296,9 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn test_service() -> (SshAlertsService, Arc<SecurityEventService>) {
+    async fn test_service_with_notifier(
+        notifier: NotificationService,
+    ) -> (SshAlertsService, Arc<SecurityEventService>) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -339,15 +336,20 @@ mod tests {
             .expect("security event schema should initialize");
 
         let events = Arc::new(SecurityEventService::new(pool.clone()));
-        let service = SshAlertsService::new(
-            pool,
-            Arc::new(NotificationService::disabled_for_tests()),
-            events.clone(),
-            90,
-        );
+        let notifier = Arc::new(notifier);
+        let outbox = Arc::new(NotificationOutbox::new(pool.clone(), notifier.clone()));
+        let service = SshAlertsService::new(pool, notifier, events.clone(), outbox, 90);
         service.set_token("test-token".to_string());
 
         (service, events)
+    }
+
+    async fn test_service() -> (SshAlertsService, Arc<SecurityEventService>) {
+        test_service_with_notifier(NotificationService::with_test_endpoint(
+            "123456:test",
+            "http://127.0.0.1:9".to_string(),
+        ))
+        .await
     }
 
     #[test]
@@ -409,11 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_markdown_code() {
-        assert_eq!(escape_markdown_code("a`b\\c"), "a\\`b\\\\c");
-    }
-
-    #[test]
     fn test_normalize_ip_normalizes_ipv6() {
         assert_eq!(normalize_ip("0:0:0:0:0:0:0:1").unwrap(), "::1");
     }
@@ -442,6 +439,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_delivery_is_recorded_as_not_notified() {
+        let (service, events) =
+            test_service_with_notifier(NotificationService::disabled_for_tests()).await;
+        let event = SshLoginEvent {
+            user: "root".to_string(),
+            ip: "203.0.113.25".to_string(),
+            timestamp: Utc::now().timestamp(),
+            method: "publickey".to_string(),
+        };
+
+        service.handle_login(event, "test-token").await.unwrap();
+
+        let logs = service.get_logs().await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(!logs[0].notified);
+        assert_eq!(events.list(Some("active"), 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn trusted_login_does_not_create_active_security_event() {
         let (service, events) = test_service().await;
         service
@@ -465,7 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limited_untrusted_login_still_records_history() {
+    async fn duplicate_untrusted_login_is_durably_suppressed_and_records_history() {
         let (service, events) = test_service().await;
         let first = SshLoginEvent {
             user: "root".to_string(),

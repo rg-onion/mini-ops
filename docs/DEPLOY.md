@@ -1,132 +1,183 @@
 # Deploying Mini-Ops
 
-## Recommended Path: One-Command Bootstrap (Ubuntu)
+`scripts/bootstrap_server.sh` is the supported managed installer. The legacy
+`deploy.sh` and `provision.sh` entrypoints remain disabled and exit before any
+build, network, or mutation; they point operators to the managed bootstrap.
+The manual managed-systemd procedure remains available below.
 
-The script `scripts/bootstrap_server.sh` automates:
-1. Baseline hardening (`ufw`, `fail2ban`) when `DEPLOY_HARDENING=1`
-   (default).
-2. Installing Mini-Ops as a systemd service. The default service user is `root`
-   for full VPS-control functionality.
-3. Installing/Verifying Docker (optional).
-4. Local build and binary deployment.
-5. Creating `.env` and systemd unit.
-6. Optional PAM hook setup for SSH alerts (`setup_ssh_alerts.sh`).
-7. Optional plain-HTTP Nginx reverse proxy when `DEPLOY_SETUP_NGINX=1`.
-   In `test` mode it is enabled by default; in `production` mode it is disabled
-   unless explicitly set.
+## Tagged release archive
 
-### Requirements
-1. SSH access to the server (`root` or user with `sudo`).
-2. Local: `cargo`, `npm`, `ssh`, `scp`.
-3. Server OS: Ubuntu/Debian-compatible (uses `apt`).
+The supported GitHub release asset contains the prebuilt binary at
+`target/release/mini-ops` together with tracked scripts, configuration examples,
+and public documentation. Verify `SHA256SUMS` and the GitHub attestation as
+described in [RELEASING.md](RELEASING.md), then keep local compilation disabled:
 
-### Quick Start (Test Mode, No SSL)
 ```bash
-DEPLOY_HOST=203.0.113.10 ./scripts/bootstrap_server.sh
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  DEPLOY_RUN_LOCAL_BUILD=0 \
+  ./scripts/bootstrap_server.sh
 ```
 
-With default flags, the app listens on `127.0.0.1:3000` and generated Nginx
-serves the dashboard on `http://203.0.113.10:8090`.
+The dry run remains mandatory before providing a host or authorizing mutation.
 
-### Important Variables
+## Managed bootstrap
+
+Start with a deterministic dry run. Validation finishes before build, DNS,
+SSH, package installation, or remote mutation:
+
 ```bash
-DEPLOY_HOST=203.0.113.10
-DEPLOY_SSH_USER=root
-DEPLOY_SSH_PORT=22
-DEPLOY_TARGET_DIR=/opt/mini-ops
-DEPLOY_APP_USER=root               # root|miniops
-DEPLOY_MODE=test                   # test|production
-DEPLOY_SETUP_NGINX=1               # 1|0 (default: test=1, production=0)
-DEPLOY_EXPOSE_HTTP=1               # 1|0 (default: test=1, production=0)
-DEPLOY_NGINX_PORT=8090             # external Nginx port when enabled
-DEPLOY_APP_PORT=3000               # internal app port
-DEPLOY_INSTALL_DOCKER=1            # 1|0
-DEPLOY_ENABLE_SSH_ALERTS=1         # 1|0
-DEPLOY_RUN_LOCAL_BUILD=1           # 1|0
-DEPLOY_HARDENING=1                 # 1|0 (ufw + fail2ban packages/service)
-DEPLOY_MINIMAL=0                   # 1|0 (skip user/systemd/.env changes)
-DEPLOY_WRITE_ENV=0                 # 1|0 (write .env when DEPLOY_MINIMAL=1)
-DEPLOY_SYSTEMD_ONLY=0              # 1|0 (rewrite systemd unit and restart)
-AUTH_TOKEN=<strong 32+ char token> # optional; generated if absent/empty
-TELEGRAM_BOT_TOKEN=...             # optional
-TELEGRAM_CHAT_ID=...               # optional
+DEPLOY_HOST=server.example \
+  DEPLOY_DRY_RUN=1 \
+  ./scripts/bootstrap_server.sh
 ```
 
-### Network Modes
-`DEPLOY_MODE`, `DEPLOY_SETUP_NGINX`, and `DEPLOY_EXPOSE_HTTP` decide what is
-installed and what UFW opens:
+The default plan builds from lockfiles, verifies the artifact architecture,
+uses strict existing-host-key checking, installs a non-root `miniops` service,
+binds the app to `127.0.0.1:3000`, and performs paired backup/rollback plus
+service, API, SQLite path, owner, and mode proofs. It does not install Docker or
+Nginx, expose HTTP, change UFW, add the Docker group, or write PAM.
 
-1. Default `DEPLOY_MODE=test`: writes a plain-HTTP Nginx reverse proxy on
-   `DEPLOY_NGINX_PORT` and UFW allows that port when `DEPLOY_HARDENING=1`.
-   The generated Nginx config blocks `/api/internal/*`.
-2. Default `DEPLOY_MODE=production`: does not write generated Nginx and does
-   not open an HTTP dashboard port unless you explicitly set
-   `DEPLOY_SETUP_NGINX=1` and `DEPLOY_EXPOSE_HTTP=1`.
-3. With `DEPLOY_SETUP_NGINX=0 DEPLOY_MODE=test`, UFW allows `DEPLOY_APP_PORT`
-   only when `DEPLOY_HARDENING=1` and `DEPLOY_EXPOSE_HTTP=1`.
-4. `DEPLOY_EXPOSE_HTTP=0` prevents the script from adding UFW allow rules for
-   the dashboard, but it does not replace TLS, VPN, or external firewall policy.
+For an existing managed installation, the default preserves and normalizes its
+existing root-owned `.env`:
 
-The script does not configure TLS certificates. For production, add HTTPS with
-your own Nginx/Caddy/Cloudflare Tunnel setup or restrict access to a private
-network/VPN.
-
-### Reduced Mutation Mode
 ```bash
-DEPLOY_HOST=203.0.113.10 \
-DEPLOY_HARDENING=0 \
-DEPLOY_ENABLE_SSH_ALERTS=0 \
-./scripts/bootstrap_server.sh
+DEPLOY_HOST=server.example ./scripts/bootstrap_server.sh
 ```
 
-This skips UFW/Fail2Ban hardening and the PAM hook. In test mode with default
-`DEPLOY_SETUP_NGINX=1`, the script may still install/write Nginx. Add
-`DEPLOY_SETUP_NGINX=0` to skip Nginx automation, and `DEPLOY_INSTALL_DOCKER=0`
-to skip Docker installation.
+For a fresh installation, explicitly provide a strong token and authorize the
+private environment-file write. Keep the token out of command arguments and
+unset it after the installer returns:
 
-### Minimal Mode (Binary Deployment Only)
 ```bash
-DEPLOY_HOST=203.0.113.10 \
-DEPLOY_MINIMAL=1 \
-./scripts/bootstrap_server.sh
+AUTH_TOKEN="$(openssl rand -hex 32)"
+export AUTH_TOKEN
+DEPLOY_HOST=server.example \
+  DEPLOY_WRITE_ENV=1 \
+  ./scripts/bootstrap_server.sh
+unset AUTH_TOKEN
 ```
 
-### Minimal + .env
+The remote account must be root or have passwordless `sudo`; SSH is
+non-interactive. A new host key is rejected unless
+`DEPLOY_ACCEPT_NEW_HOST_KEY=1` is explicitly selected and the learned
+fingerprint is verified out of band.
+
+Every additional mutation is separately opt-in:
+
+- `DEPLOY_INSTALL_DOCKER=1` installs/enables Docker;
+- `DEPLOY_ENABLE_DOCKER_INTEGRATION=1` grants the root-equivalent Docker group;
+- `DEPLOY_SETUP_NGINX=1` creates a loopback listener;
+- `DEPLOY_EXPOSE_HTTP=1` additionally permits a wildcard plain-HTTP listener;
+- `DEPLOY_ENABLE_SSH_ALERTS=1` changes PAM;
+- `DEPLOY_HARDENING=1` changes UFW and enables Fail2Ban.
+
+The UFW path is unsupported behind NAT/port forwarding. It requires the
+validated actual SSH listener port, a root-only snapshot, a bounded systemd
+rollback timer, exact post-rule checks, and a new independent SSH connection
+before commit. Failure restores the original files/state and rechecks SSH.
+Firewall configuration is unchanged when `DEPLOY_HARDENING=0` (the default).
+
+## Manual managed-systemd installation
+
+## Build locally
+
 ```bash
-DEPLOY_HOST=203.0.113.10 \
-DEPLOY_MINIMAL=1 \
-DEPLOY_WRITE_ENV=1 \
-AUTH_TOKEN="$(openssl rand -hex 32)" \
-./scripts/bootstrap_server.sh
+npm --prefix frontend ci
+npm --prefix frontend run build
+cargo build --release --locked
 ```
 
-### Systemd Only (Recreate Unit and Restart)
+## Prepare the server
+
+Record the local checksums, transfer the binary, unit, and SSH-alert scripts to
+an unpredictable administrator-owned `0700` staging directory, and verify the
+checksums again on the server before installation:
+
 ```bash
-DEPLOY_HOST=203.0.113.10 \
-DEPLOY_SYSTEMD_ONLY=1 \
-DEPLOY_APP_USER=root \
-DEPLOY_TARGET_DIR=/opt/mini-ops \
-./scripts/bootstrap_server.sh
+sha256sum target/release/mini-ops scripts/mini-ops.service \
+  scripts/setup_ssh_alerts.sh scripts/ssh-alert.sh
 ```
 
-### Privilege Modes
+Use your normal authenticated SSH/SCP workflow for the transfer. In the server
+commands below, `/path/to/private-upload` means that verified private staging
+directory; do not use a shared or predictable upload path.
 
-Mini-Ops is a local VPS control panel. The default `DEPLOY_APP_USER=root` mode
-is recommended when you want the full feature set: Docker control, journal
-inspection/cleanup, SSH/PAM alert setup, filesystem size checks, and richer
-security audits. Keep `APP_HOST=127.0.0.1`, use a strong `AUTH_TOKEN`, and put
-public access behind a TLS-enabled reverse proxy, tunnel, private network, or
-VPN. The default bootstrap Nginx config is plain HTTP.
+Create the service account and immutable code/config directory:
 
-You can still run a reduced installation with `DEPLOY_APP_USER=miniops`. In that
-mode some dashboard features may be restricted:
+```bash
+sudo useradd --system --home /var/lib/mini-ops --shell /usr/sbin/nologin miniops
+sudo install -d -o root -g root -m 0755 /opt/mini-ops
+sudo install -d -o root -g root -m 0755 /opt/mini-ops/scripts
+sudo install -o root -g root -m 0755 /path/to/private-upload/mini-ops \
+  /opt/mini-ops/mini-ops
+sudo install -o root -g root -m 0755 \
+  /path/to/private-upload/setup_ssh_alerts.sh \
+  /opt/mini-ops/scripts/setup_ssh_alerts.sh
+sudo install -o root -g root -m 0755 /path/to/private-upload/ssh-alert.sh \
+  /opt/mini-ops/scripts/ssh-alert.sh
+```
 
-1. **System Logs**: Reading system logs (`journalctl`) requires membership in the `systemd-journal` group or `root`.
-2. **System Cleansing**: Clearing system caches (`apt`, `journald`) is impossible without `sudo`.
-3. **Frontend Cache**: If the `node_modules` folder was created during a build by another user, cleanup might fail (although `bootstrap_server.sh` performs `chown`).
-4. **Docker**: Works correctly (user is added to the `docker` group).
+Create `/opt/mini-ops/.env` as `root:root` mode `0600`:
 
-## Legacy Scripts
+```env
+AUTH_TOKEN=
+APP_HOST=127.0.0.1
+APP_PORT=3000
+DATABASE_URL=sqlite:///var/lib/mini-ops/mini-ops.db
+MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token
+MINI_OPS_ALLOW_WEB_UPDATE=false
+MINI_OPS_ALLOW_DISK_CLEANUP=false
+```
 
-`scripts/deploy.sh` and `scripts/provision.sh` are kept for compatibility,
-but `scripts/bootstrap_server.sh` is recommended for new installations.
+Generate `AUTH_TOKEN` with `openssl rand -hex 32`. Managed startup fails if the
+token is missing, blank, weak, or a known placeholder; it never writes a state
+`.env` file.
+
+```bash
+sudo install -o root -g root -m 0600 /path/to/prepared.env /opt/mini-ops/.env
+sudo install -o root -g root -m 0644 /path/to/private-upload/mini-ops.service \
+  /etc/systemd/system/mini-ops.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mini-ops
+```
+
+The unit creates `/var/lib/mini-ops` and `/run/mini-ops` as private
+`miniops:miniops` directories. Code and `.env` remain root-owned. The service
+uses `UMask=0077`, `ProtectSystem=strict`, and `ProtectHome=true`.
+
+Verify without printing secrets:
+
+```bash
+sudo systemctl status mini-ops --no-pager -l
+sudo journalctl -u mini-ops --since "10 minutes ago" --no-pager -n 100
+sudo stat /opt/mini-ops/mini-ops /opt/mini-ops/.env \
+  /var/lib/mini-ops/mini-ops.db /run/mini-ops/internal.token
+curl --fail --silent http://127.0.0.1:3000/
+```
+
+## Optional SSH alerts
+
+PAM configuration is a separate explicit operation:
+
+```bash
+sudo env MINI_OPS_APP_USER=miniops \
+  MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token \
+  DEPLOY_APP_PORT=3000 \
+  /opt/mini-ops/scripts/setup_ssh_alerts.sh
+```
+
+The setup script does not change firewall rules. See [SSH_ALERTS.md](SSH_ALERTS.md).
+
+## Network and Docker boundaries
+
+The shipped service listens on loopback by default. Configure TLS and a reverse
+proxy, VPN, or private network separately before external exposure. The unit
+does not add the service account to the root-equivalent Docker group. Docker
+integration requires an explicit administrator override and a separate risk
+review.
+
+Existing installations that keep mutable state under `/opt/mini-ops` must not
+replace only the binary or unit with this layout. Preserve the current service
+and state until you can perform a stopped-service migration with a verified
+backup and rollback point.

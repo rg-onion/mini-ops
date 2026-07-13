@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+          package-manager-cache: false
+
+      - name: Pin npm
+        run: npm install --global npm@12.0.1
+
+      - name: Verify release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_version="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
+          frontend_version="$(node -p "require('./frontend/package.json').version")"
+          test "$rust_version" = "$frontend_version"
+          test "$(node -p "require('./frontend/package.json').private")" = "true"
+          grep -Fxq 'publish = false' Cargo.toml
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Audit complete frontend dependency graph
+        run: npm --prefix frontend audit --audit-level=moderate
+
+      - name: Lint and build frontend
+        run: |
+          npm --prefix frontend run lint
+          npm --prefix frontend run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test Rust workspace
+        run: cargo test --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --locked -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Audit Rust dependency graph
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
+          (( ${#scripts[@]} > 0 ))
+          for script in "${scripts[@]}"; do
+            bash -n "$script"
+          done
+          shellcheck --exclude=SC2317 "${scripts[@]}"
+          bash scripts/tests/bootstrap_contract.sh
+          bash scripts/tests/transaction_faults.sh
+
+      - name: Check patch whitespace
+        run: git diff --check

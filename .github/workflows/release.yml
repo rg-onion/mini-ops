@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+          package-manager-cache: false
+
+      - name: Pin npm
+        run: npm install --global npm@12.0.1
+
+      - name: Verify tag and manifest versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test "$GITHUB_REF_NAME" = "v${version}"
+          test "$version" = "$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
+          test "$version" = "$(node -p "require('./frontend/package.json').version")"
+          test "$(node -p "require('./frontend/package.json').private")" = "true"
+          grep -Fxq 'publish = false' Cargo.toml
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install and audit frontend dependencies
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend audit --audit-level=moderate
+
+      - name: Build frontend
+        run: |
+          npm --prefix frontend run lint
+          npm --prefix frontend run build
+
+      - name: Verify Rust source
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked
+          cargo clippy --locked -- -D warnings
+
+      - name: Audit Rust dependency graph
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build reproducible release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package_release.sh "${{ steps.version.outputs.version }}"
+          archive="dist/mini-ops-v${{ steps.version.outputs.version }}-linux-x86_64.tar.gz"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sbom=dist/mini-ops-v${{ steps.version.outputs.version }}-linux-x86_64.spdx.json" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          file: ${{ steps.package.outputs.archive }}
+          format: spdx-json
+          output-file: ${{ steps.package.outputs.sbom }}
+          upload-artifact: false
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      - name: Complete release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum "$(basename "${{ steps.package.outputs.sbom }}")" >> SHA256SUMS
+          sort -k2 -o SHA256SUMS SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Attest SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+          sbom-path: ${{ steps.package.outputs.sbom }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.sbom }}" \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "Mini-Ops $GITHUB_REF_NAME"

@@ -9,9 +9,13 @@ Mini-Ops включает в себя встроенную систему ауд
 ### Проверки (Checks)
 
 1.  **SSH Root Login**:
-    *   **Проверяет**: файл `/etc/ssh/sshd_config`.
+    *   **Проверяет**: bounded effective output `sshd -T -C` для отдельного
+        root context с remote TEST-NET адресами. Evaluation context сохраняется
+        в evidence и не означает перебор всех возможных `Match`-веток.
     *   **Правило**: `PermitRootLogin` не должен быть `yes`.
     *   **Риск**: Разрешает прямой вход `root` по паролю, что уязвимо для брутфорса.
+    *   **Fallback**: чтение `/etc/ssh/sshd_config` без разрешения
+        `Include`/`Match` может дать только `WARN`, но не `PASS`.
 
 2.  **Firewall (UFW)**:
     *   **Проверяет**: наличие UFW в стандартных расположениях:
@@ -25,13 +29,19 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **WARN**: UFW не найден или команда не может быть выполнена (например, из-за недостатка прав)
 
 3.  **Docker Socket**:
-    *   **Проверяет**: права доступа к `/var/run/docker.sock`.
+    *   **Проверяет**: `/var/run/docker.sock` является реальным final Unix
+        socket, а не symlink/другим типом файла, принадлежит root и имеет
+        безопасные права доступа.
     *   **Правило**: Не должен быть доступен для записи всем (`o+w`).
     *   **Риск**: Любой пользователь с доступом к сокету получает права root на хосте.
 
 4.  **Disk Encryption**:
-    *   **Проверяет**: наличие разделов типа `crypt` через `lsblk`.
-    *   **Правило**: Наличие шифрования (LUKS).
+    *   **Проверяет**: bounded JSON tree `lsblk` для фактической backing chain
+        корневой файловой системы.
+    *   **Правило**: `PASS` возможен только если в ancestry root mount есть
+        устройство типа `crypt`; отдельный зашифрованный том этого не доказывает.
+    *   **Неизвестность**: отсутствующий/неоднозначный root mount или malformed
+        output даёт `WARN`.
     *   **Риск**: Физическая кража дисков.
 
 5.  **Fail2Ban Status**:
@@ -40,44 +50,93 @@ Mini-Ops включает в себя встроенную систему ауд
     *   **Не проверяет**: состояние отдельных jail-правил.
 
 6.  **SSH Password Auth**:
-    *   **Проверяет**: файл `/etc/ssh/sshd_config`.
-    *   **Правило**: `PasswordAuthentication` должен быть установлен в `no`.
+    *   **Проверяет**: отдельный bounded non-root `sshd -T -C` context.
+    *   **Правило**: `PasswordAuthentication` и
+        `KbdInteractiveAuthentication` должны быть `no`; effective `UsePAM`
+        сохраняется в evidence.
     *   **Риск**: Вход по паролю менее безопасен, чем по SSH ключам.
 
 7.  **Listening Ports**:
     *   **Проверяет**: открытые TCP/UDP порты через `ss -H -tuln`.
+    *   **Сохраняет**: protocol, local address и
+        loopback/wildcard/non-loopback scope. Unknown или malformed output
+        всегда даёт `WARN`.
     *   **Правило**: Только ожидаемые порты `22`, `80`, `443`, `APP_PORT` (`3000` по умолчанию) и `DEPLOY_NGINX_PORT` (`8090` по умолчанию) должны быть открыты.
     *   **Риск**: Лишние открытые порты увеличивают поверхность атаки.
 
 8.  **Docker TCP API**:
-    *   **Проверяет**: открытые Docker API порты `2375`/`2376`.
+    *   **Проверяет**: TCP listeners `2375`/`2376` с учётом address scope.
+        Public/wildcard listener даёт `FAIL`, loopback-only — `WARN`, а UDP с
+        тем же номером порта не считается Docker TCP API.
     *   **Риск**: Открытый Docker API может дать контроль над хостом.
 
 9.  **Docker Container Hardening**:
-    *   **Проверяет**: container hardening risks, если Docker доступен агенту.
+    *   **Проверяет**: privileged mode; host network/PID/IPC/UTS/user/cgroup
+        namespaces; explicit capabilities и device access; sensitive host bind
+        mounts; seccomp, no-new-privileges, unconfined system paths и effective
+        AppArmor/SELinux confinement. Только closed built-in/default profile
+        facts доказывают confinement. Custom/malformed profiles, incomplete
+        inspect data и недоступное SELinux enforcement state остаются `WARN`;
+        известный Critical/High остаётся `FAIL`, даже если другие facts
+        incomplete.
     *   **Риск**: Привилегированные или опасно настроенные контейнеры расширяют blast radius.
 
 ## 🔒 SSH Security & Alerts
 
-Mini-Ops обеспечивает мониторинг SSH-подключений через PAM hook. При старте агент генерирует случайный internal token, записывает его в `MINI_OPS_INTERNAL_TOKEN_FILE`, а hook читает этот файл и отправляет localhost request в Mini-Ops API. Повторные уведомления о SSH-входах ограничиваются по source IP. Подробное описание в [SSH_ALERTS.ru.md](SSH_ALERTS.ru.md).
+Mini-Ops обеспечивает мониторинг SSH-подключений через PAM hook. При старте
+агент генерирует случайный internal token; managed mode атомарно записывает его
+в `/run/mini-ops/internal.token`, standalone mode по умолчанию использует
+`mini-ops-internal.token`. Root-owned hook выполняет bounded no-follow чтение с
+правами service account и отправляет bearer только в loopback API с отключённым
+proxy/curlrc behavior. Повторные уведомления ограничиваются по source IP.
+Подробнее: [SSH_ALERTS.ru.md](SSH_ALERTS.ru.md).
 
 ## API Exposure
 
 Mini-Ops не ограничивает частоту запросов ко всем API routes самостоятельно. Если dashboard доступен вне trusted network, используйте reverse proxy, VPN или edge-сервис с TLS и request throttling.
 
-## Web-triggered updates
+Embedded HTML применяет строгую same-origin Content Security Policy и не
+загружает third-party browser resources. Поддерживаемый Nginx renderer добавляет
+эквивалентный response CSP, а также clickjacking, MIME-sniffing, referrer,
+permissions и cross-origin isolation headers. HSTS намеренно не добавляется,
+поскольку TLS termination находится вне Mini-Ops. Оставляйте direct Axum
+listener на loopback; внешний reverse proxy должен сохранять эти headers или
+задавать эквивалентную policy.
+
+После успешного login dashboard хранит bearer token только в памяти JavaScript
+module и удаляет legacy key `auth_token` из
+`localStorage` и `sessionStorage`. Reload, закрытие tab или
+открытие нового независимого tab требует повторного login. Это ограничивает
+persistence credential, но не эквивалентно server session с
+`HttpOnly`: script execution в активной странице всё ещё может
+действовать с её полномочиями, поэтому CSP остаётся defense-in-depth, а не
+основным control. CLI/API clients продолжают использовать
+`Authorization: Bearer`.
+
+## Экспериментальная web-сборка исходников
 
 Endpoint `POST /api/deploy/webhook` остается защищенным через `AUTH_TOKEN`, но
 по умолчанию выключен. Включайте `MINI_OPS_ALLOW_WEB_UPDATE=true` только если
-этот хост должен принимать обновления из dashboard.
+этот хост должен принимать экспериментальные запросы на сборку исходников.
 
 Когда флаг включен, Mini-Ops запускает `scripts/update.sh` из локального git
 checkout. Скрипт отказывается работать вне git checkout и при tracked local
 changes, использует `git pull --ff-only`, ставит frontend dependencies из
 lockfile при наличии и собирает backend через `cargo build --release --locked`.
-Одновременно может идти только одно обновление, а `/api/deploy/logs` отдает
-последние строки update logs через SSE. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
-ограничивает runtime каждого web-triggered update (`1800` секунд по умолчанию).
+Одновременно может идти только одно обновление, а `/api/deploy/logs` передаёт
+через SSE bounded status events без raw command output. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
+ограничивает runtime каждой web-сборки (`1800` секунд по умолчанию). Успешный
+terminal state означает только завершение сборки исходников. Установка файла,
+перезапуск сервиса, health validation и rollback выполняются вручную; dashboard
+не показывает этот endpoint как готовое обновление агента.
+
+## Очистка диска
+
+Dashboard показывает использование диска, но не предлагает действий очистки.
+Server-side endpoint выключен, если не задано точное значение
+`MINI_OPS_ALLOW_DISK_CLEANUP=true`. Даже при включённом экспериментальном gate
+target `docker` всегда возвращает `403 operation_unavailable` и не может
+запустить `docker system prune -af`.
 
 ## События безопасности
 
@@ -89,7 +148,24 @@ Mini-Ops сохраняет результаты аудита безопасно
   `ssh.untrusted_source_ip`; добавление IP в доверенный список закрывает
   соответствующее событие.
 - Закрытые события хранятся `SECURITY_EVENTS_RETENTION_HOURS` часов (`168` по умолчанию).
-- Telegram-уведомления отправляются только когда failed-проверка открывается/переоткрывается и когда она закрывается.
+- Alert-worthy transition и строка Telegram delivery фиксируются одной SQLite
+  transaction. Retryable ошибки переживают restart; transition считается
+  доставленным только после HTTP `2xx` и `ok=true` от Telegram.
+- Acknowledge события не отменяет pending delivery. Delivery state использует
+  только closed error codes и не хранит bot token, chat ID, request URL или raw
+  provider response.
+- JSON security event содержит nullable `notification_delivery_status`, число
+  попыток, время обновления и закрытый error code. Внутренний transition
+  sequence наружу не выдаётся.
+- JSON security event сохраняет legacy-поле `evidence_json` и добавляет typed
+  envelope `evidence` с полями `schema_version`, `kind`, `data` и `error_code`.
+  Для valid v1 row поле `kind` точно совпадает с `event_type`, `data` содержит
+  только allowlisted поля соответствующего event kind, а `error_code` равен
+  `null`; `evidence_json` является точной JSON serialization этих data.
+  Unsupported или invalid stored evidence не возвращается raw: `data` равен
+  `null`, `error_code` равен `unsupported_schema_version` или
+  `invalid_stored_payload`, а legacy-поле содержит точную строку `{}`.
+  Projection не переписывает сохранённую row.
 
 ## Локальное хранение данных
 
@@ -119,8 +195,75 @@ Mini-Ops ограничивает локальную operational history, что
 - `SECURITY_AUDIT_DOCKER_TIMEOUT_SECS` ограничивает Docker container inspection
   во время security audit (`10` секунд по умолчанию).
 
-Если Docker inspection превышает timeout, check Docker container hardening
-возвращает `WARN` с evidence о timeout вместо блокировки всего audit.
+Docker audit использует один внутренний deadline и bounded projections: не
+более `256` containers; для каждого проверяемого container — по `256`
+capabilities, mounts и entries в каждой категории devices плюс `64` security
+options; `64` daemon security options; `128` сохранённых глобальных risk rows.
+Overflow/timeout даёт
+closed incomplete evidence, а не clean result. Риски, найденные до deadline,
+сохраняются, поэтому известный `FAIL` не понижается из-за более позднего
+timeout. Docker daemon error bodies не копируются в API responses или
+application logs.
+
+API, background monitor и optional Cloud Push используют один общий
+language-neutral single-flight snapshot аудита. Concurrent refresh-запросы
+присоединяются к одному collection, а смена языка API не запускает probes
+повторно. Body существующего `/api/security/audit` остаётся массивом; успешный
+ответ добавляет headers `X-Security-Collector-Epoch`,
+`X-Security-Generation`, `X-Security-Collected-At` и
+`X-Security-Collection-Status`. Если в bounded collection window не появился
+новый publishable snapshot, route возвращает `503` с кодом
+`security_audit_unavailable`, а не устаревший healthy result.
+
+Unknown или incomplete facts остаются видимыми как `WARN` и помечают snapshot
+как `degraded`. Cloud Push только читает snapshot и пропускает push, если он
+отсутствует, degraded или старше удвоенного audit interval: текущий security
+payload не умеет честно представить unknown values без misleading zero/healthy
+полей.
+
+## Контроль целостности sensitive files
+
+Polling целостности sensitive files — отдельный opt-in collector. Он включается
+через `SECURITY_FILE_INTEGRITY_ENABLED=true`; default — `false`. Collector
+обязан работать от непривилегированного service account. Явное включение при
+effective UID `0` fail-closed завершает startup с redacted code
+`unsupported_runtime_identity` до создания integrity tables, worker task или
+чтения файлов. Shipped managed unit работает как `miniops` и сохраняет
+`ProtectHome=true`.
+
+Начальный allowlist включает `/etc/passwd`, `/etc/group`, `/etc/sudoers`,
+`/etc/ssh/sshd_config`, `/etc/crontab` и direct children каталогов
+`/etc/sudoers.d`, `/etc/ssh/sshd_config.d`, `/etc/cron.d`,
+`/etc/cron.daily`, `/etc/cron.hourly` и `/etc/cron.weekly`. Collector не делает
+recursion, не следует symlink, не читает devices/FIFO/sockets и не обходит
+network/FUSE или unclassified filesystems. Permission denial, небезопасный тип
+файла, неизвестная файловая система, timeout или превышение лимита дают
+`degraded` coverage, но никогда clean result. Authorized keys в home/root
+намеренно не входят в эту low-privilege boundary.
+
+Первый допустимый scan создаёт локальный trust-on-first-use baseline. Contents
+обычных файлов на каждом scan потоково хешируются SHA-256; 32-byte digest
+хранится только в private SQLite integrity tables. Contents, excerpts, digests,
+symlink targets и raw OS/SQL errors не возвращаются через API и не попадают в
+security-event evidence, Telegram или Cloud Push. Drift metadata или content
+создаёт bounded event `file.sensitive_changed`. Acknowledge оставляет incident
+активным и никогда не меняет baseline.
+
+Authenticated Security page и API показывают aggregate states `disabled`,
+`initializing`, `healthy`, `drift` и `degraded`. Принятие полного current
+snapshot — отдельное подтверждаемое whole-snapshot действие с CAS baseline и
+observation generations; stale запрос получает `409`. Логическая corruption
+baseline требует отдельного подтверждаемого re-enrollment и свежего complete
+observation. Оба действия никогда не запускаются автоматически после package
+update. Структурная SQLite corruption остаётся restore-from-backup condition.
+
+`SECURITY_FILE_INTEGRITY_INTERVAL_SECS` по умолчанию равен `300` и clamp-ится в
+`60..86400`. Каждый single-flight scan ограничен `256` distinct path IDs,
+`1 MiB` на файл, `8 MiB` суммарно, streaming buffer `64 KiB` и deadline
+`15 секунд`. Current baseline/observation имеют encoded cap `256 KiB` и не
+создают per-poll history. Unchanged healthy scan не пишет SQLite. Collector не
+добавляет check в общий audit, не меняет security score и не расширяет Cloud
+Push schema.
 
 ## Baseline listening ports
 
@@ -141,8 +284,8 @@ SECURITY_ALLOWED_PUBLIC_PORTS=81,82,86
 SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
 ```
 
-Некорректные значения игнорируются и попадают в audit evidence, чтобы оператор
-мог исправить `.env`.
+Некорректные значения переводят port check в `WARN`. Evidence содержит только
+closed configuration error code и количество ошибок, но не raw env value.
 
 ## 🔔 Alerting (Оповещения)
 
@@ -163,19 +306,12 @@ TELEGRAM_CHAT_ID=ваш_id
 
 ## 🌐 Безопасность развертывания (Deployment)
 
-### Автоматизированный деплой
-Скрипт развертывания (`scripts/bootstrap_server.sh`) сейчас работает так:
+### Deployment boundary
 
-1. **Внутренняя привязка**: Mini-Ops по умолчанию слушает `127.0.0.1:3000`. Скрипт добавляет `APP_HOST=127.0.0.1` и `APP_PORT=3000` в deployed `.env`, если они отсутствуют.
-2. **Nginx automation**: в `DEPLOY_MODE=test` generated plain-HTTP Nginx включен по умолчанию на `DEPLOY_NGINX_PORT` (`8090` по умолчанию). В `DEPLOY_MODE=production` generated Nginx выключен, если явно не задан `DEPLOY_SETUP_NGINX=1`. Сгенерированный config блокирует `/api/internal/*`.
-3. **Firewall automation**: при `DEPLOY_HARDENING=1` (default) UFW разрешает OpenSSH. Dashboard ports открываются только при `DEPLOY_EXPOSE_HTTP=1` для Nginx (`DEPLOY_SETUP_NGINX=1`) или прямого test app access (`DEPLOY_SETUP_NGINX=0 DEPLOY_MODE=test`).
-4. **TLS**: bootstrap script не настраивает HTTPS certificates. Для production exposure добавьте TLS через Nginx/Caddy/Cloudflare Tunnel или ограничьте доступ private network/VPN.
-
-### Синхронизация переменных окружения (`.env`)
-Скрипт развертывания собирает временный `.env` локально и загружает его на сервер по SCP:
-
-- Если в корне проекта есть `.env`, он используется как source.
-- Если `.env` нет, используется `.env.example` как template. Когда `AUTH_TOKEN`
-  отсутствует или пустой, bootstrap генерирует сильный токен до загрузки.
-- Overrides для `AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` применяются локально до загрузки, поэтому они не передаются как remote command-line arguments.
-- Runtime defaults (`APP_HOST`, `APP_PORT`, `DEPLOY_NGINX_PORT`, `DATABASE_URL`, `MINI_OPS_INTERNAL_TOKEN_FILE`, `RUST_LOG`, `AGENT_LANG`, `SERVER_NAME`) добавляются на сервере только если отсутствуют.
+Поддерживаемый managed bootstrap проверяет детерминированный dry run до build
+или network activity. Defaults привязывают приложение к loopback, оставляют
+code/config root-owned, используют private state/runtime directories и не
+меняют firewall, public HTTP, PAM, Docker installation или root-equivalent
+Docker-group access. Каждое расширение явно opt-in; UFW option использует
+bounded rollback timer и новое SSH connection перед commit. Legacy
+`deploy.sh`/`provision.sh` остаются hard-stop. См. [DEPLOY.ru.md](DEPLOY.ru.md).

@@ -1,9 +1,7 @@
 import { useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "./ui/dialog";
-import { Button } from "./ui/button";
-import { HardDrive, Trash2, RotateCw } from "lucide-react";
+import { HardDrive, ShieldAlert } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
-import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { apiFetch } from "@/api";
 
@@ -17,32 +15,10 @@ interface DiskUsage {
 export function DiskManager() {
     const { t } = useTranslation();
     const [usage, setUsage] = useState<DiskUsage | null>(null);
-    const [cleaning, setCleaning] = useState<string | null>(null);
 
     const fetchUsage = async () => {
         const res = await apiFetch("/disk/usage");
         if (res.ok) setUsage(await res.json());
-    };
-
-    const handleClean = async (target: string) => {
-        if (!confirm(t('disk.confirm_clean', { target }))) return;
-
-        setCleaning(target);
-        try {
-            const res = await apiFetch("/disk/clean", {
-                method: "POST",
-                body: JSON.stringify({ target })
-            });
-
-            if (res.ok) {
-                toast.success(await res.text());
-                fetchUsage();
-            } else {
-                toast.error(t('common.error') + ": " + await res.text());
-            }
-        } finally {
-            setCleaning(null);
-        }
     };
 
     return (
@@ -61,7 +37,12 @@ export function DiskManager() {
                     </DialogTitle>
                 </DialogHeader>
 
-                <div className="grid grid-cols-2 gap-4 mt-4">
+                <div className="mt-4 flex gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
+                    <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{t('disk.cleanup_unavailable')}</span>
+                </div>
+
+                <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                     {/* Rust Artifacts */}
                     <Card>
                         <CardHeader className="pb-2">
@@ -69,11 +50,7 @@ export function DiskManager() {
                         </CardHeader>
                         <CardContent>
                             <div className="text-2xl font-bold">{usage?.target_size || "..."}</div>
-                            <Button variant="destructive" size="sm" className="w-full mt-4"
-                                onClick={() => handleClean("target")} disabled={!!cleaning}>
-                                {cleaning === "target" ? <RotateCw className="animate-spin h-4 w-4" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                                {t('disk.clean')}
-                            </Button>
+                            <p className="mt-4 text-xs text-muted-foreground">{t('disk.analysis_only')}</p>
                         </CardContent>
                     </Card>
 
@@ -84,11 +61,7 @@ export function DiskManager() {
                         </CardHeader>
                         <CardContent>
                             <div className="text-2xl font-bold">{usage?.node_modules_size || "..."}</div>
-                            <Button variant="destructive" size="sm" className="w-full mt-4"
-                                onClick={() => handleClean("node_modules")} disabled={!!cleaning}>
-                                {cleaning === "node_modules" ? <RotateCw className="animate-spin h-4 w-4" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                                {t('disk.clean')}
-                            </Button>
+                            <p className="mt-4 text-xs text-muted-foreground">{t('disk.analysis_only')}</p>
                         </CardContent>
                     </Card>
 
@@ -100,11 +73,9 @@ export function DiskManager() {
                         <CardContent>
                             <div className="text-2xl font-bold">{usage?.docker_size || "..."}</div>
                             <p className="text-xs text-muted-foreground mb-4">{t('disk.prune_desc')}</p>
-                            <Button variant="destructive" size="sm" className="w-full"
-                                onClick={() => handleClean("docker")} disabled={!!cleaning}>
-                                {cleaning === "docker" ? <RotateCw className="animate-spin h-4 w-4" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                                {t('disk.prune')}
-                            </Button>
+                            <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                                {t('disk.docker_unavailable')}
+                            </p>
                         </CardContent>
                     </Card>
 
@@ -115,11 +86,7 @@ export function DiskManager() {
                         </CardHeader>
                         <CardContent>
                             <div className="text-2xl font-bold">{usage?.logs_size || "..."}</div>
-                            <Button variant="secondary" size="sm" className="w-full mt-4"
-                                onClick={() => handleClean("logs")} disabled={!!cleaning}>
-                                {cleaning === "logs" ? <RotateCw className="animate-spin h-4 w-4" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                                {t('disk.vacuum')}
-                            </Button>
+                            <p className="mt-4 text-xs text-muted-foreground">{t('disk.analysis_only')}</p>
                         </CardContent>
                     </Card>
                 </div>

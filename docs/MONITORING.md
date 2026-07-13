@@ -32,10 +32,25 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 ```
 
+Both values must be non-blank. If either value is missing or whitespace-only,
+Telegram delivery is disabled. A blank `SERVER_NAME` falls back to the host
+name.
+
+Operational and security alerts use a durable SQLite outbox. Failed retryable
+deliveries survive restart and retry up to five attempts with bounded backoff.
+The queue is capped at 1000 live and 200 terminal rows; capacity pressure is
+shown as a local `notification.delivery_degraded` security event. Metric alerts
+use stable CPU/disk keys with a 30-minute cooldown rather than changing metric
+text as their identity. Provider response bodies, request URLs, tokens, and raw
+transport errors are not stored or logged.
+
 ### Testing
 You can manually test notification delivery:
 ```bash
-curl -X POST http://YOUR_SERVER_IP:8090/api/test-notification \
+curl --include --request POST http://127.0.0.1:3000/api/test-notification \
   -H "Authorization: Bearer YOUR_AUTH_TOKEN"
 ```
-If settings are correct, the bot will send a test message.
+
+This test is an immediate, non-durable attempt: HTTP `200` means Telegram
+actually returned a successful response. Disabled configuration and delivery
+failure return typed non-2xx responses and are not queued for retry.

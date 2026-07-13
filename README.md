@@ -23,10 +23,11 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 - **🛡️ Security Auditor**:
   - **SSH Monitoring**: Telegram alerts on login (PAM hook).
   - **Hardening Checks**: Audits SSH config, Fail2Ban status, UFW firewall, and listening ports.
+  - **Sensitive-File Integrity**: opt-in, low-privilege drift detection with a local private baseline.
   - **Trusted IPs**: Whitelist management for secure access.
 - **📊 System Monitoring**: CPU/RAM/Disk usage + metrics history.
 - **🔔 Alerts**: Telegram alerts for CPU and disk thresholds + security state changes.
-- **🧹 Disk Cleanup**: clean `target`, `node_modules`, Docker cache, and old journal logs.
+- **💾 Disk Analysis**: inspect build, dependency, Docker, and journal disk usage in a read-only dashboard.
 - **🌍 Localization**: Full support for English and Russian languages.
 
 ---
@@ -35,16 +36,21 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 
 ### 1. Installation
 
-Mini-Ops is designed to be built from source or deployed via an automated script.
+For tagged OSS releases, download the binary archive, `SHA256SUMS`, and SBOM
+from the same GitHub Release and verify them before use. See
+[docs/RELEASING.md](docs/RELEASING.md).
 
-#### Option A: Automated Ubuntu Bootstrap (Recommended)
-This script will build the app locally and deploy it to your server:
+Use the managed bootstrap only after reviewing its zero-mutation dry run:
+
 ```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
+DEPLOY_HOST=server.example DEPLOY_DRY_RUN=1 ./scripts/bootstrap_server.sh
 ```
 
-#### Option B: Manual Installation
-See the [Development](#-development) section below to build the binary from source.
+Defaults keep the app on loopback and leave Docker, Nginx, UFW, public HTTP,
+Docker-group access, and PAM unchanged. The legacy `deploy.sh` and
+`provision.sh` entrypoints remain hard-stopped. See the actual invocation,
+explicit mutation flags, rollback boundaries, and manual alternative in
+[docs/DEPLOY.md](docs/DEPLOY.md).
 
 ### 2. Configuration (`.env`)
 
@@ -58,8 +64,9 @@ Minimal required variable:
 AUTH_TOKEN=
 ```
 
-Leave it empty to let Mini-Ops/bootstrap generate a strong token, or generate
-one in your shell and paste the resulting value into `.env`:
+Standalone local mode can generate a token when this value is empty. Managed
+systemd mode requires a preconfigured strong token and fails fast otherwise.
+Generate one and paste it into `.env`:
 ```bash
 openssl rand -hex 32
 ```
@@ -68,85 +75,34 @@ Optional:
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
-DATABASE_URL=sqlite:mini-ops.db
+# Standalone-only override; omit it for the managed systemd service.
+# DATABASE_URL=sqlite:mini-ops.db
 SERVER_NAME=My-VPS-1
 RUST_LOG=info
 ```
 
-### 3. Run as Service
+### 3. Run as a managed service
 
-```bash
-# Create systemd service
-sudo tee /etc/systemd/system/mini-ops.service <<EOF
-[Unit]
-Description=Mini-Ops Agent
-After=network.target docker.service
-
-[Service]
-ExecStart=/usr/local/bin/mini-ops
-Restart=always
-EnvironmentFile=/path/to/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Start
-sudo systemctl enable --now mini-ops
-```
-
-With this manual service example, Mini-Ops listens on
-**http://127.0.0.1:3000** by default. Put it behind a reverse proxy or set
-`APP_HOST`/`APP_PORT` intentionally before exposing it.
-
-Automated Ubuntu bootstrap (recommended for fast demo):
-```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
-```
-Default bootstrap access: **http://your-server-ip:8090** through the generated
-plain-HTTP Nginx reverse proxy.
-
-Reduced mutation mode (skip UFW/Fail2Ban, PAM hook, Nginx, and Docker automation):
-```bash
-DEPLOY_HOST=your-server-ip \
-DEPLOY_HARDENING=0 \
-DEPLOY_ENABLE_SSH_ALERTS=0 \
-DEPLOY_SETUP_NGINX=0 \
-DEPLOY_INSTALL_DOCKER=0 \
-./scripts/bootstrap_server.sh
-```
-Minimal mode (only uploads binary, no user/systemd/.env changes):
-```bash
-DEPLOY_HOST=your-server-ip DEPLOY_MINIMAL=1 ./scripts/bootstrap_server.sh
-```
-Minimal + .env:
-```bash
-DEPLOY_HOST=your-server-ip DEPLOY_MINIMAL=1 DEPLOY_WRITE_ENV=1 AUTH_TOKEN="$(openssl rand -hex 32)" ./scripts/bootstrap_server.sh
-```
-Systemd only (rewrite unit + restart):
-```bash
-DEPLOY_HOST=your-server-ip DEPLOY_SYSTEMD_ONLY=1 DEPLOY_APP_USER=miniops DEPLOY_TARGET_DIR=/opt/mini-ops ./scripts/bootstrap_server.sh
-```
-See [docs/DEPLOY.md](docs/DEPLOY.md) for full options.
+The shipped unit keeps code/config root-owned, stores mutable state under
+`/var/lib/mini-ops`, rotates the PAM token under `/run/mini-ops`, and applies
+`UMask=0077`, `ProtectSystem=strict`, and `ProtectHome=true`. See the exact
+installation and verification commands in [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ---
 
 ## 🌐 Networking Modes
 
-- **Default bootstrap test access**: `http://server-ip:8090` via generated
-  Nginx config. This is plain HTTP and intended for lab/internal testing.
-- **Production mode**: `DEPLOY_MODE=production` does not enable the generated
-  plain-HTTP Nginx proxy unless you explicitly set `DEPLOY_SETUP_NGINX=1`.
-- **Production exposure**: add TLS with Nginx/Caddy/Cloudflare Tunnel or
-  restrict access to a private network/VPN. Do not expose `3000` directly.
+- **Default**: the application listens on `127.0.0.1:3000`.
+- **External access**: configure TLS and a reverse proxy, VPN, tunnel, or
+  private network separately. Do not expose `3000` directly.
 
 ---
 
 ## 🛠 Development
 
 ### Prerequisites
-- **Rust** (latest stable)
-- **Node.js** (v20+)
+- **Rust** (`1.93.0`)
+- **Node.js** (`24.17.0`) and **npm** (`12.0.1`)
 - **Docker**
 
 ### Local Setup
@@ -180,8 +136,11 @@ Production recommendations:
 - Put Mini-Ops behind HTTPS reverse proxy (Nginx/Caddy/Cloudflare Tunnel).
 - Avoid exposing port `8090` publicly without TLS.
 - Run service as dedicated non-root user whenever possible.
-- Keep dashboard-triggered updates disabled unless explicitly needed
-  (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default).
+- Keep the experimental web source-build endpoint disabled unless explicitly
+  needed (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default). It does not install or
+  restart the running service.
+- Disk cleanup is disabled by default and unavailable in the dashboard. Docker
+  cleanup cannot be enabled in this release.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
 

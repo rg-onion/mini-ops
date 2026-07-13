@@ -19,10 +19,11 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 - **🛡️ Аудит безопасности**:
   - **SSH Мониторинг**: Telegram уведомления при входе (PAM хук).
   - **Проверки Hardening**: Аудит конфига SSH, статуса Fail2Ban, UFW фаервола и открытых портов.
+  - **Целостность sensitive files**: opt-in low-privilege обнаружение drift с локальным private baseline.
   - **Доверенные IP**: Управление белым списком для безопасного доступа.
 - **📊 Системный мониторинг**: Загрузка CPU/RAM/Disk + история метрик.
 - **🔔 Уведомления**: Telegram алерты при превышении порогов CPU и диска + изменения статуса безопасности.
-- **🧹 Очистка диска**: очистка `target`, `node_modules`, Docker кэша и старых логов journald.
+- **💾 Анализ диска**: просмотр использования диска сборками, зависимостями, Docker и journald в режиме только для чтения.
 - **🌍 Локализация**: Полная поддержка Русского и Английского языков.
 
 ---
@@ -31,16 +32,21 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 
 ### 1. Установка
 
-Mini-Ops собирается из исходного кода или развертывается с помощью автоматического скрипта.
+Для tagged OSS releases скачивайте binary archive, `SHA256SUMS` и SBOM из
+одного GitHub Release и проверяйте их перед использованием. Подробнее:
+[docs/RELEASING.ru.md](docs/RELEASING.ru.md).
 
-#### Вариант А: Автоматическая установка (Ubuntu, рекомендуется)
-Этот скрипт соберет приложение локально и развернет его на сервере:
+Используйте managed bootstrap только после zero-mutation dry run:
+
 ```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
+DEPLOY_HOST=server.example DEPLOY_DRY_RUN=1 ./scripts/bootstrap_server.sh
 ```
 
-#### Вариант Б: Ручная сборка
-См. раздел [Разработка](#-разработка) ниже для сборки бинарного файла из исходников.
+Defaults оставляют приложение на loopback и не меняют Docker, Nginx, UFW,
+public HTTP, Docker-group access или PAM. Legacy entrypoints `deploy.sh` и
+`provision.sh` остаются hard-stop. Actual invocation, explicit mutation flags,
+rollback boundaries и ручная альтернатива описаны в
+[docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
 
 ### 2. Конфигурация (`.env`)
 
@@ -54,8 +60,9 @@ cp .env.example .env
 AUTH_TOKEN=
 ```
 
-Оставьте значение пустым, чтобы Mini-Ops/bootstrap сгенерировал сильный токен,
-или сгенерируйте токен в shell и вставьте готовое значение в `.env`:
+Standalone local mode может сгенерировать токен для пустого значения. Managed
+systemd mode требует заранее заданный сильный токен и иначе завершает startup.
+Сгенерируйте токен и вставьте его в `.env`:
 ```bash
 openssl rand -hex 32
 ```
@@ -64,65 +71,34 @@ openssl rand -hex 32
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
-DATABASE_URL=sqlite:mini-ops.db
+# Override только для standalone; не задавайте его для managed systemd service.
+# DATABASE_URL=sqlite:mini-ops.db
 SERVER_NAME=My-VPS-1
 RUST_LOG=info
 ```
 
-### 3. Запуск как сервис
+### 3. Запуск как managed service
 
-```bash
-# Создать systemd сервис
-sudo tee /etc/systemd/system/mini-ops.service <<EOF
-[Unit]
-Description=Mini-Ops Agent
-After=network.target docker.service
-
-[Service]
-ExecStart=/usr/local/bin/mini-ops
-Restart=always
-EnvironmentFile=/path/to/.env
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Запустить
-sudo systemctl enable --now mini-ops
-```
-
-В этом ручном примере Mini-Ops по умолчанию слушает
-**http://127.0.0.1:3000**. Перед внешней публикацией настройте reverse proxy
-или явно задайте `APP_HOST`/`APP_PORT`.
-
-**Автоматическая установка (Ubuntu, рекомендуется):**
-```bash
-DEPLOY_HOST=your-server-ip ./scripts/bootstrap_server.sh
-```
-Доступ при bootstrap-настройках по умолчанию:
-**http://your-server-ip:8090** через сгенерированный plain-HTTP Nginx reverse
-proxy.
-
-Подробнее см. [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
+Shipped unit оставляет код и конфигурацию root-owned, хранит mutable state в
+`/var/lib/mini-ops`, ротирует PAM token в `/run/mini-ops` и применяет
+`UMask=0077`, `ProtectSystem=strict`, `ProtectHome=true`. Exact команды
+установки и проверки находятся в [docs/DEPLOY.ru.md](docs/DEPLOY.ru.md).
 
 ---
 
 ## 🌐 Сетевые режимы
 
-- **Bootstrap test access по умолчанию**: `http://server-ip:8090` через
-  сгенерированный Nginx config. Это plain HTTP для lab/internal тестов.
-- **Production mode**: `DEPLOY_MODE=production` не включает сгенерированный
-  plain-HTTP Nginx proxy, если явно не задать `DEPLOY_SETUP_NGINX=1`.
-- **Production exposure**: добавьте TLS через Nginx/Caddy/Cloudflare Tunnel
-  или ограничьте доступ private network/VPN. Не публикуйте `3000` напрямую.
+- **По умолчанию**: приложение слушает `127.0.0.1:3000`.
+- **Внешний доступ**: отдельно настройте TLS и reverse proxy, VPN, tunnel или
+  private network. Не публикуйте `3000` напрямую.
 
 ---
 
 ## 🛠 Разработка
 
 ### Требования
-- **Rust** (последний stable)
-- **Node.js** (v20+)
+- **Rust** (`1.93.0`)
+- **Node.js** (`24.17.0`) и **npm** (`12.0.1`)
 - **Docker**
 
 ### Локальный запуск
@@ -156,8 +132,11 @@ Mini-Ops разработан с учетом безопасности:
 - Используйте HTTPS reverse proxy.
 - Не открывайте порты `3000` или `8090` публично без TLS/сетевого ограничения.
 - Запускайте сервис от отдельного пользователя (non-root).
-- Держите update из dashboard выключенным, если он явно не нужен
-  (`MINI_OPS_ALLOW_WEB_UPDATE=false` по умолчанию).
+- Держите экспериментальную web-сборку исходников выключенной, если она явно
+  не нужна (`MINI_OPS_ALLOW_WEB_UPDATE=false` по умолчанию). Она не устанавливает
+  собранный файл и не перезапускает работающий сервис.
+- Очистка диска по умолчанию выключена и недоступна в dashboard. Очистку Docker
+  нельзя включить в этой версии.
 
 Подробнее: [docs/SECURITY.ru.md](docs/SECURITY.ru.md).
 

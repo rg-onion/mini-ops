@@ -1,47 +1,110 @@
-#!/bin/bash
-# /usr/local/bin/ssh-alert.sh
-# Called by PAM on successful login/logout
-# To install: 
-# 1. Copy to /usr/local/bin/ssh-alert.sh
-# 2. chmod +x /usr/local/bin/ssh-alert.sh
-# 3. Add to /etc/pam.d/sshd: session optional pam_exec.so quiet /usr/local/bin/ssh-alert.sh
+#!/bin/bash -p
+# Called by pam_exec.so after a successful SSH session opens.
 
-# Only run on open_session (login)
-if [ "$PAM_TYPE" != "open_session" ]; then
-    exit 0
-fi
+set -u
+set +x
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
 
-USER="$PAM_USER"
-IP="$PAM_RHOST"
-SERVICE="$PAM_SERVICE"
-# PAM_TTY might be ssh, but we are in sshd config so it's implied
-# Attempt to guess method specifically? 
-# PAM doesn't easily give auth method (password vs key) in session phase without complex setup.
-# We will send "unknown" or try to infer if possible, but usually it's hard from session hook.
-METHOD="ssh" 
-TIMESTAMP=$(date +%s)
-API_URL="${MINI_OPS_API_URL:-http://127.0.0.1:3000/api/internal/ssh-login}"
-TOKEN_FILE="${MINI_OPS_INTERNAL_TOKEN_FILE:-/opt/mini-ops/mini-ops-internal.token}"
+mini_ops_send_payload() {
+    local internal_token="$1"
+    local payload="$2"
+    local api_url="$3"
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+    # curl reads the bearer header from bounded stdin config. `env -i`,
+    # `--disable`, and `--noproxy` prevent inherited proxy/curlrc behavior.
+    (
+        printf 'header = "Authorization: Bearer %s"\n' "$internal_token" |
+            /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/bin/curl --disable --config - --noproxy '*' \
+                --silent --show-error --fail \
+                --connect-timeout 1 --max-time 3 --request POST \
+                --header "Content-Type: application/json" \
+                --data-binary "$payload" "$api_url" >/dev/null 2>&1
+    ) >/dev/null 2>&1
 }
 
-# Read internal token
-INTERNAL_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null || echo "")
+# Non-root library mode exists only for the bounded local regression fixture.
+# PAM invokes this hook as root, so PAM-controlled environment cannot select it.
+if [ "${MINI_OPS_SSH_ALERT_LIBRARY_MODE:-}" = "1" ] && [ "$EUID" -ne 0 ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
-if [ -z "$INTERNAL_TOKEN" ]; then
-    # Silently fail or log to syslog
-    # logger -t ssh-alert "mini-ops internal token not found"
+if [ "${PAM_TYPE:-}" != "open_session" ]; then
     exit 0
 fi
 
-# Send to mini-ops API (background, non-blocking)
-# We use & to ensure it doesn't block login if API is slow
-curl -sS --connect-timeout 1 --max-time 3 -X POST "$API_URL" \
-    -H "Authorization: Bearer $INTERNAL_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"user\":\"$(json_escape "$USER")\",\"ip\":\"$(json_escape "$IP")\",\"method\":\"$(json_escape "$METHOD")\",\"timestamp\":$TIMESTAMP}" \
-    >> /var/log/ssh-alert.log 2>&1 &
+CONFIG_FILE="/etc/mini-ops/ssh-alert.conf"
+API_URL=""
+TOKEN_FILE=""
+TOKEN_USER=""
+TOKEN_UID=""
+TOKEN_GID=""
 
+CONFIG_METADATA="$(/usr/bin/stat -c '%F:%a:%u:%g' -- "$CONFIG_FILE" 2>/dev/null)" || exit 0
+if [ "$CONFIG_METADATA" != "regular file:600:0:0" ]; then
+    exit 0
+fi
+while IFS='=' read -r key value; do
+    case "$key" in
+        API_URL) API_URL="$value" ;;
+        TOKEN_FILE) TOKEN_FILE="$value" ;;
+        TOKEN_USER) TOKEN_USER="$value" ;;
+        TOKEN_UID) TOKEN_UID="$value" ;;
+        TOKEN_GID) TOKEN_GID="$value" ;;
+    esac
+done < "$CONFIG_FILE"
+
+if [[ ! "$API_URL" =~ ^http://127\.0\.0\.1:([0-9]{1,5})/api/internal/ssh-login$ ]]; then
+    exit 0
+fi
+API_PORT="${BASH_REMATCH[1]}"
+if (( API_PORT < 1 || API_PORT > 65535 )); then
+    exit 0
+fi
+if [[ "$TOKEN_FILE" != /* || "$TOKEN_FILE" == *[[:cntrl:]]* ]]; then
+    exit 0
+fi
+if [[ ! "$TOKEN_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+    exit 0
+fi
+if [[ ! "$TOKEN_UID" =~ ^[0-9]+$ || ! "$TOKEN_GID" =~ ^[0-9]+$ ]]; then
+    exit 0
+fi
+TOKEN_METADATA="$(/usr/bin/stat -c '%F:%a:%u:%g' -- "$TOKEN_FILE" 2>/dev/null)" || exit 0
+if [ "$TOKEN_METADATA" != "regular file:600:${TOKEN_UID}:${TOKEN_GID}" ]; then
+    exit 0
+fi
+
+INTERNAL_TOKEN="$(
+    /usr/bin/setpriv --reuid="$TOKEN_UID" --regid="$TOKEN_GID" --clear-groups \
+        /usr/bin/dd if="$TOKEN_FILE" iflag=nofollow,nonblock,count_bytes \
+        count=513 status=none 2>/dev/null
+)" || exit 0
+if [ -z "$INTERNAL_TOKEN" ] || [ "${#INTERNAL_TOKEN}" -gt 512 ]; then
+    exit 0
+fi
+case "$INTERNAL_TOKEN" in
+    *[!A-Za-z0-9._~-]*) exit 0 ;;
+esac
+
+json_escape() {
+    local value="${1:0:128}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+}
+
+USER_JSON="$(json_escape "${PAM_USER:-unknown}")"
+IP_JSON="$(json_escape "${PAM_RHOST:-unknown}")"
+TIMESTAMP="$(/usr/bin/date +%s)" || exit 0
+PAYLOAD="{\"user\":\"$USER_JSON\",\"ip\":\"$IP_JSON\",\"method\":\"ssh\",\"timestamp\":$TIMESTAMP}"
+
+mini_ops_send_payload "$INTERNAL_TOKEN" "$PAYLOAD" "$API_URL" &
+
+unset INTERNAL_TOKEN
 exit 0

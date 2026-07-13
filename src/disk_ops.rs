@@ -1,5 +1,11 @@
-use std::process::Command;
 use serde::{Deserialize, Serialize};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(300);
+const USAGE_TIMEOUT: Duration = Duration::from_secs(3);
+const USAGE_OUTPUT_CAP_BYTES: u64 = 4 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DiskUsageBreakdown {
@@ -12,11 +18,15 @@ pub struct DiskUsageBreakdown {
 pub struct DiskOps;
 
 impl DiskOps {
-    pub fn get_usage(root_dir: &str) -> DiskUsageBreakdown {
-        let target = Self::get_dir_size(&format!("{}/target", root_dir));
-        let node_modules = Self::get_dir_size(&format!("{}/frontend/node_modules", root_dir));
-        let logs = Self::get_logs_size();
-        let docker = Self::get_docker_size();
+    pub async fn get_usage(root_dir: &str) -> DiskUsageBreakdown {
+        let target_path = format!("{}/target", root_dir);
+        let node_modules_path = format!("{}/frontend/node_modules", root_dir);
+        let (target, node_modules, logs, docker) = tokio::join!(
+            Self::get_dir_size(target_path),
+            Self::get_dir_size(node_modules_path),
+            Self::get_logs_size(),
+            Self::get_dir_size("/var/lib/docker".to_string()),
+        );
 
         DiskUsageBreakdown {
             target_size: target,
@@ -26,119 +36,125 @@ impl DiskOps {
         }
     }
 
-    fn get_dir_size(path: &str) -> String {
-        let output = Command::new("du")
-            .arg("-sh")
-            .arg(path)
-            .output();
-
-        match output {
-            Ok(o) if o.status.success() => {
-                let out = String::from_utf8_lossy(&o.stdout);
-                out.split_whitespace().next().unwrap_or("0B").to_string()
-            }
-            _ => "0B".to_string(),
+    async fn get_dir_size(path: String) -> String {
+        let mut command = tokio::process::Command::new("/usr/bin/du");
+        command.args(["-sh", "--"]).arg(path);
+        match Self::run_usage_command(command).await {
+            Ok(output) => std::str::from_utf8(&output)
+                .ok()
+                .and_then(|value| value.split_whitespace().next())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Unknown")
+                .to_string(),
+            Err(()) => "Unknown".to_string(),
         }
     }
 
-    fn get_logs_size() -> String {
-         let output = Command::new("journalctl")
-            .arg("--disk-usage")
-            .output();
-         // Output format: "Archived and active journals take up 16.0M in the file system."
-         // We need to parse this. Or just use du on /var/log/journal if we have access.
-         // Let's rely on journalctl output parsing for now, or just say "Unknown".
-         
-        match output {
-            Ok(o) if o.status.success() => {
-                let out = String::from_utf8_lossy(&o.stdout);
-                // Extract size string? It's human readable text.
-                // Simple regex or split?
-                // "take up 16.0M"
-                 out.split("take up ").nth(1)
-                    .and_then(|s| s.split(" ").next())
-                    .unwrap_or("Unknown")
-                    .to_string()
-            }
-            _ => "Unknown".to_string(),
+    async fn get_logs_size() -> String {
+        let mut command = tokio::process::Command::new("/usr/bin/journalctl");
+        command.arg("--disk-usage");
+        match Self::run_usage_command(command).await {
+            Ok(output) => std::str::from_utf8(&output)
+                .ok()
+                .and_then(|value| value.split("take up ").nth(1))
+                .and_then(|value| value.split_whitespace().next())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Unknown")
+                .to_string(),
+            Err(()) => "Unknown".to_string(),
         }
     }
 
-    fn get_docker_size() -> String {
-        // docker system df --format "{{.Size}}" prints multiple lines (Images, Containers, Volumes, Build Cache)
-        // We probably want a summary or just "Total".
-        // simpler: docker system df -v ? 
-        // Let's just run `du -sh /var/lib/docker` if we are root?
-        // Since we are running as root (currently), du /var/lib/docker is accurate.
-        
-        Self::get_dir_size("/var/lib/docker")
+    async fn run_usage_command(mut command: tokio::process::Command) -> Result<Vec<u8>, ()> {
+        command
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|_| ())?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(());
+        };
+        let mut output = Vec::with_capacity(256);
+        let mut reader = stdout.take(USAGE_OUTPUT_CAP_BYTES + 1);
+
+        let result = tokio::time::timeout(USAGE_TIMEOUT, async {
+            let (read, status) = tokio::join!(reader.read_to_end(&mut output), child.wait());
+            let read = read.map_err(|_| ())?;
+            let status = status.map_err(|_| ())?;
+            if !status.success() || read as u64 > USAGE_OUTPUT_CAP_BYTES {
+                return Err(());
+            }
+            Ok(output)
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(())
+            }
+        }
     }
 
     pub async fn clean_target(root_dir: &str) -> Result<String, String> {
-        let output = Command::new("cargo")
-            .arg("clean")
-            .current_dir(root_dir)
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if output.status.success() {
-             Ok("Target cleaned (cargo clean executed).".to_string())
-        } else {
-             Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
+        let mut command = tokio::process::Command::new("cargo");
+        command.arg("clean").current_dir(root_dir);
+        Self::run_cleanup_command(command).await?;
+        Ok("Target cleaned (cargo clean executed).".to_string())
     }
 
     pub async fn clean_node_modules(root_dir: &str) -> Result<String, String> {
         let path = format!("{}/frontend/node_modules", root_dir);
-        let output = Command::new("rm")
-            .arg("-rf")
-            .arg(path)
-            .output()
-            .map_err(|e| e.to_string())?;
-            
-        if output.status.success() {
-             Ok("Node modules deleted.".to_string())
-        } else {
-             Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
+        let mut command = tokio::process::Command::new("rm");
+        command.arg("-rf").arg(path);
+        Self::run_cleanup_command(command).await?;
+        Ok("Node modules deleted.".to_string())
     }
 
-    pub async fn clean_docker() -> Result<String, String> {
-         let output = Command::new("docker")
-            .arg("system")
-            .arg("prune")
-            .arg("-af") // -a: all unused images, -f: force
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if output.status.success() {
-             let out = String::from_utf8_lossy(&output.stdout).to_string();
-             if out.trim().is_empty() {
-                 Ok("Docker Prune finished (No output).".to_string())
-             } else {
-                 Ok(out)
-             }
-        } else {
-             Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
-    }
-    
     pub async fn clean_logs() -> Result<String, String> {
-         let output = Command::new("journalctl")
-            .arg("--vacuum-time=1d")
-            .output()
-            .map_err(|e| e.to_string())?;
-
-        if output.status.success() {
-         let out = String::from_utf8_lossy(&output.stderr).to_string(); // Journalctl prints to stderr
-         if out.trim().is_empty() {
-              Ok("Logs vacuumed (No output).".to_string())
-         } else {
-              Ok(out)
-         }
-    } else {
-         Err(String::from_utf8_lossy(&output.stderr).to_string())
+        let mut command = tokio::process::Command::new("journalctl");
+        command.arg("--vacuum-time=1d");
+        Self::run_cleanup_command(command).await?;
+        Ok("Journal cleanup completed.".to_string())
     }
+
+    async fn run_cleanup_command(mut command: tokio::process::Command) -> Result<(), String> {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| "cleanup_start_failed".to_string())?;
+        let status = match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err("cleanup_wait_failed".to_string());
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err("cleanup_timed_out".to_string());
+            }
+        };
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("cleanup_command_failed".to_string())
+        }
     }
 }
 
@@ -181,5 +197,15 @@ mod tests {
         assert!(json.contains("node_modules_size"));
         assert!(json.contains("docker_size"));
         assert!(json.contains("logs_size"));
+    }
+
+    #[tokio::test]
+    async fn missing_usage_path_is_reported_as_unknown() {
+        let path = std::env::temp_dir()
+            .join(format!("mini-ops-missing-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(DiskOps::get_dir_size(path).await, "Unknown");
     }
 }
