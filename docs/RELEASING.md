@@ -31,6 +31,11 @@ Pushing the tag starts `.github/workflows/release.yml`. Do not manually replace
 assets under an existing tag. Prefer immutable GitHub Releases when the
 repository setting is available.
 
+If the tag-triggered workflow fails before publishing a release, fix the
+workflow on the default branch and retry it with `workflow_dispatch`, passing
+the existing immutable tag in the `tag` input. The retry checks out and verifies
+that tag; never move or recreate it.
+
 ## Verify a downloaded release
 
 Download the archive, SPDX SBOM, and `SHA256SUMS` from the same GitHub Release:
