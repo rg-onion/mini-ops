@@ -31,6 +31,11 @@ Push tag запускает `.github/workflows/release.yml`. Не заменяй
 существующего tag. По возможности включите immutable GitHub Releases в
 настройках репозитория.
 
+Если workflow, запущенный tag, завершился до публикации release, исправьте его
+в default branch и повторите через `workflow_dispatch`, передав существующий
+неизменяемый tag во входе `tag`. Повторный запуск checkout-ит и проверяет именно
+этот tag; не перемещайте и не пересоздавайте его.
+
 ## Проверка скачанного release
 
 Скачайте archive, SPDX SBOM и `SHA256SUMS` из одного GitHub Release:

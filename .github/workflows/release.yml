@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing immutable release tag to retry"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,12 +18,13 @@ permissions:
   artifact-metadata: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   release:
@@ -28,6 +35,7 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -47,8 +55,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          test "$GITHUB_REF_NAME" = "v${version}"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          version="${RELEASE_TAG#v}"
+          test "$RELEASE_TAG" = "v${version}"
           test "$version" = "$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
           test "$version" = "$(node -p "require('./frontend/package.json').version")"
           test "$(node -p "require('./frontend/package.json').private")" = "true"
@@ -73,6 +83,8 @@ jobs:
 
       - name: Audit Rust dependency graph
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -82,7 +94,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/package_release.sh "${{ steps.version.outputs.version }}"
+          GITHUB_REF_NAME="$RELEASE_TAG" \
+            ./scripts/package_release.sh "${{ steps.version.outputs.version }}"
           archive="dist/mini-ops-v${{ steps.version.outputs.version }}-linux-x86_64.tar.gz"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "sbom=dist/mini-ops-v${{ steps.version.outputs.version }}-linux-x86_64.spdx.json" >> "$GITHUB_OUTPUT"
@@ -122,10 +135,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             "${{ steps.package.outputs.archive }}" \
             "${{ steps.package.outputs.sbom }}" \
             dist/SHA256SUMS \
             --verify-tag \
             --generate-notes \
-            --title "Mini-Ops $GITHUB_REF_NAME"
+            --title "Mini-Ops $RELEASE_TAG"
