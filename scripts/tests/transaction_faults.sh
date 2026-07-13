@@ -100,6 +100,11 @@ set +e
 tree_status=$?
 set -e
 [[ "$tree_status" == 42 ]] || fail 'open state-directory descriptor was not detected'
+set +e
+tx_assert_no_open_tree_bounded "$TREE_PROBE" "pid:$TREE_PID:$UID_NOW" /proc
+bounded_tree_status=$?
+set -e
+[[ "$bounded_tree_status" == 42 ]] || fail 'bounded tree probe did not preserve an observed open reference'
 touch "$TREE_RELEASE"
 wait "$TREE_PID"
 
@@ -144,8 +149,15 @@ set +e
 tx_assert_no_open_tree "$TREE_PROBE" "$UID_NOW" "$FAKE_PROC"
 fake_proc_status=$?
 set -e
-chmod 0600 "$FAKE_PROC/4242/maps"
 [[ "$fake_proc_status" == 43 ]] || fail 'unreadable relevant process maps did not fail as ambiguous'
+(
+    sleep 0.08
+    chmod 0600 "$FAKE_PROC/4242/maps"
+) &
+FAKE_PROC_RECOVERY_PID=$!
+tx_assert_no_open_tree_bounded "$TREE_PROBE" "$UID_NOW" "$FAKE_PROC" ||
+    fail 'bounded tree probe did not recover from a transient ambiguous procfs snapshot'
+wait "$FAKE_PROC_RECOVERY_PID"
 
 FAKE_KTHREAD_PROC="$TMP_ROOT/fake-kthread-proc"
 mkdir -p "$FAKE_KTHREAD_PROC/7"

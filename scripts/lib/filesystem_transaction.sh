@@ -302,6 +302,31 @@ tx_assert_no_open_tree() {
     return 0
 }
 
+tx_assert_no_open_tree_bounded() {
+    local root="$1"
+    local wanted_uid="$2"
+    local proc_root="${3:-/proc}"
+    local attempt
+    local status
+
+    for attempt in 1 2 3; do
+        if tx_assert_no_open_tree "$root" "$wanted_uid" "$proc_root"; then
+            return 0
+        else
+            status=$?
+        fi
+        case "$status" in
+            42) return 42 ;;
+            43)
+                [[ "$attempt" == 3 ]] && return 43
+                sleep 0.05
+                ;;
+            *) return "$status" ;;
+        esac
+    done
+    return 43
+}
+
 tx_resolve_managed_database_url() {
     local configured="$1"
     local basename
@@ -349,7 +374,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             (( $# == 1 )) || exit 2
             # The privileged installer requires a stable stopped-writer view,
             # so even trusted root maintenance processes are scanned strictly.
-            tx_assert_no_open_tree "$1" all
+            # Procfs enumeration can race with process exit; retry only the
+            # explicit ambiguous result and never an observed open reference.
+            tx_assert_no_open_tree_bounded "$1" all
             ;;
         --assert-no-open-tree-for-uid)
             shift
