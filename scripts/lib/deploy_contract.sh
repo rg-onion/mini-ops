@@ -259,7 +259,7 @@ deploy_render_nginx() {
     local app_port="$1"
     local nginx_port="$2"
     local expose_http="$3"
-    local extra_listen_ip="$4"
+    local extra_listen_ip="${4:-}"
     local listen_directives="    listen 127.0.0.1:${nginx_port};"
 
     if [[ "$expose_http" == "1" ]]; then

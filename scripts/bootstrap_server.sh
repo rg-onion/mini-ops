@@ -776,7 +776,7 @@ DOCKER_INTEGRATION="$6"
 SETUP_NGINX="$7"
 NGINX_PORT="$8"
 EXPOSE_HTTP="$9"
-EXTRA_LISTEN_IP="${10}"
+EXTRA_LISTEN_IP="${10:-}"
 TARGET=/opt/mini-ops
 STATE=/var/lib/mini-ops
 STATE_QUARANTINE_BASE=/var/lib/mini-ops-bootstrap
@@ -1259,14 +1259,13 @@ rollback_on_exit() {
             else
                 rm -f -- "$NGINX_DEFAULT"
             fi
-            nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
             if [[ "$NGINX_WAS_ENABLED" == 1 ]]; then
                 systemctl enable nginx >/dev/null 2>&1
             else
                 systemctl disable nginx >/dev/null 2>&1
             fi
             if [[ "$NGINX_WAS_ACTIVE" == 1 ]]; then
-                systemctl start nginx >/dev/null 2>&1
+                nginx -t >/dev/null 2>&1 && systemctl restart nginx >/dev/null 2>&1
             else
                 systemctl stop nginx >/dev/null 2>&1
             fi

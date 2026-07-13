@@ -84,6 +84,10 @@ run_dry no-local-build DEPLOY_RUN_LOCAL_BUILD=0
 assert_contains "$TMP_ROOT/no-local-build.out" 'build=existing-release-artifact:no-local-build'
 assert_not_contains "$TMP_ROOT/no-local-build.out" 'build=frontend:npm-ci'
 
+run_dry exact-nginx-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1
+assert_contains "$TMP_ROOT/exact-nginx-listener.out" 'nginx=loopback+exact:127.0.0.1:8090,172.17.0.1:8090'
+assert_contains "$TMP_ROOT/exact-nginx-listener.err" 'additional exact plain-HTTP Nginx listener explicitly enabled at 172.17.0.1:8090'
+
 run_dry nonstandard DEPLOY_SSH_PORT=2222 DEPLOY_HARDENING=1 DEPLOY_UFW_ROLLBACK_SECS=240
 assert_contains "$TMP_ROOT/nonstandard.out" 'remote=root@192.0.2.10:2222'
 assert_contains "$TMP_ROOT/nonstandard.out" 'firewall=ufw-transaction:ss-port=2222,rollback=240s,fail2ban=enable'
@@ -129,6 +133,10 @@ run_invalid invalid-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTE
 assert_contains "$TMP_ROOT/invalid-extra-listener.err" 'must be a canonical IPv4 address'
 run_invalid wildcard-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=0.0.0.0
 assert_contains "$TMP_ROOT/wildcard-extra-listener.err" 'must be a non-wildcard unicast address outside loopback'
+run_invalid loopback-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=127.0.0.1
+assert_contains "$TMP_ROOT/loopback-extra-listener.err" 'must be a non-wildcard unicast address outside loopback'
+run_invalid injected-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP='172.17.0.1;listen 80'
+assert_contains "$TMP_ROOT/injected-extra-listener.err" 'must be a canonical IPv4 address'
 run_invalid conflicting-extra-listener DEPLOY_SETUP_NGINX=1 DEPLOY_EXPOSE_HTTP=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1
 assert_contains "$TMP_ROOT/conflicting-extra-listener.err" 'cannot be combined with DEPLOY_EXPOSE_HTTP=1'
 run_invalid root-without-override DEPLOY_APP_USER=root
@@ -198,7 +206,7 @@ assert_not_contains "$TMP_ROOT/default.service" 'ReadWritePaths=/opt/mini-ops'
 deploy_render_unit "$UNIT_TEMPLATE" miniops 1 > "$TMP_ROOT/docker.service"
 assert_contains "$TMP_ROOT/docker.service" 'SupplementaryGroups=docker'
 
-deploy_render_nginx 3000 8090 0 '' > "$TMP_ROOT/loopback.nginx"
+deploy_render_nginx 3000 8090 0 > "$TMP_ROOT/loopback.nginx"
 assert_contains "$TMP_ROOT/loopback.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'proxy_pass http://127.0.0.1:3000;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'server_tokens off;'
@@ -210,7 +218,7 @@ assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Permissions-Policy "camer
 assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Opener-Policy "same-origin" always;'
 assert_contains "$TMP_ROOT/loopback.nginx" 'add_header Cross-Origin-Resource-Policy "same-origin" always;'
 assert_not_contains "$TMP_ROOT/loopback.nginx" 'Strict-Transport-Security'
-deploy_render_nginx 3000 8090 1 '' > "$TMP_ROOT/public.nginx"
+deploy_render_nginx 3000 8090 1 > "$TMP_ROOT/public.nginx"
 assert_contains "$TMP_ROOT/public.nginx" 'listen 8090;'
 assert_not_contains "$TMP_ROOT/public.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/public.nginx" "frame-ancestors 'none'"
@@ -221,6 +229,10 @@ deploy_render_nginx 3000 8090 0 172.17.0.1 > "$TMP_ROOT/edge.nginx"
 assert_contains "$TMP_ROOT/edge.nginx" 'listen 127.0.0.1:8090;'
 assert_contains "$TMP_ROOT/edge.nginx" 'listen 172.17.0.1:8090;'
 assert_not_contains "$TMP_ROOT/edge.nginx" 'listen 8090;'
+# shellcheck disable=SC2016
+assert_contains "$BOOTSTRAP" 'EXTRA_LISTEN_IP="${10:-}"'
+assert_contains "$BOOTSTRAP" 'nginx -t >/dev/null 2>&1 && systemctl restart nginx >/dev/null 2>&1'
+assert_not_contains "$BOOTSTRAP" 'systemctl reload nginx'
 
 if command -v systemd-analyze >/dev/null 2>&1; then
     sed \
