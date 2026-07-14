@@ -1,11 +1,13 @@
 use crate::certificate_probe::{
-    CertificateBatchError, CertificateObservation, CertificateProbe, CertificateProbeInitError,
-    CertificateTarget, CertificateTargetsConfig, ExpiryStatus, HostnameStatus, MAX_CONCURRENCY,
-    MAX_CONFIG_BYTES, MAX_TARGETS, ReachabilityStatus, TrustStatus, parse_targets_config,
+    CertificateBatchError, CertificateObservation, CertificateProbe, CertificateProbeErrorCode,
+    CertificateProbeInitError, CertificateTarget, CertificateTargetsConfig, ExpiryStatus,
+    HostnameStatus, MAX_CONCURRENCY, MAX_CONFIG_BYTES, MAX_TARGETS, ReachabilityStatus,
+    TrustStatus, parse_targets_config,
 };
 use crate::notifications::{NotificationOutbox, NotificationService};
 use crate::security::SecurityCheck;
 use crate::security_events::SecurityEventService;
+use serde::Serialize;
 use sqlx::{Row, SqlitePool, Transaction};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -18,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 const ENABLED_ENV: &str = "SECURITY_CERTIFICATE_MONITOR_ENABLED";
 const TARGETS_FILE_ENV: &str = "SECURITY_CERTIFICATE_TARGETS_FILE";
@@ -29,6 +32,9 @@ const MIN_INTERVAL_SECS: u64 = 300;
 const MAX_INTERVAL_SECS: u64 = 86_400;
 const DEFAULT_CONCURRENCY: usize = 4;
 const MAX_PATH_BYTES: usize = 4096;
+#[cfg(test)]
+const MAX_API_RESPONSE_BYTES: usize = 64 * 1024;
+pub(crate) const MANUAL_REFRESH_COOLDOWN_SECS: u64 = 60;
 
 const CURRENT_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS certificate_current (
@@ -271,11 +277,112 @@ impl fmt::Display for CertificateMonitorInitError {
 
 impl std::error::Error for CertificateMonitorInitError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CertificateMonitorState {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CertificateCurrentObservation {
+    pub(crate) schema_version: u64,
+    pub(crate) checked_at: i64,
+    pub(crate) duration_ms: u64,
+    pub(crate) last_success_at: Option<i64>,
+    pub(crate) reachability: ReachabilityStatus,
+    pub(crate) trust: TrustStatus,
+    pub(crate) hostname: HostnameStatus,
+    pub(crate) expiry: ExpiryStatus,
+    pub(crate) not_before: Option<i64>,
+    pub(crate) not_after: Option<i64>,
+    pub(crate) remaining_seconds: Option<i64>,
+    pub(crate) error_code: Option<CertificateProbeErrorCode>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CertificateTargetStatus {
+    pub(crate) target_id: String,
+    pub(crate) label: String,
+    pub(crate) connect_host: String,
+    pub(crate) port: u16,
+    pub(crate) server_name: String,
+    pub(crate) observation: Option<CertificateCurrentObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CertificateMonitorStatus {
+    pub(crate) schema_version: u64,
+    pub(crate) status: CertificateMonitorState,
+    pub(crate) interval_seconds: Option<u64>,
+    pub(crate) refresh_cooldown_seconds: u64,
+    pub(crate) earliest_expiry_at: Option<i64>,
+    pub(crate) targets: Vec<CertificateTargetStatus>,
+}
+
+impl CertificateMonitorStatus {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            schema_version: 1,
+            status: CertificateMonitorState::Disabled,
+            interval_seconds: None,
+            refresh_cooldown_seconds: MANUAL_REFRESH_COOLDOWN_SECS,
+            earliest_expiry_at: None,
+            targets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct CertificateRefreshResult {
+    pub(crate) schema_version: u64,
+    pub(crate) result: &'static str,
+    pub(crate) target: CertificateTargetStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CertificateRefreshError {
+    TargetNotFound,
+    Busy,
+    Cooldown { retry_after_seconds: u64 },
+    Database,
+}
+
+impl CertificateRefreshError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::TargetNotFound => "certificate_target_not_found",
+            Self::Busy => "certificate_refresh_busy",
+            Self::Cooldown { .. } => "certificate_refresh_cooldown",
+            Self::Database => "certificate_monitor_unavailable",
+        }
+    }
+
+    pub(crate) const fn retry_after_seconds(self) -> Option<u64> {
+        match self {
+            Self::Cooldown {
+                retry_after_seconds,
+            } => Some(retry_after_seconds),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CertificateStorage {
     db: SqlitePool,
     outbox: Arc<NotificationOutbox>,
     notifier: Arc<NotificationService>,
+}
+
+struct StoredCertificateRow {
+    target_id: String,
+    label: String,
+    connect_host: String,
+    port: u16,
+    server_name: String,
+    trust_profile: String,
+    observation: CertificateCurrentObservation,
 }
 
 impl CertificateStorage {
@@ -317,6 +424,111 @@ impl CertificateStorage {
                 .await?;
         }
         transaction.commit().await
+    }
+
+    async fn publish_one(
+        &self,
+        target: &CertificateTarget,
+        observation: &CertificateObservation,
+    ) -> Result<(), sqlx::Error> {
+        if target.id != observation.target_id {
+            return Err(invalid_certificate_state());
+        }
+        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        upsert_current(&mut transaction, target, observation).await?;
+        self.apply_observation(&mut transaction, observation)
+            .await?;
+        transaction.commit().await
+    }
+
+    async fn read_targets(
+        &self,
+        targets: &[CertificateTarget],
+    ) -> Result<Vec<CertificateTargetStatus>, sqlx::Error> {
+        if targets.is_empty() || targets.len() > MAX_TARGETS {
+            return Err(invalid_certificate_state());
+        }
+        let rows = sqlx::query(
+            "SELECT target_id, label, connect_host, port, server_name, trust_profile,
+                    schema_version, checked_at, duration_ms, last_success_at,
+                    reachability, trust, hostname, expiry, not_before, not_after,
+                    remaining_seconds, error_code
+             FROM certificate_current
+             ORDER BY target_id
+             LIMIT ?",
+        )
+        .bind((MAX_TARGETS + 1) as i64)
+        .fetch_all(&self.db)
+        .await?;
+        if rows.len() > MAX_TARGETS {
+            return Err(invalid_certificate_state());
+        }
+
+        let mut current = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let port = row.try_get::<i64, _>("port")?;
+            let duration_ms = row.try_get::<i64, _>("duration_ms")?;
+            let schema_version = row.try_get::<i64, _>("schema_version")?;
+            let stored = StoredCertificateRow {
+                target_id: row.try_get("target_id")?,
+                label: row.try_get("label")?,
+                connect_host: row.try_get("connect_host")?,
+                port: u16::try_from(port).map_err(|_| invalid_certificate_state())?,
+                server_name: row.try_get("server_name")?,
+                trust_profile: row.try_get("trust_profile")?,
+                observation: CertificateCurrentObservation {
+                    schema_version: u64::try_from(schema_version)
+                        .ok()
+                        .filter(|version| *version == 1)
+                        .ok_or_else(invalid_certificate_state)?,
+                    checked_at: row.try_get("checked_at")?,
+                    duration_ms: u64::try_from(duration_ms)
+                        .ok()
+                        .filter(|duration| *duration <= 60_000)
+                        .ok_or_else(invalid_certificate_state)?,
+                    last_success_at: row.try_get("last_success_at")?,
+                    reachability: parse_reachability(
+                        row.try_get::<String, _>("reachability")?.as_str(),
+                    )?,
+                    trust: parse_trust(row.try_get::<String, _>("trust")?.as_str())?,
+                    hostname: parse_hostname(row.try_get::<String, _>("hostname")?.as_str())?,
+                    expiry: parse_expiry(row.try_get::<String, _>("expiry")?.as_str())?,
+                    not_before: row.try_get("not_before")?,
+                    not_after: row.try_get("not_after")?,
+                    remaining_seconds: row.try_get("remaining_seconds")?,
+                    error_code: row
+                        .try_get::<Option<String>, _>("error_code")?
+                        .as_deref()
+                        .map(parse_probe_error)
+                        .transpose()?,
+                },
+            };
+            if current.insert(stored.target_id.clone(), stored).is_some() {
+                return Err(invalid_certificate_state());
+            }
+        }
+
+        Ok(targets
+            .iter()
+            .map(|target| {
+                let observation = current.get(&target.id).and_then(|stored| {
+                    (stored.label == target.label
+                        && stored.connect_host == target.connect_host
+                        && stored.port == target.port
+                        && stored.server_name == target.server_name
+                        && stored.trust_profile == target.trust_profile.code())
+                    .then(|| stored.observation.clone())
+                });
+                CertificateTargetStatus {
+                    target_id: target.id.clone(),
+                    label: target.label.clone(),
+                    connect_host: target.connect_host.clone(),
+                    port: target.port,
+                    server_name: target.server_name.clone(),
+                    observation,
+                }
+            })
+            .collect())
     }
 
     async fn prune_removed_targets(
@@ -486,6 +698,7 @@ pub(crate) struct CertificateMonitorService {
     interval_secs: u64,
     concurrency: usize,
     exclusive: Mutex<()>,
+    manual_refresh_deadlines: Mutex<HashMap<String, Instant>>,
 }
 
 impl CertificateMonitorService {
@@ -519,6 +732,7 @@ impl CertificateMonitorService {
             interval_secs: config.interval_secs,
             concurrency: config.concurrency,
             exclusive: Mutex::new(()),
+            manual_refresh_deadlines: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -552,22 +766,103 @@ impl CertificateMonitorService {
             .await
             .map_err(CertificateMonitorCycleError::Batch)?;
         for observation in &observations {
-            tracing::info!(
-                target_id = %observation.target_id,
-                duration_ms = observation.duration_ms,
-                reachability = observation.reachability.code(),
-                trust = observation.trust.code(),
-                hostname = observation.hostname.code(),
-                expiry = observation.expiry.code(),
-                error_code = observation.error_code.map(|error| error.code()),
-                "Certificate target observed"
-            );
+            log_observation(observation, "scheduled");
         }
         self.storage
             .publish(&self.targets, &observations)
             .await
             .map_err(|_| CertificateMonitorCycleError::Database)
     }
+
+    pub(crate) async fn status(&self) -> Result<CertificateMonitorStatus, sqlx::Error> {
+        let targets = self.storage.read_targets(&self.targets).await?;
+        let earliest_expiry_at = targets
+            .iter()
+            .filter_map(|target| target.observation.as_ref()?.not_after)
+            .min();
+        Ok(CertificateMonitorStatus {
+            schema_version: 1,
+            status: CertificateMonitorState::Enabled,
+            interval_seconds: Some(self.interval_secs),
+            refresh_cooldown_seconds: MANUAL_REFRESH_COOLDOWN_SECS,
+            earliest_expiry_at,
+            targets,
+        })
+    }
+
+    pub(crate) async fn refresh(
+        &self,
+        target_id: &str,
+    ) -> Result<CertificateRefreshResult, CertificateRefreshError> {
+        let target = self
+            .targets
+            .iter()
+            .find(|target| target.id == target_id)
+            .ok_or(CertificateRefreshError::TargetNotFound)?;
+        let _guard = self
+            .exclusive
+            .try_lock()
+            .map_err(|_| CertificateRefreshError::Busy)?;
+        self.reserve_manual_refresh(target_id).await?;
+
+        let observation = self.probe.probe(target).await;
+        log_observation(&observation, "manual");
+        self.storage
+            .publish_one(target, &observation)
+            .await
+            .map_err(|_| CertificateRefreshError::Database)?;
+        let target = self
+            .storage
+            .read_targets(&self.targets)
+            .await
+            .map_err(|_| CertificateRefreshError::Database)?
+            .into_iter()
+            .find(|target| target.target_id == target_id)
+            .ok_or(CertificateRefreshError::Database)?;
+        if target.observation.is_none() {
+            return Err(CertificateRefreshError::Database);
+        }
+        Ok(CertificateRefreshResult {
+            schema_version: 1,
+            result: "refreshed",
+            target,
+        })
+    }
+
+    async fn reserve_manual_refresh(&self, target_id: &str) -> Result<(), CertificateRefreshError> {
+        let now = Instant::now();
+        let mut deadlines = self.manual_refresh_deadlines.lock().await;
+        deadlines.retain(|_, deadline| *deadline > now);
+        if let Some(deadline) = deadlines.get(target_id) {
+            let remaining = deadline.duration_since(now);
+            let retry_after_seconds = remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .max(1);
+            return Err(CertificateRefreshError::Cooldown {
+                retry_after_seconds,
+            });
+        }
+        deadlines.insert(
+            target_id.to_string(),
+            now + Duration::from_secs(MANUAL_REFRESH_COOLDOWN_SECS),
+        );
+        Ok(())
+    }
+}
+
+fn log_observation(observation: &CertificateObservation, trigger: &'static str) {
+    tracing::info!(
+        target_id = %observation.target_id,
+        trigger,
+        duration_ms = observation.duration_ms,
+        reachability = observation.reachability.code(),
+        trust = observation.trust.code(),
+        hostname = observation.hostname.code(),
+        expiry = observation.expiry.code(),
+        error_code = observation.error_code.map(|error| error.code()),
+        "Certificate target observed"
+    );
 }
 
 #[derive(Debug)]
@@ -903,6 +1198,62 @@ fn unknown_dimensions(observation: &CertificateObservation) -> Vec<&'static str>
         dimensions.push("expiry");
     }
     dimensions
+}
+
+fn parse_reachability(value: &str) -> Result<ReachabilityStatus, sqlx::Error> {
+    match value {
+        "reachable" => Ok(ReachabilityStatus::Reachable),
+        "unknown" => Ok(ReachabilityStatus::Unknown),
+        _ => Err(invalid_certificate_state()),
+    }
+}
+
+fn parse_trust(value: &str) -> Result<TrustStatus, sqlx::Error> {
+    match value {
+        "valid" => Ok(TrustStatus::Valid),
+        "invalid" => Ok(TrustStatus::Invalid),
+        "unknown" => Ok(TrustStatus::Unknown),
+        _ => Err(invalid_certificate_state()),
+    }
+}
+
+fn parse_hostname(value: &str) -> Result<HostnameStatus, sqlx::Error> {
+    match value {
+        "match" => Ok(HostnameStatus::Match),
+        "mismatch" => Ok(HostnameStatus::Mismatch),
+        "unknown" => Ok(HostnameStatus::Unknown),
+        _ => Err(invalid_certificate_state()),
+    }
+}
+
+fn parse_expiry(value: &str) -> Result<ExpiryStatus, sqlx::Error> {
+    match value {
+        "healthy" => Ok(ExpiryStatus::Healthy),
+        "warning" => Ok(ExpiryStatus::Warning),
+        "critical" => Ok(ExpiryStatus::Critical),
+        "expired" => Ok(ExpiryStatus::Expired),
+        "not_yet_valid" => Ok(ExpiryStatus::NotYetValid),
+        "unknown" => Ok(ExpiryStatus::Unknown),
+        _ => Err(invalid_certificate_state()),
+    }
+}
+
+fn parse_probe_error(value: &str) -> Result<CertificateProbeErrorCode, sqlx::Error> {
+    match value {
+        "dns_timeout" => Ok(CertificateProbeErrorCode::DnsTimeout),
+        "dns_failed" => Ok(CertificateProbeErrorCode::DnsFailed),
+        "connect_timeout" => Ok(CertificateProbeErrorCode::ConnectTimeout),
+        "connect_refused" => Ok(CertificateProbeErrorCode::ConnectRefused),
+        "connect_failed" => Ok(CertificateProbeErrorCode::ConnectFailed),
+        "tls_timeout" => Ok(CertificateProbeErrorCode::TlsTimeout),
+        "tls_handshake_failed" => Ok(CertificateProbeErrorCode::TlsHandshakeFailed),
+        "certificate_missing" => Ok(CertificateProbeErrorCode::CertificateMissing),
+        "certificate_parse_failed" => Ok(CertificateProbeErrorCode::CertificateParseFailed),
+        "unsupported_protocol" => Ok(CertificateProbeErrorCode::UnsupportedProtocol),
+        "cancelled" => Ok(CertificateProbeErrorCode::Cancelled),
+        "internal_error" => Ok(CertificateProbeErrorCode::InternalError),
+        _ => Err(invalid_certificate_state()),
+    }
 }
 
 fn invalid_certificate_state() -> sqlx::Error {
@@ -1537,6 +1888,203 @@ trust_profile = "system"
             "resolved"
         );
         assert_eq!(outbox_count(&storage).await, 1);
+    }
+
+    #[tokio::test]
+    async fn current_state_projection_is_bounded_and_hides_unused_certificate_metadata() {
+        let storage = test_storage(false).await;
+        let target = target("service");
+        let checked_at = 1_700_500_000;
+        let observation = healthy_observation(&target, checked_at);
+        storage
+            .publish(
+                std::slice::from_ref(&target),
+                std::slice::from_ref(&observation),
+            )
+            .await
+            .expect("current state should publish");
+
+        let targets = storage
+            .read_targets(std::slice::from_ref(&target))
+            .await
+            .expect("current state should project");
+        assert_eq!(targets.len(), 1);
+        let projected = targets[0]
+            .observation
+            .as_ref()
+            .expect("published observation should be present");
+        assert_eq!(projected.last_success_at, Some(checked_at));
+        assert_eq!(projected.expiry, ExpiryStatus::Healthy);
+        let json = serde_json::to_string(&targets).expect("projection should serialize");
+        assert!(!json.contains("Fixture CA"));
+        assert!(!json.contains("0123456789abcdef"));
+        assert!(!json.contains("fingerprint"));
+        assert!(!json.contains("issuer"));
+
+        let mut changed_target = target.clone();
+        changed_target.server_name = "replacement.test".to_string();
+        let changed = storage
+            .read_targets(std::slice::from_ref(&changed_target))
+            .await
+            .expect("changed config should remain readable");
+        assert!(
+            changed[0].observation.is_none(),
+            "an observation from a previous endpoint must not be attached to changed config"
+        );
+    }
+
+    #[test]
+    fn worst_case_current_state_api_stays_below_frontend_response_limit() {
+        let targets: Vec<_> = (0..MAX_TARGETS)
+            .map(|index| CertificateTargetStatus {
+                target_id: format!("target-{index:02}"),
+                label: "L".repeat(128),
+                connect_host: "c".repeat(253),
+                port: u16::MAX,
+                server_name: "s".repeat(253),
+                observation: Some(CertificateCurrentObservation {
+                    schema_version: 1,
+                    checked_at: 253_000_000_000,
+                    duration_ms: 60_000,
+                    last_success_at: Some(253_000_000_000),
+                    reachability: ReachabilityStatus::Reachable,
+                    trust: TrustStatus::Invalid,
+                    hostname: HostnameStatus::Mismatch,
+                    expiry: ExpiryStatus::Critical,
+                    not_before: Some(252_000_000_000),
+                    not_after: Some(253_400_000_000),
+                    remaining_seconds: Some(400_000_000),
+                    error_code: None,
+                }),
+            })
+            .collect();
+        let status = CertificateMonitorStatus {
+            schema_version: 1,
+            status: CertificateMonitorState::Enabled,
+            interval_seconds: Some(MAX_INTERVAL_SECS),
+            refresh_cooldown_seconds: MANUAL_REFRESH_COOLDOWN_SECS,
+            earliest_expiry_at: Some(253_400_000_000),
+            targets,
+        };
+        let encoded = serde_json::to_vec(&status).expect("worst-case status should serialize");
+        assert!(
+            encoded.len() <= MAX_API_RESPONSE_BYTES,
+            "certificate API response was {} bytes",
+            encoded.len()
+        );
+        assert!(
+            !encoded
+                .windows(b"fingerprint".len())
+                .any(|window| window == b"fingerprint")
+        );
+        assert!(
+            !encoded
+                .windows(b"issuer".len())
+                .any(|window| window == b"issuer")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_single_target_publish_preserves_other_current_rows() {
+        let storage = test_storage(false).await;
+        let first = target("first");
+        let second = target("second");
+        let first_initial = healthy_observation(&first, 1_700_600_000);
+        let second_initial = healthy_observation(&second, 1_700_600_000);
+        storage
+            .publish(
+                &[first.clone(), second.clone()],
+                &[first_initial, second_initial],
+            )
+            .await
+            .expect("initial targets should publish");
+
+        let failed = failed_observation(&first, 1_700_600_060);
+        storage
+            .publish_one(&first, &failed)
+            .await
+            .expect("single target refresh should publish atomically");
+        let projected = storage
+            .read_targets(&[first, second])
+            .await
+            .expect("both configured targets should remain readable");
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected[0]
+                .observation
+                .as_ref()
+                .expect("first observation")
+                .last_success_at,
+            Some(1_700_600_000)
+        );
+        assert_eq!(
+            projected[1]
+                .observation
+                .as_ref()
+                .expect("second observation")
+                .checked_at,
+            1_700_600_000
+        );
+    }
+
+    #[tokio::test]
+    async fn service_status_and_manual_refresh_coordination_are_closed() {
+        let storage = test_storage(false).await;
+        let target = target("service");
+        let observation = healthy_observation(&target, 1_700_700_000);
+        let earliest = observation.not_after;
+        storage
+            .publish(
+                std::slice::from_ref(&target),
+                std::slice::from_ref(&observation),
+            )
+            .await
+            .expect("current state should publish");
+        let service = CertificateMonitorService {
+            storage,
+            probe: CertificateProbe::new_system().expect("system trust should initialize"),
+            targets: Arc::new(vec![target]),
+            interval_secs: DEFAULT_INTERVAL_SECS,
+            concurrency: DEFAULT_CONCURRENCY,
+            exclusive: Mutex::new(()),
+            manual_refresh_deadlines: Mutex::new(HashMap::new()),
+        };
+
+        let status = service.status().await.expect("status should project");
+        assert_eq!(status.status, CertificateMonitorState::Enabled);
+        assert_eq!(status.interval_seconds, Some(DEFAULT_INTERVAL_SECS));
+        assert_eq!(status.earliest_expiry_at, earliest);
+        assert_eq!(status.targets.len(), 1);
+
+        service
+            .reserve_manual_refresh("service")
+            .await
+            .expect("first manual reservation should succeed");
+        let cooldown = service
+            .reserve_manual_refresh("service")
+            .await
+            .expect_err("repeated manual reservation should be rate limited");
+        assert_eq!(cooldown.code(), "certificate_refresh_cooldown");
+        assert_eq!(
+            cooldown.retry_after_seconds(),
+            Some(MANUAL_REFRESH_COOLDOWN_SECS)
+        );
+
+        let _cycle = service.exclusive.lock().await;
+        assert_eq!(
+            service
+                .refresh("service")
+                .await
+                .expect_err("manual refresh must not overlap a cycle"),
+            CertificateRefreshError::Busy
+        );
+        assert_eq!(
+            service
+                .refresh("unknown")
+                .await
+                .expect_err("unknown IDs must be rejected without probing"),
+            CertificateRefreshError::TargetNotFound
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+import { CertificateMonitoringCard } from "@/components/CertificateMonitoringCard";
 import { FileIntegrityCard } from "@/components/FileIntegrityCard";
 import { SecurityCard } from "@/components/SecurityCard";
 import { SecurityEventsCard } from "@/components/SecurityEventsCard";
@@ -18,6 +19,7 @@ export default function SecurityPage() {
 
             <div className="grid gap-4">
                 <SecurityEventsCard />
+                <CertificateMonitoringCard />
                 <FileIntegrityCard />
                 <SecurityCard />
             </div>

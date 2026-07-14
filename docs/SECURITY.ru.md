@@ -329,10 +329,27 @@ Event/outbox writes и current observation выполняются одной SQL
 Certificate event evidence содержит только stable target ID и закрытые
 state/timestamp/error facts; target labels, connect hosts, SNI, issuer,
 fingerprints и raw library errors не попадают в event evidence и Telegram
-outbox. Certificate transitions остаются видны через существующий
-generic security-events API/UI; эта фаза не добавляет dedicated
-certificate current-state API/UI, manual refresh, Cloud Push fields, renewal
-automation или discovery локальных certificate files.
+outbox. Certificate transitions остаются видны через существующий generic
+security-events API/UI.
+
+Authenticated endpoint `GET /api/security/certificates` и страница Security
+показывают bounded current state настроенных targets: endpoint, expiry,
+hostname/trust result, последнюю проверку и remediation. Response не содержит
+DER, chains, SAN, subject/serial data, issuer, fingerprint и library errors.
+Когда collector выключен, GET возвращает versioned disabled state без чтения
+targets file и без создания certificate table. Пока страница Security открыта,
+она обновляет эту локальную projection каждые 30 секунд; каждое обновление —
+один bounded read максимум 32 rows без TLS probe и без обращения к target.
+
+`POST /api/security/certificates/{target_id}/refresh` принимает только empty
+body и ID, загруженный из root-owned startup file; выбрать новый host, port,
+path или URL через API нельзя. Он повторно использует тот же 10-секундный
+direct-TLS probe и atomic state/event/outbox transaction. Для ручной проверки
+действует per-target cooldown 60 секунд; она не overlap-ится с scheduled или
+другим manual cycle, а busy cycle отклоняется сразу без удержания HTTP request.
+Unknown ID, disabled state, cooldown, busy state и storage failure возвращают
+закрытые redacted errors. Эта возможность не добавляет Cloud Push fields,
+renewal automation или discovery локальных certificate files.
 
 ## Baseline listening ports
 

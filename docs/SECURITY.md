@@ -310,9 +310,27 @@ Certificate event evidence contains only the stable target ID and closed
 state/timestamp/error facts; target labels, connect hosts, SNI, issuer,
 fingerprints, and raw library errors are excluded from event evidence and the
 Telegram outbox. Certificate transitions remain visible through the existing
-generic security-events API/UI; this phase does not add a dedicated certificate
-current-state API/UI, manual refresh, Cloud Push fields, renewal automation, or
-local certificate-file discovery.
+generic security-events API/UI.
+
+The authenticated `GET /api/security/certificates` endpoint and the Security
+page expose the bounded current state for configured targets, including the
+endpoint, expiry, hostname/trust result, last check, and remediation guidance.
+The response omits DER, chains, SANs, subject/serial data, issuer, fingerprint,
+and library errors. When the collector is disabled, GET returns a versioned
+disabled state without reading the targets file or creating the certificate
+table. While the Security page is open, it refreshes this local projection
+every 30 seconds; each refresh is one bounded read of at most 32 rows and does
+not run a TLS probe or contact a target.
+
+`POST /api/security/certificates/{target_id}/refresh` accepts an empty body and
+only an ID loaded from the root-owned startup file; it cannot select a new host,
+port, path, or URL. It reuses the same 10-second direct-TLS probe and atomic
+state/event/outbox transaction. Manual checks have a 60-second per-target
+cooldown and do not overlap a scheduled or other manual cycle; a busy cycle is
+rejected immediately rather than holding the HTTP request. Unknown IDs,
+disabled state, cooldown, busy state, and storage failure return closed,
+redacted errors. This feature does not add Cloud Push fields, renewal
+automation, or local certificate-file discovery.
 
 ## Listening Port Baseline
 
