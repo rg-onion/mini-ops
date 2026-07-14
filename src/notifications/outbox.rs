@@ -161,6 +161,25 @@ impl NotificationEvent {
         }
     }
 
+    pub(crate) fn certificate_transition(
+        event_key: impl Into<String>,
+        sequence: i64,
+        kind: impl Into<String>,
+        text: impl Into<String>,
+        occurred_at: i64,
+    ) -> Self {
+        let event_key = event_key.into();
+        Self {
+            dedup_key: format!("security:{event_key}:{sequence}"),
+            kind: kind.into(),
+            source_event_key: Some(event_key),
+            source_event_seq: Some(sequence),
+            text: text.into(),
+            occurred_at,
+            suppress_for_seconds: 0,
+        }
+    }
+
     pub(crate) fn ssh_login_transition(
         event_key: impl Into<String>,
         normalized_ip: &str,

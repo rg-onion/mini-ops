@@ -74,7 +74,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Audit Rust dependency graph
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # upstream Node 24 support
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 

@@ -190,6 +190,95 @@
                 "unreadable": "недоступен для чтения"
             }
         },
+        "certificates": {
+            "title": "TLS-сертификаты",
+            "description": "Текущее состояние явно настроенных direct-TLS endpoints. Проверки не отправляют HTTP-запросы и не читают private keys.",
+            "loading": "Загрузка состояния мониторинга сертификатов...",
+            "load_error": "Не удалось загрузить состояние мониторинга сертификатов. Healthy-результат не предполагается.",
+            "disabled": "Мониторинг сертификатов включается явно. Настройте root-owned targets file и задайте SECURITY_CERTIFICATE_MONITOR_ENABLED=true.",
+            "unavailable": "Недоступно",
+            "awaiting": "Ожидается первая проверка",
+            "not_checked": "Проверка ещё не выполнялась",
+            "status": {
+                "disabled": "Выключено",
+                "enabled": "Включено"
+            },
+            "earliest_expiry": "Ближайшее окончание",
+            "targets": "Настроенные цели",
+            "interval": "Плановые проверки",
+            "interval_hours": "Каждые {{count}} ч",
+            "interval_minutes": "Каждые {{count}} мин",
+            "interval_hours_minutes": "Каждые {{hours}} ч {{minutes}} мин",
+            "cooldown": "Cooldown ручной проверки: {{seconds}} с",
+            "target": "Цель",
+            "expiry_title": "Срок действия",
+            "identity": "Hostname / trust",
+            "last_check": "Последняя проверка",
+            "last_success": "Последний сертификат: {{timestamp}}",
+            "remediation_title": "Что делать",
+            "actions": "Действия",
+            "connect_via": "Подключение через {{endpoint}}",
+            "refresh": "Проверить",
+            "refresh_target": "Обновить состояние сертификата для {{label}}",
+            "refresh_success": "Состояние сертификата для {{label}} обновлено.",
+            "remaining_days": "{{count}} дн.",
+            "remaining_hours": "{{count}} ч",
+            "remaining_less_hour": "меньше 1 ч",
+            "remaining": "Осталось {{value}}",
+            "overdue": "Просрочен на {{value}}",
+            "expiry": {
+                "healthy": "В норме",
+                "warning": "Скоро истекает",
+                "critical": "Критично",
+                "expired": "Истёк",
+                "not_yet_valid": "Ещё не действует",
+                "unknown": "Неизвестно"
+            },
+            "hostname": {
+                "match": "Hostname совпадает",
+                "mismatch": "Hostname не совпадает",
+                "unknown": "Hostname неизвестен"
+            },
+            "trust": {
+                "valid": "Доверенный",
+                "invalid": "Недоверенный",
+                "unknown": "Trust неизвестен"
+            },
+            "remediation": {
+                "pending": "Запустите первую проверку или дождитесь immediate startup cycle.",
+                "coverage": "Проверьте DNS, доступность TCP/TLS и chain endpoint; unknown не является healthy.",
+                "trust": "Установите chain, которому доверяет системное хранилище сервера, и перезагрузите TLS-сервис.",
+                "hostname": "Отдавайте сертификат, соответствующий настроенному SNI/hostname.",
+                "expiry_warning": "Запланируйте обновление и проверьте, что сервис загрузил новый сертификат.",
+                "expiry_critical": "Немедленно обновите сертификат и проверьте, что именно его отдаёт endpoint.",
+                "expiry_expired": "Немедленно замените истёкший сертификат и перезагрузите TLS-сервис.",
+                "expiry_not_yet_valid": "Проверьте даты выпуска и время хоста перед установкой сертификата.",
+                "healthy": "Действия не требуются; периодический мониторинг продолжает работу."
+            },
+            "error_code": {
+                "dns_timeout": "Тайм-аут DNS",
+                "dns_failed": "Ошибка DNS",
+                "connect_timeout": "Тайм-аут подключения",
+                "connect_refused": "Подключение отклонено",
+                "connect_failed": "Ошибка подключения",
+                "tls_timeout": "Тайм-аут TLS",
+                "tls_handshake_failed": "Ошибка TLS handshake",
+                "certificate_missing": "Сертификат endpoint отсутствует",
+                "certificate_parse_failed": "Ошибка разбора сертификата",
+                "unsupported_protocol": "Неподдерживаемый протокол",
+                "cancelled": "Проверка отменена",
+                "internal_error": "Внутренняя ошибка проверки"
+            },
+            "refresh_error": {
+                "invalid_request": "Запрос проверки отклонён. Ни одна цель не изменена.",
+                "certificate_monitor_disabled": "Мониторинг сертификатов выключен.",
+                "certificate_target_not_found": "Настроенная цель больше не существует. Перезагрузите текущее состояние.",
+                "certificate_refresh_busy": "Плановая или ручная проверка сертификатов уже выполняется. Повторите позже.",
+                "certificate_refresh_cooldown": "Эта цель только что проверена. Повторите через {{seconds}} секунд.",
+                "certificate_monitor_unavailable": "Безопасно завершить проверку не удалось. Сохранённое состояние могло не измениться.",
+                "invalid_response": "Результат проверки не удалось подтвердить. Перезагрузите состояние перед повтором."
+            }
+        },
         "file_integrity": {
             "title": "Целостность sensitive-файлов",
             "loading": "Загрузка статуса целостности файлов...",

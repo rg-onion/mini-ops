@@ -1,7 +1,5 @@
 mod auth;
-// C1 is an intentionally isolated probe core. C2 will wire scheduling and
-// persistence after the observation contract has stabilized.
-#[allow(dead_code)]
+mod certificate_monitor;
 mod certificate_probe;
 mod cloud_payload;
 mod cloud_push;
@@ -40,6 +38,10 @@ use axum::{
         sse::{Event, Sse},
     },
     routing::{delete, get, post},
+};
+use certificate_monitor::{
+    CertificateMonitorConfig, CertificateMonitorService, CertificateMonitorStatus,
+    CertificateRefreshError,
 };
 use deployment::{
     DeploymentService, api_error_response, deploy_logs_sse_handler, trigger_update_handler,
@@ -126,6 +128,13 @@ async fn main() {
             eprintln!("CRITICAL: file_integrity_configuration: {}", error.code());
             std::process::exit(1);
         });
+    let certificate_monitor_config = CertificateMonitorConfig::from_env().unwrap_or_else(|error| {
+        eprintln!(
+            "CRITICAL: certificate_monitor_configuration: {}",
+            error.code()
+        );
+        std::process::exit(1);
+    });
 
     let auth_token = match resolve_auth_token(runtime_mode) {
         Ok(token) => token,
@@ -206,6 +215,26 @@ async fn main() {
     let security_events = Arc::new(SecurityEventService::new(pool.clone()));
     let notification_outbox =
         Arc::new(NotificationOutbox::new(pool.clone(), notifications.clone()));
+    let certificate_monitor = if certificate_monitor_config.enabled() {
+        Some(
+            CertificateMonitorService::initialize_enabled(
+                pool.clone(),
+                Arc::clone(&notification_outbox),
+                Arc::clone(&notifications),
+                certificate_monitor_config,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "CRITICAL: certificate_monitor_initialization: {}",
+                    error.code()
+                );
+                std::process::exit(1);
+            }),
+        )
+    } else {
+        None
+    };
     let file_integrity = if file_integrity_config.enabled() {
         FileIntegrityService::initialize_enabled(
             pool.clone(),
@@ -257,6 +286,9 @@ async fn main() {
 
     let _notification_worker = Arc::clone(&notification_outbox).start();
     let _file_integrity_worker = Arc::clone(&file_integrity).start();
+    let _certificate_monitor_worker = certificate_monitor
+        .as_ref()
+        .map(|service| Arc::clone(service).start());
 
     // Start the monitor only after all fail-fast runtime state is ready.
     let security_monitor = Arc::new(SecurityMonitor::new(
@@ -434,6 +466,11 @@ async fn main() {
         .route("/deploy/webhook", post(trigger_update_handler))
         .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
+        .route("/security/certificates", get(get_certificates_handler))
+        .route(
+            "/security/certificates/{target_id}/refresh",
+            post(refresh_certificate_handler),
+        )
         .route(
             "/security/file-integrity/status",
             get(get_file_integrity_status_handler),
@@ -481,6 +518,7 @@ async fn main() {
             security_events,
             security_snapshots,
             file_integrity,
+            certificate_monitor,
         });
 
     let app_host = std::env::var("APP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -687,6 +725,7 @@ struct AppState {
     security_events: Arc<SecurityEventService>,
     security_snapshots: Arc<SecuritySnapshotService>,
     file_integrity: Arc<FileIntegrityService>,
+    certificate_monitor: Option<Arc<CertificateMonitorService>>,
 }
 
 impl FromRef<AppState> for Arc<DeploymentService> {
@@ -1016,6 +1055,58 @@ fn security_audit_snapshot_response(
         "x-security-collection-status",
         header::HeaderValue::from_static(snapshot.collection_status().code()),
     );
+    response
+}
+
+async fn get_certificates_handler(State(state): State<AppState>) -> Response {
+    let Some(service) = &state.certificate_monitor else {
+        return Json(CertificateMonitorStatus::disabled()).into_response();
+    };
+    match service.status().await {
+        Ok(status) => Json(status).into_response(),
+        Err(_) => api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "certificate_monitor_unavailable",
+        ),
+    }
+}
+
+async fn refresh_certificate_handler(
+    State(state): State<AppState>,
+    Path(target_id): Path<String>,
+    request: Request,
+) -> Response {
+    if !request_body_is_empty(request).await {
+        return api_error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let Some(service) = &state.certificate_monitor else {
+        return api_error_response(StatusCode::FORBIDDEN, "certificate_monitor_disabled");
+    };
+    match service.refresh(&target_id).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => certificate_refresh_error_response(error),
+    }
+}
+
+async fn request_body_is_empty(request: Request) -> bool {
+    axum::body::to_bytes(request.into_body(), 1)
+        .await
+        .is_ok_and(|body| body.is_empty())
+}
+
+fn certificate_refresh_error_response(error: CertificateRefreshError) -> Response {
+    let status = match error {
+        CertificateRefreshError::TargetNotFound => StatusCode::NOT_FOUND,
+        CertificateRefreshError::Busy => StatusCode::CONFLICT,
+        CertificateRefreshError::Cooldown { .. } => StatusCode::TOO_MANY_REQUESTS,
+        CertificateRefreshError::Database => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let mut response = api_error_response(status, error.code());
+    if let Some(retry_after_seconds) = error.retry_after_seconds()
+        && let Ok(value) = header::HeaderValue::from_str(&retry_after_seconds.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }
 
@@ -1353,6 +1444,65 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn certificate_refresh_accepts_only_an_empty_body() {
+        let empty = HttpRequest::builder()
+            .body(Body::empty())
+            .expect("empty request should build");
+        assert!(request_body_is_empty(empty).await);
+
+        for body in [Body::from("{}"), Body::from(" "), Body::from(vec![b'x'; 2])] {
+            let request = HttpRequest::builder()
+                .body(body)
+                .expect("non-empty request should build");
+            assert!(!request_body_is_empty(request).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn certificate_refresh_errors_are_closed_and_bounded() {
+        let cases = [
+            (
+                CertificateRefreshError::TargetNotFound,
+                StatusCode::NOT_FOUND,
+                "certificate_target_not_found",
+                None,
+            ),
+            (
+                CertificateRefreshError::Busy,
+                StatusCode::CONFLICT,
+                "certificate_refresh_busy",
+                None,
+            ),
+            (
+                CertificateRefreshError::Cooldown {
+                    retry_after_seconds: 37,
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+                "certificate_refresh_cooldown",
+                Some("37"),
+            ),
+            (
+                CertificateRefreshError::Database,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "certificate_monitor_unavailable",
+                None,
+            ),
+        ];
+        for (error, status, code, retry_after) in cases {
+            let response = certificate_refresh_error_response(error);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                retry_after
+            );
+            assert_error_code(response, code).await;
+        }
     }
 
     #[tokio::test]

@@ -246,6 +246,92 @@ cap and no per-poll history. An unchanged healthy scan does not write SQLite.
 This collector does not add a general audit check, change the security score,
 or extend the Cloud Push schema.
 
+## TLS Certificate Monitoring
+
+TLS certificate monitoring is a separate opt-in collector for explicit
+direct-TLS endpoints. It is disabled by default and never scans certificate
+directories, private keys, Docker volumes, the filesystem, or adjacent hosts.
+Enable it with:
+
+```env
+SECURITY_CERTIFICATE_MONITOR_ENABLED=true
+SECURITY_CERTIFICATE_TARGETS_FILE=/etc/mini-ops/certificates.toml
+SECURITY_CERTIFICATE_INTERVAL_SECS=21600
+SECURITY_CERTIFICATE_MAX_CONCURRENCY=4
+```
+
+The targets file is read once at startup. Its absolute path and every ancestor
+must be root-owned and not group/other-writable; the final regular file must
+also have no execute or world permissions. A typical installation is:
+
+```bash
+sudo install -d -o root -g miniops -m 0750 /etc/mini-ops
+sudo install -o root -g miniops -m 0640 certificates.toml /etc/mini-ops/certificates.toml
+```
+
+The versioned file accepts between 1 and 32 explicit targets:
+
+```toml
+schema_version = 1
+
+[[targets]]
+id = "ops-dashboard"
+label = "Mini-Ops HTTPS"
+connect_host = "ops.example.com"
+port = 443
+server_name = "ops.example.com"
+trust_profile = "system"
+```
+
+Invalid environment values, unsafe ownership/modes, malformed or oversized
+configuration, unavailable native roots, or schema initialization errors fail
+enabled startup with a closed error code. The disabled path does not read the
+file or create certificate state. The interval has a strict `300..86400`
+second range; concurrency has a strict `1..8` range and defaults to `4`.
+
+The first cycle runs immediately. Later cycles skip missed ticks and never
+overlap. Each target has a 10-second total deadline, at most eight DNS answers,
+and no HTTP/application request. Mini-Ops stores one current SQLite row per
+configured target; raw DER, chains, SAN lists, private keys, and per-poll sample
+history are never stored. A later transport failure preserves only the last
+successful timestamp while current certificate fields become unknown.
+
+Expiry warning/critical/expired, not-yet-valid, hostname mismatch, and invalid
+trust are independent security events. The first risk, a reopen, or a severity
+increase enqueues one durable Telegram transition; a proven recovery enqueues
+one recovery transition. Identical polls do not notify. Unknown transport or
+parse state opens a non-notifying coverage event and never resolves an existing
+risk without healthy evidence. Removing a target from the startup file removes
+its current row and closes its certificate events without a recovery message;
+it does not record a false healthy observation.
+
+Event/outbox writes and the current observation use one SQLite transaction.
+Certificate event evidence contains only the stable target ID and closed
+state/timestamp/error facts; target labels, connect hosts, SNI, issuer,
+fingerprints, and raw library errors are excluded from event evidence and the
+Telegram outbox. Certificate transitions remain visible through the existing
+generic security-events API/UI.
+
+The authenticated `GET /api/security/certificates` endpoint and the Security
+page expose the bounded current state for configured targets, including the
+endpoint, expiry, hostname/trust result, last check, and remediation guidance.
+The response omits DER, chains, SANs, subject/serial data, issuer, fingerprint,
+and library errors. When the collector is disabled, GET returns a versioned
+disabled state without reading the targets file or creating the certificate
+table. While the Security page is open, it refreshes this local projection
+every 30 seconds; each refresh is one bounded read of at most 32 rows and does
+not run a TLS probe or contact a target.
+
+`POST /api/security/certificates/{target_id}/refresh` accepts an empty body and
+only an ID loaded from the root-owned startup file; it cannot select a new host,
+port, path, or URL. It reuses the same 10-second direct-TLS probe and atomic
+state/event/outbox transaction. Manual checks have a 60-second per-target
+cooldown and do not overlap a scheduled or other manual cycle; a busy cycle is
+rejected immediately rather than holding the HTTP request. Unknown IDs,
+disabled state, cooldown, busy state, and storage failure return closed,
+redacted errors. This feature does not add Cloud Push fields, renewal
+automation, or local certificate-file discovery.
+
 ## Listening Port Baseline
 
 Mini-Ops reports listening sockets that are not part of the local expected-port

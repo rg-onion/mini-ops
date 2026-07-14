@@ -888,26 +888,45 @@ impl SecurityEventService {
         check: &SecurityCheck,
         notification: Option<(&NotificationOutbox, &str)>,
     ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
-        let event_key = Self::audit_event_key(&check.id);
         let now = Utc::now().timestamp();
+        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
+        let outcome =
+            Self::upsert_audit_event_in_transaction(&mut transaction, check, notification, now)
+                .await?;
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    pub(crate) async fn upsert_audit_event_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        check: &SecurityCheck,
+        notification: Option<(&NotificationOutbox, &str)>,
+        now: i64,
+    ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
+        let event_key = Self::audit_event_key(&check.id);
         let event_type = if check.status == "WARN" {
             "audit.check_warning"
         } else {
             "audit.check_failed"
         };
-        let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
-        let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
+        let previous_state = get_notification_state_by_key(transaction, &event_key).await?;
         let is_warning_to_failed = matches!(
             previous_state.as_ref(),
-            Some((status, previous_event_type, _))
-                if matches!(status.as_str(), "open" | "acknowledged")
-                    && previous_event_type == "audit.check_warning"
+            Some(state)
+                if matches!(state.status.as_str(), "open" | "acknowledged")
+                    && state.event_type == "audit.check_warning"
                     && event_type == "audit.check_failed"
         );
+        let is_severity_escalation = previous_state.as_ref().is_some_and(|state| {
+            check.category == "certificate"
+                && matches!(state.status.as_str(), "open" | "acknowledged")
+                && event_type == "audit.check_failed"
+                && severity_rank(&check.severity) > severity_rank(&state.severity)
+        });
         let should_alert = match previous_state.as_ref() {
             None => event_type == "audit.check_failed",
-            Some((status, _, _)) if status == "resolved" => event_type == "audit.check_failed",
-            _ if is_warning_to_failed => true,
+            Some(state) if state.status == "resolved" => event_type == "audit.check_failed",
+            _ if is_warning_to_failed || is_severity_escalation => true,
             _ => false,
         };
         let evidence_json = Self::audit_evidence_json(check);
@@ -970,24 +989,44 @@ impl SecurityEventService {
         .bind(evidence_json)
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
+
+        if is_severity_escalation {
+            sqlx::query(
+                "UPDATE security_events
+                 SET status = 'open', acknowledged_at = NULL, resolved_at = NULL
+                 WHERE event_key = ? AND status IN ('open', 'acknowledged')",
+            )
+            .bind(&event_key)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         let notification_outcome = if should_alert {
             if let Some((outbox, notification_text)) = notification {
-                let sequence = next_notification_sequence(&mut transaction, &event_key).await?;
-                let event = NotificationEvent::security_transition(
-                    &event_key,
-                    sequence,
-                    event_type,
-                    notification_text,
-                    now,
-                );
+                let sequence = next_notification_sequence(transaction, &event_key).await?;
+                let event = if check.category == "certificate" {
+                    NotificationEvent::certificate_transition(
+                        &event_key,
+                        sequence,
+                        event_type,
+                        notification_text,
+                        now,
+                    )
+                } else {
+                    NotificationEvent::security_transition(
+                        &event_key,
+                        sequence,
+                        event_type,
+                        notification_text,
+                        now,
+                    )
+                };
                 let outcome = outbox
-                    .enqueue_in_transaction(&mut transaction, &event, now)
+                    .enqueue_in_transaction(transaction, &event, now)
                     .await?;
-                update_enqueue_summary(&mut transaction, &event_key, sequence, &outcome, now)
-                    .await?;
+                update_enqueue_summary(transaction, &event_key, sequence, &outcome, now).await?;
                 Some(outcome)
             } else {
                 None
@@ -996,7 +1035,6 @@ impl SecurityEventService {
             None
         };
 
-        transaction.commit().await?;
         Ok((should_alert, notification_outcome))
     }
 
@@ -1023,23 +1061,34 @@ impl SecurityEventService {
         check: &SecurityCheck,
         notification: Option<(&NotificationOutbox, &str)>,
     ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
-        let event_key = Self::audit_event_key(&check.id);
+        let now = Utc::now().timestamp();
         let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
-        let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
+        let outcome =
+            Self::resolve_audit_event_in_transaction(&mut transaction, check, notification, now)
+                .await?;
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
+    pub(crate) async fn resolve_audit_event_in_transaction(
+        transaction: &mut Transaction<'_, Sqlite>,
+        check: &SecurityCheck,
+        notification: Option<(&NotificationOutbox, &str)>,
+        now: i64,
+    ) -> Result<(bool, Option<EnqueueOutcome>), sqlx::Error> {
+        let event_key = Self::audit_event_key(&check.id);
+        let previous_state = get_notification_state_by_key(transaction, &event_key).await?;
         let should_resolve = matches!(
-            previous_state
-                .as_ref()
-                .map(|(status, _, _)| status.as_str()),
+            previous_state.as_ref().map(|state| state.status.as_str()),
             Some("open") | Some("acknowledged")
         );
         let should_alert = matches!(
             previous_state.as_ref(),
-            Some((status, event_type, _))
-                if matches!(status.as_str(), "open" | "acknowledged")
-                    && event_type == "audit.check_failed"
+            Some(state)
+                if matches!(state.status.as_str(), "open" | "acknowledged")
+                    && state.event_type == "audit.check_failed"
         );
 
-        let now = Utc::now().timestamp();
         if should_resolve {
             sqlx::query(
                 "UPDATE security_events
@@ -1049,25 +1098,34 @@ impl SecurityEventService {
             .bind(now)
             .bind(now)
             .bind(&event_key)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
 
         let notification_outcome = if should_alert {
             if let Some((outbox, notification_text)) = notification {
-                let sequence = next_notification_sequence(&mut transaction, &event_key).await?;
-                let event = NotificationEvent::security_transition(
-                    &event_key,
-                    sequence,
-                    "audit.check_resolved",
-                    notification_text,
-                    now,
-                );
+                let sequence = next_notification_sequence(transaction, &event_key).await?;
+                let event = if check.category == "certificate" {
+                    NotificationEvent::certificate_transition(
+                        &event_key,
+                        sequence,
+                        "audit.check_resolved",
+                        notification_text,
+                        now,
+                    )
+                } else {
+                    NotificationEvent::security_transition(
+                        &event_key,
+                        sequence,
+                        "audit.check_resolved",
+                        notification_text,
+                        now,
+                    )
+                };
                 let outcome = outbox
-                    .enqueue_in_transaction(&mut transaction, &event, now)
+                    .enqueue_in_transaction(transaction, &event, now)
                     .await?;
-                update_enqueue_summary(&mut transaction, &event_key, sequence, &outcome, now)
-                    .await?;
+                update_enqueue_summary(transaction, &event_key, sequence, &outcome, now).await?;
                 Some(outcome)
             } else {
                 None
@@ -1076,7 +1134,6 @@ impl SecurityEventService {
             None
         };
 
-        transaction.commit().await?;
         Ok((should_alert, notification_outcome))
     }
 
@@ -1127,9 +1184,7 @@ impl SecurityEventService {
         let mut transaction = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let previous_state = get_notification_state_by_key(&mut transaction, &event_key).await?;
         let should_alert = matches!(
-            previous_state
-                .as_ref()
-                .map(|(status, _, _)| status.as_str()),
+            previous_state.as_ref().map(|state| state.status.as_str()),
             None | Some("resolved")
         );
         let now = Utc::now().timestamp();
@@ -1681,6 +1736,16 @@ fn valid_stored_security_event_context(
         return true;
     };
     match &known.kind {
+        KnownSecurityEventEvidenceV1::AuditCheckFailed { data, .. }
+        | KnownSecurityEventEvidenceV1::AuditCheckWarning { data, .. }
+            if data.category == "certificate" =>
+        {
+            valid_integrity_status_context(context)
+                && context.event_key == format!("audit:{}", data.check_id)
+                && certificate_audit_severity(data)
+                    .is_some_and(|severity| context.severity == severity)
+                && (data.status != "WARN" || integrity_event_has_no_notification_state(context))
+        }
         KnownSecurityEventEvidenceV1::FileSensitiveChanged { data, .. } => {
             valid_integrity_status_context(context)
                 && context.severity == "high"
@@ -1706,6 +1771,20 @@ fn valid_stored_security_event_context(
                 && integrity_event_has_no_notification_state(context)
         }
         _ => true,
+    }
+}
+
+fn certificate_audit_severity(evidence: &AuditEventEvidenceV1) -> Option<&'static str> {
+    let state = evidence
+        .evidence
+        .iter()
+        .find_map(|item| item.strip_prefix("state="))?;
+    match state {
+        "warning" => Some("medium"),
+        "critical" | "not_yet_valid" | "mismatch" | "invalid" => Some("high"),
+        "expired" => Some("critical"),
+        "degraded" => Some("medium"),
+        _ => None,
     }
 }
 
@@ -1761,6 +1840,8 @@ fn parse_audit_evidence(event_type: &str, stored: &str) -> Option<AuditEventEvid
             MAX_AUDIT_EVIDENCE_BYTES,
         )
         || !valid_audit_metadata(&evidence.metadata)
+        || ((evidence.category == "certificate" || evidence.check_id.starts_with("certificate."))
+            && !valid_certificate_audit_evidence(&evidence))
     {
         return None;
     }
@@ -1773,6 +1854,148 @@ fn parse_audit_evidence(event_type: &str, stored: &str) -> Option<AuditEventEvid
         _ => false,
     };
     status_is_valid.then_some(evidence)
+}
+
+fn valid_certificate_audit_evidence(evidence: &AuditEventEvidenceV1) -> bool {
+    if evidence.category != "certificate" || !evidence.metadata.is_empty() {
+        return false;
+    }
+    let mut fields = BTreeMap::new();
+    for item in &evidence.evidence {
+        let Some((key, value)) = item.split_once('=') else {
+            return false;
+        };
+        if value.is_empty() || fields.insert(key, value).is_some() {
+            return false;
+        }
+    }
+    if !fields.keys().all(|key| {
+        matches!(
+            *key,
+            "target_id"
+                | "finding"
+                | "state"
+                | "checked_at"
+                | "not_after"
+                | "remaining_seconds"
+                | "error_code"
+                | "unknown_dimensions"
+        )
+    }) {
+        return false;
+    }
+    let Some(target_id) = fields.get("target_id").copied() else {
+        return false;
+    };
+    if !valid_certificate_target_id(target_id) {
+        return false;
+    }
+    let Some(finding) = fields.get("finding").copied() else {
+        return false;
+    };
+    let Some(state) = fields.get("state").copied() else {
+        return false;
+    };
+    let checked_at = fields
+        .get("checked_at")
+        .and_then(|value| value.parse::<i64>().ok());
+    let Some(checked_at) = checked_at.filter(|value| (0..=MAX_FILE_TIMESTAMP).contains(value))
+    else {
+        return false;
+    };
+
+    let expected_check_id = format!("certificate.{finding}.{target_id}");
+    if evidence.check_id != expected_check_id {
+        return false;
+    }
+
+    match finding {
+        "expiry" => {
+            let severity_state =
+                matches!(state, "warning" | "critical" | "expired" | "not_yet_valid");
+            let not_after = fields
+                .get("not_after")
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| (0..=MAX_FILE_TIMESTAMP).contains(value));
+            let remaining = fields
+                .get("remaining_seconds")
+                .and_then(|value| value.parse::<i64>().ok());
+            evidence.status == "FAIL"
+                && severity_state
+                && fields.len() == 6
+                && not_after
+                    .zip(remaining)
+                    .is_some_and(|(not_after, remaining)| {
+                        not_after.saturating_sub(checked_at) == remaining
+                    })
+        }
+        "hostname" => evidence.status == "FAIL" && state == "mismatch" && fields.len() == 4,
+        "trust" => evidence.status == "FAIL" && state == "invalid" && fields.len() == 4,
+        "coverage" => {
+            let unknown_dimensions = fields
+                .get("unknown_dimensions")
+                .is_some_and(|value| valid_unknown_dimensions(value));
+            let error_is_valid = fields
+                .get("error_code")
+                .is_none_or(|value| valid_certificate_error_code(value));
+            evidence.status == "WARN"
+                && state == "degraded"
+                && unknown_dimensions
+                && error_is_valid
+                && matches!(fields.len(), 5 | 6)
+        }
+        _ => false,
+    }
+}
+
+fn valid_certificate_target_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_unknown_dimensions(value: &str) -> bool {
+    let dimensions: Vec<&str> = value.split(',').collect();
+    !dimensions.is_empty()
+        && dimensions.len() <= 4
+        && dimensions
+            .iter()
+            .all(|dimension| matches!(*dimension, "reachability" | "trust" | "hostname" | "expiry"))
+        && dimensions
+            .windows(2)
+            .all(|pair| certificate_dimension_rank(pair[0]) < certificate_dimension_rank(pair[1]))
+}
+
+fn certificate_dimension_rank(value: &str) -> u8 {
+    match value {
+        "reachability" => 1,
+        "trust" => 2,
+        "hostname" => 3,
+        "expiry" => 4,
+        _ => 0,
+    }
+}
+
+fn valid_certificate_error_code(value: &str) -> bool {
+    matches!(
+        value,
+        "dns_timeout"
+            | "dns_failed"
+            | "connect_timeout"
+            | "connect_refused"
+            | "connect_failed"
+            | "tls_timeout"
+            | "tls_handshake_failed"
+            | "certificate_missing"
+            | "certificate_parse_failed"
+            | "unsupported_protocol"
+            | "cancelled"
+            | "internal_error"
+    )
 }
 
 fn parse_ssh_evidence(stored: &str) -> Option<SshEventEvidenceV1> {
@@ -2291,24 +2514,39 @@ async fn ensure_notification_columns(db: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+struct NotificationState {
+    status: String,
+    event_type: String,
+    severity: String,
+}
+
 async fn get_notification_state_by_key(
     transaction: &mut Transaction<'_, Sqlite>,
     event_key: &str,
-) -> Result<Option<(String, String, i64)>, sqlx::Error> {
+) -> Result<Option<NotificationState>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT status, event_type, notification_seq
+        "SELECT status, event_type, severity
          FROM security_events WHERE event_key = ?",
     )
     .bind(event_key)
     .fetch_optional(&mut **transaction)
     .await?;
-    Ok(row.map(|row| {
-        (
-            row.get("status"),
-            row.get("event_type"),
-            row.get("notification_seq"),
-        )
+    Ok(row.map(|row| NotificationState {
+        status: row.get("status"),
+        event_type: row.get("event_type"),
+        severity: row.get("severity"),
     }))
+}
+
+fn severity_rank(value: &str) -> u8 {
+    match value {
+        "info" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "critical" => 5,
+        _ => 0,
+    }
 }
 
 async fn next_notification_sequence(

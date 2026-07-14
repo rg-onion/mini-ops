@@ -190,6 +190,95 @@
                 "unreadable": "unreadable"
             }
         },
+        "certificates": {
+            "title": "TLS certificates",
+            "description": "Current state of explicitly configured direct-TLS endpoints. Checks do not send HTTP requests or read private keys.",
+            "loading": "Loading certificate monitoring state...",
+            "load_error": "Certificate monitoring state could not be loaded. No healthy result is assumed.",
+            "disabled": "Certificate monitoring is opt-in. Configure a root-owned targets file and set SECURITY_CERTIFICATE_MONITOR_ENABLED=true to enable it.",
+            "unavailable": "Unavailable",
+            "awaiting": "Awaiting first check",
+            "not_checked": "Not checked yet",
+            "status": {
+                "disabled": "Disabled",
+                "enabled": "Enabled"
+            },
+            "earliest_expiry": "Earliest expiry",
+            "targets": "Configured targets",
+            "interval": "Scheduled checks",
+            "interval_hours": "Every {{count}} h",
+            "interval_minutes": "Every {{count}} min",
+            "interval_hours_minutes": "Every {{hours}} h {{minutes}} min",
+            "cooldown": "Manual refresh cooldown: {{seconds}} s",
+            "target": "Target",
+            "expiry_title": "Expiry",
+            "identity": "Hostname / trust",
+            "last_check": "Last check",
+            "last_success": "Last certificate: {{timestamp}}",
+            "remediation_title": "Remediation",
+            "actions": "Actions",
+            "connect_via": "Connect via {{endpoint}}",
+            "refresh": "Refresh",
+            "refresh_target": "Refresh certificate state for {{label}}",
+            "refresh_success": "Certificate state refreshed for {{label}}.",
+            "remaining_days": "{{count}} d",
+            "remaining_hours": "{{count}} h",
+            "remaining_less_hour": "less than 1 h",
+            "remaining": "{{value}} remaining",
+            "overdue": "Overdue by {{value}}",
+            "expiry": {
+                "healthy": "Healthy",
+                "warning": "Expiring soon",
+                "critical": "Critical",
+                "expired": "Expired",
+                "not_yet_valid": "Not yet valid",
+                "unknown": "Unknown"
+            },
+            "hostname": {
+                "match": "Hostname matches",
+                "mismatch": "Hostname mismatch",
+                "unknown": "Hostname unknown"
+            },
+            "trust": {
+                "valid": "Trusted",
+                "invalid": "Untrusted",
+                "unknown": "Trust unknown"
+            },
+            "remediation": {
+                "pending": "Run the first check or wait for the immediate startup cycle.",
+                "coverage": "Check DNS, TCP/TLS reachability and the endpoint chain; unknown is not healthy.",
+                "trust": "Install a chain trusted by the server system store and reload the TLS service.",
+                "hostname": "Serve a certificate matching the configured SNI/hostname.",
+                "expiry_warning": "Schedule renewal and verify that the service reloads the renewed certificate.",
+                "expiry_critical": "Renew immediately and verify the certificate served by this endpoint.",
+                "expiry_expired": "Replace the expired certificate immediately and reload the TLS service.",
+                "expiry_not_yet_valid": "Check issuance dates and host time before deploying this certificate.",
+                "healthy": "No action required; periodic monitoring remains active."
+            },
+            "error_code": {
+                "dns_timeout": "DNS timeout",
+                "dns_failed": "DNS failed",
+                "connect_timeout": "Connection timeout",
+                "connect_refused": "Connection refused",
+                "connect_failed": "Connection failed",
+                "tls_timeout": "TLS timeout",
+                "tls_handshake_failed": "TLS handshake failed",
+                "certificate_missing": "Peer certificate missing",
+                "certificate_parse_failed": "Certificate parse failed",
+                "unsupported_protocol": "Unsupported protocol",
+                "cancelled": "Check cancelled",
+                "internal_error": "Internal check error"
+            },
+            "refresh_error": {
+                "invalid_request": "The refresh request was rejected. No target was changed.",
+                "certificate_monitor_disabled": "Certificate monitoring is disabled.",
+                "certificate_target_not_found": "The configured target no longer exists. Reload the current state.",
+                "certificate_refresh_busy": "A scheduled or manual certificate check is already running. Retry shortly.",
+                "certificate_refresh_cooldown": "This target was just checked. Retry in {{seconds}} seconds.",
+                "certificate_monitor_unavailable": "The refresh could not be completed safely. The stored state may be unchanged.",
+                "invalid_response": "The refresh result could not be verified. Reload the current state before retrying."
+            }
+        },
         "file_integrity": {
             "title": "Sensitive-file integrity",
             "loading": "Loading file-integrity status...",

@@ -179,6 +179,86 @@ export interface FileIntegrityActionErrorEnvelope {
     };
 }
 
+export type CertificateMonitorState = "disabled" | "enabled";
+
+export type CertificateReachability = "reachable" | "unknown";
+export type CertificateTrust = "valid" | "invalid" | "unknown";
+export type CertificateHostname = "match" | "mismatch" | "unknown";
+export type CertificateExpiry =
+    | "healthy"
+    | "warning"
+    | "critical"
+    | "expired"
+    | "not_yet_valid"
+    | "unknown";
+
+export type CertificateProbeErrorCode =
+    | "dns_timeout"
+    | "dns_failed"
+    | "connect_timeout"
+    | "connect_refused"
+    | "connect_failed"
+    | "tls_timeout"
+    | "tls_handshake_failed"
+    | "certificate_missing"
+    | "certificate_parse_failed"
+    | "unsupported_protocol"
+    | "cancelled"
+    | "internal_error";
+
+export interface CertificateCurrentObservation {
+    schema_version: 1;
+    checked_at: number;
+    duration_ms: number;
+    last_success_at: number | null;
+    reachability: CertificateReachability;
+    trust: CertificateTrust;
+    hostname: CertificateHostname;
+    expiry: CertificateExpiry;
+    not_before: number | null;
+    not_after: number | null;
+    remaining_seconds: number | null;
+    error_code: CertificateProbeErrorCode | null;
+}
+
+export interface CertificateTargetStatus {
+    target_id: string;
+    label: string;
+    connect_host: string;
+    port: number;
+    server_name: string;
+    observation: CertificateCurrentObservation | null;
+}
+
+export interface CertificateMonitorStatus {
+    schema_version: 1;
+    status: CertificateMonitorState;
+    interval_seconds: number | null;
+    refresh_cooldown_seconds: number;
+    earliest_expiry_at: number | null;
+    targets: CertificateTargetStatus[];
+}
+
+export interface CertificateRefreshResult {
+    schema_version: 1;
+    result: "refreshed";
+    target: CertificateTargetStatus & { observation: CertificateCurrentObservation };
+}
+
+export type CertificateRefreshErrorCode =
+    | "invalid_request"
+    | "certificate_monitor_disabled"
+    | "certificate_target_not_found"
+    | "certificate_refresh_busy"
+    | "certificate_refresh_cooldown"
+    | "certificate_monitor_unavailable";
+
+export interface CertificateRefreshErrorEnvelope {
+    error: {
+        code: CertificateRefreshErrorCode;
+    };
+}
+
 export type SensitiveFileCompleteEvidenceMetadata =
     | {
         state: "absent";
