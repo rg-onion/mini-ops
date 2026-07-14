@@ -1,4 +1,8 @@
 mod auth;
+// C1 is an intentionally isolated probe core. C2 will wire scheduling and
+// persistence after the observation contract has stabilized.
+#[allow(dead_code)]
+mod certificate_probe;
 mod cloud_payload;
 mod cloud_push;
 mod deployment;
