@@ -28,7 +28,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 pub(crate) const MAX_TARGETS: usize = 32;
 pub(crate) const MAX_CONCURRENCY: usize = 8;
-const MAX_CONFIG_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_DNS_ANSWERS: usize = 8;
 const MAX_CHAIN_CERTIFICATES: usize = 8;
 const MAX_CHAIN_BYTES: usize = 256 * 1024;
@@ -43,6 +43,14 @@ const DAY_SECONDS: i64 = 24 * 60 * 60;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TrustProfile {
     System,
+}
+
+impl TrustProfile {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::System => "system",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -220,6 +228,15 @@ pub(crate) enum ReachabilityStatus {
     Unknown,
 }
 
+impl ReachabilityStatus {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TrustStatus {
@@ -228,12 +245,32 @@ pub(crate) enum TrustStatus {
     Unknown,
 }
 
+impl TrustStatus {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HostnameStatus {
     Match,
     Mismatch,
     Unknown,
+}
+
+impl HostnameStatus {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -248,6 +285,17 @@ pub(crate) enum ExpiryStatus {
 }
 
 impl ExpiryStatus {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::Unknown => "unknown",
+        }
+    }
+
     const fn currently_valid(self) -> bool {
         matches!(self, Self::Healthy | Self::Warning | Self::Critical)
     }
@@ -265,9 +313,32 @@ pub(crate) enum CertificateProbeErrorCode {
     TlsHandshakeFailed,
     CertificateMissing,
     CertificateParseFailed,
+    // Reserved by the frozen v1 observation contract for future bounded
+    // protocol adapters and explicit service cancellation.
+    #[allow(dead_code)]
     UnsupportedProtocol,
+    #[allow(dead_code)]
     Cancelled,
     InternalError,
+}
+
+impl CertificateProbeErrorCode {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::DnsTimeout => "dns_timeout",
+            Self::DnsFailed => "dns_failed",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::ConnectRefused => "connect_refused",
+            Self::ConnectFailed => "connect_failed",
+            Self::TlsTimeout => "tls_timeout",
+            Self::TlsHandshakeFailed => "tls_handshake_failed",
+            Self::CertificateMissing => "certificate_missing",
+            Self::CertificateParseFailed => "certificate_parse_failed",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::Cancelled => "cancelled",
+            Self::InternalError => "internal_error",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

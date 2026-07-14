@@ -265,6 +265,75 @@ update. Структурная SQLite corruption остаётся restore-from-b
 добавляет check в общий audit, не меняет security score и не расширяет Cloud
 Push schema.
 
+## Мониторинг TLS-сертификатов
+
+Мониторинг TLS-сертификатов — отдельный opt-in collector для явно заданных
+direct-TLS endpoints. По умолчанию он выключен и никогда не сканирует каталоги
+сертификатов, private keys, Docker volumes, файловую систему или соседние
+хосты. Включение:
+
+```env
+SECURITY_CERTIFICATE_MONITOR_ENABLED=true
+SECURITY_CERTIFICATE_TARGETS_FILE=/etc/mini-ops/certificates.toml
+SECURITY_CERTIFICATE_INTERVAL_SECS=21600
+SECURITY_CERTIFICATE_MAX_CONCURRENCY=4
+```
+
+Targets file читается один раз при startup. Его absolute path и каждый ancestor
+обязаны принадлежать root и не быть group/other-writable; final regular file
+также не должен иметь execute/world permissions. Типичная установка:
+
+```bash
+sudo install -d -o root -g miniops -m 0750 /etc/mini-ops
+sudo install -o root -g miniops -m 0640 certificates.toml /etc/mini-ops/certificates.toml
+```
+
+Versioned file принимает от 1 до 32 explicit targets:
+
+```toml
+schema_version = 1
+
+[[targets]]
+id = "ops-dashboard"
+label = "Mini-Ops HTTPS"
+connect_host = "ops.example.com"
+port = 443
+server_name = "ops.example.com"
+trust_profile = "system"
+```
+
+Invalid env values, небезопасные owner/mode, malformed или oversized config,
+недоступные native roots и ошибка инициализации schema fail-closed завершают
+enabled startup с закрытым error code. Disabled path не читает файл и не
+создаёт certificate state. Interval имеет strict range `300..86400` секунд;
+concurrency — `1..8`, default `4`.
+
+Первый cycle запускается сразу. Следующие cycles пропускают missed ticks и не
+overlap-ятся. Для каждого target действует общий deadline 10 секунд, максимум
+восемь DNS answers и отсутствие HTTP/application request. Mini-Ops хранит одну
+current SQLite row на configured target; raw DER, chains, SAN lists, private
+keys и per-poll sample history никогда не сохраняются. Последующий transport
+failure сохраняет только timestamp последнего успеха, а current certificate
+fields становятся unknown.
+
+Expiry warning/critical/expired, not-yet-valid, hostname mismatch и invalid
+trust являются независимыми security events. Первый risk, reopen или severity
+increase создаёт одну durable Telegram transition; доказанный recovery — одну
+recovery transition. Идентичные polls уведомлений не создают. Unknown
+transport/parse state открывает coverage event без уведомления и никогда не
+закрывает существующий risk без healthy evidence. Удаление target из startup
+file удаляет current row и закрывает его certificate events без recovery
+message; ложная healthy observation не записывается.
+
+Event/outbox writes и current observation выполняются одной SQLite transaction.
+Certificate event evidence содержит только stable target ID и закрытые
+state/timestamp/error facts; target labels, connect hosts, SNI, issuer,
+fingerprints и raw library errors не попадают в event evidence и Telegram
+outbox. Certificate transitions остаются видны через существующий
+generic security-events API/UI; эта фаза не добавляет dedicated
+certificate current-state API/UI, manual refresh, Cloud Push fields, renewal
+automation или discovery локальных certificate files.
+
 ## Baseline listening ports
 
 Mini-Ops показывает listening sockets, которые не входят в локальный baseline

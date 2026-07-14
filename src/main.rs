@@ -1,7 +1,5 @@
 mod auth;
-// C1 is an intentionally isolated probe core. C2 will wire scheduling and
-// persistence after the observation contract has stabilized.
-#[allow(dead_code)]
+mod certificate_monitor;
 mod certificate_probe;
 mod cloud_payload;
 mod cloud_push;
@@ -41,6 +39,7 @@ use axum::{
     },
     routing::{delete, get, post},
 };
+use certificate_monitor::{CertificateMonitorConfig, CertificateMonitorService};
 use deployment::{
     DeploymentService, api_error_response, deploy_logs_sse_handler, trigger_update_handler,
 };
@@ -126,6 +125,13 @@ async fn main() {
             eprintln!("CRITICAL: file_integrity_configuration: {}", error.code());
             std::process::exit(1);
         });
+    let certificate_monitor_config = CertificateMonitorConfig::from_env().unwrap_or_else(|error| {
+        eprintln!(
+            "CRITICAL: certificate_monitor_configuration: {}",
+            error.code()
+        );
+        std::process::exit(1);
+    });
 
     let auth_token = match resolve_auth_token(runtime_mode) {
         Ok(token) => token,
@@ -206,6 +212,26 @@ async fn main() {
     let security_events = Arc::new(SecurityEventService::new(pool.clone()));
     let notification_outbox =
         Arc::new(NotificationOutbox::new(pool.clone(), notifications.clone()));
+    let certificate_monitor = if certificate_monitor_config.enabled() {
+        Some(
+            CertificateMonitorService::initialize_enabled(
+                pool.clone(),
+                Arc::clone(&notification_outbox),
+                Arc::clone(&notifications),
+                certificate_monitor_config,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "CRITICAL: certificate_monitor_initialization: {}",
+                    error.code()
+                );
+                std::process::exit(1);
+            }),
+        )
+    } else {
+        None
+    };
     let file_integrity = if file_integrity_config.enabled() {
         FileIntegrityService::initialize_enabled(
             pool.clone(),
@@ -257,6 +283,7 @@ async fn main() {
 
     let _notification_worker = Arc::clone(&notification_outbox).start();
     let _file_integrity_worker = Arc::clone(&file_integrity).start();
+    let _certificate_monitor_worker = certificate_monitor.map(|service| service.start());
 
     // Start the monitor only after all fail-fast runtime state is ready.
     let security_monitor = Arc::new(SecurityMonitor::new(
