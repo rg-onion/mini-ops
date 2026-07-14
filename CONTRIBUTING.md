@@ -46,6 +46,19 @@ npm run dev
 - **Frontend**: Use `eslint` and `prettier`.
 - **Commits**: Use conventional commits (e.g., `feat: add new widget`, `fix: resolve crash on startup`).
 
+For dependency changes, install `cargo-audit` and run:
+
+```bash
+node scripts/tests/check_cargo_audit.mjs
+bash scripts/check_cargo_audit.sh
+```
+
+The policy wrapper keeps RustSec fail-closed while allowing only the reviewed
+`spin` 0.9.8 yank with its exact checksum and dependency path. Raw
+`cargo audit` remains strict and exits non-zero until that transitive package
+can be removed. Any vulnerability, additional warning/yank, changed checksum,
+or new direct dependent fails the wrapper and CI.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.

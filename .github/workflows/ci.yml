@@ -78,6 +78,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Enforce reviewed Rust audit policy
+        run: |
+          node scripts/tests/check_cargo_audit.mjs
+          bash scripts/check_cargo_audit.sh --no-fetch
+
       - name: Validate shell scripts
         shell: bash
         run: |

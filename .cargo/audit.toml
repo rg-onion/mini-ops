@@ -5,8 +5,16 @@
 # cargo tree --locked --target x86_64-unknown-linux-gnu -i rsa@0.9.10
 # cargo tree --locked --target all -i rsa@0.9.10
 #
-# Owner/revisit: Mini-Ops maintainers must remove this ignore if `rsa` becomes
-# reachable, when a patched release exists, or during the mandatory P9 audit.
+# `scripts/check_cargo_audit.sh` now enforces that `rsa` remains unreachable.
+# Owner/revisit: Mini-Ops maintainers must remove this ignore if a patched
+# release exists or the package can be removed from Cargo.lock.
+#
+# A newly yanked `spin` 0.9.8 remains reachable only through
+# `sqlx-sqlite` -> `flume` 0.11.1. Raw `cargo audit` intentionally remains
+# strict and exits non-zero. `scripts/check_cargo_audit.sh` accepts exactly
+# that name/version/checksum/direct-dependent tuple and rejects every advisory,
+# other warning, other yank, or new dependency path. Remove the exception as
+# soon as SQLx can use flume 0.12+ or the package is no longer reachable.
 [advisories]
 ignore = ["RUSTSEC-2023-0071"]
 
