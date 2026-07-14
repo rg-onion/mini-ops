@@ -19,6 +19,8 @@ futures-util = "0.3.31"
 mime_guess = "2.0.5"
 rand = "0.9.3"
 reqwest = { version = "0.13.1", features = ["json"] }
+rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8.3"
 rust-embed = "8.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -26,7 +28,9 @@ sha2 = "0.10.9"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 sysinfo = "0.38.0"
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tokio-stream = "0.1.18"
+toml = { version = "1.1.2", default-features = false, features = ["parse", "serde", "std"] }
 tower = "0.5.3"
 tower-http = { version = "0.6.8", features = ["fs", "trace"] }
 tracing = "0.1.44"
@@ -35,3 +39,7 @@ hostname = "0.4"
 libc = "0.2.180"
 url = "2.5.8"
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
+x509-parser = { version = "0.18.1", default-features = false }
+
+[dev-dependencies]
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs"] }
