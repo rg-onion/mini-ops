@@ -197,10 +197,10 @@ route returns `503` with error code `security_audit_unavailable` rather than a
 stale healthy result.
 
 Unknown or incomplete facts remain visible as `WARN` and mark the snapshot
-`degraded`. Cloud Push reads snapshots only; it skips a push when the snapshot
-is missing, degraded, or older than twice the audit interval, because its
-current security payload cannot express unknown values without misleading
-zero/healthy fields.
+`degraded`. Cloud Push reads snapshots only and never starts an audit. Fleet
+Observation v1 keeps the server heartbeat and reports `security.status` as
+`missing`, `stale`, or `degraded` with no score/counts when the snapshot is not
+publishable. It never substitutes zero or a healthy value for unknown state.
 
 ## Sensitive-File Integrity
 
@@ -329,8 +329,12 @@ state/event/outbox transaction. Manual checks have a 60-second per-target
 cooldown and do not overlap a scheduled or other manual cycle; a busy cycle is
 rejected immediately rather than holding the HTTP request. Unknown IDs,
 disabled state, cooldown, busy state, and storage failure return closed,
-redacted errors. This feature does not add Cloud Push fields, renewal
-automation, or local certificate-file discovery.
+redacted errors. When both opt-in features are enabled, Fleet Observation v1
+projects only target ID, configured TLS `server_name`, port, freshness,
+timestamps, bounded status enums, `not_after`, and a closed error code. It omits
+the target label, connect host, issuer, fingerprint, certificate bytes, SANs,
+paths, and keys. This feature does not add renewal automation or local
+certificate-file discovery.
 
 ## Listening Port Baseline
 

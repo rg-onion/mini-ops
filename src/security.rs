@@ -408,22 +408,6 @@ impl SecurityAuditor {
         ((earned * 100) / total_weight).min(100)
     }
 
-    pub fn extract_open_ports(checks: &[SecurityCheck]) -> Vec<u16> {
-        let mut ports = checks
-            .iter()
-            .find(|check| check.id == "network.listening_ports")
-            .and_then(|check| check.metadata.get("open_ports"))
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|port| port.parse::<u16>().ok())
-            .collect::<Vec<_>>();
-
-        ports.sort_unstable();
-        ports.dedup();
-        ports
-    }
-
     fn severity_weight(check: &SecurityCheck) -> u32 {
         match check.severity.as_str() {
             "critical" => 35,

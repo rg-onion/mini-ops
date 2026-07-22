@@ -20,9 +20,11 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
   - **SSH Мониторинг**: Telegram уведомления при входе (PAM хук).
   - **Проверки Hardening**: Аудит конфига SSH, статуса Fail2Ban, UFW фаервола и открытых портов.
   - **Целостность sensitive files**: opt-in low-privilege обнаружение drift с локальным private baseline.
+  - **Мониторинг TLS-сертификатов**: opt-in проверки до 32 явно заданных обслуживаемых endpoints без поиска по filesystem и чтения private keys.
   - **Доверенные IP**: Управление белым списком для безопасного доступа.
 - **📊 Системный мониторинг**: Загрузка CPU/RAM/Disk + история метрик.
 - **🔔 Уведомления**: Telegram алерты при превышении порогов CPU и диска + изменения статуса безопасности.
+- **☁️ Fleet Observation Push**: optional outbound-only v1 projection минимизированного system, security и certificate state в Hub оператора.
 - **💾 Анализ диска**: просмотр использования диска сборками, зависимостями, Docker и journald в режиме только для чтения.
 - **🌍 Локализация**: Полная поддержка Русского и Английского языков.
 
@@ -139,6 +141,12 @@ Mini-Ops разработан с учетом безопасности:
   нельзя включить в этой версии.
 
 Подробнее: [docs/SECURITY.ru.md](docs/SECURITY.ru.md).
+
+В репозитории реализован opt-in agent-side протокол Fleet observations, но нет
+hosted Hub или встроенного Fleet server. Текущий implementation status, privacy
+boundary и контракт receiver описаны в
+[docs/CLOUD_PUSH.ru.md](docs/CLOUD_PUSH.ru.md) и
+[docs/FLEET_INTEGRATION.ru.md](docs/FLEET_INTEGRATION.ru.md).
 
 Индекс документации: [docs/README.md](docs/README.md).
 

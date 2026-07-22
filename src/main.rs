@@ -308,10 +308,9 @@ async fn main() {
     if std::env::var("CLOUD_PUSH_ENABLED").as_deref() == Ok("true") {
         match (
             std::env::var("CLOUD_HUB_URL"),
-            std::env::var("CLOUD_AGENT_ID"),
             std::env::var("CLOUD_AGENT_TOKEN"),
         ) {
-            (Ok(hub_url), Ok(agent_id), Ok(agent_token)) => {
+            (Ok(hub_url), Ok(agent_token)) => {
                 let interval = match std::env::var_os("CLOUD_PUSH_INTERVAL") {
                     None => cloud_push::parse_push_interval(None),
                     Some(value) => value
@@ -323,24 +322,25 @@ async fn main() {
                     Ok(interval) => {
                         let config = cloud_push::CloudPushConfig {
                             hub_url,
-                            agent_id,
                             agent_token,
                             push_interval_secs: interval,
+                            allow_http: std::env::var("CLOUD_PUSH_ALLOW_HTTP").as_deref()
+                                == Ok("true"),
                         };
                         match cloud_push::CloudPushService::new(
                             config,
                             Arc::clone(&security_snapshots),
+                            certificate_monitor.clone(),
                         ) {
                             Ok(svc) => {
-                                Arc::new(svc).start(
-                                    Arc::clone(&metrics_state),
-                                    docker_service.clone(),
-                                    Arc::clone(&ssh_alerts_service),
-                                );
+                                Arc::new(svc).start(Arc::clone(&metrics_state));
                                 tracing::info!("Cloud push enabled, interval={}s", interval);
                             }
                             Err(e) => {
-                                tracing::error!("Cloud push disabled: {}", e);
+                                tracing::error!(
+                                    configuration_error = e.code(),
+                                    "Cloud push disabled: invalid configuration"
+                                );
                             }
                         }
                     }
@@ -351,7 +351,7 @@ async fn main() {
                 }
             }
             _ => tracing::warn!(
-                "CLOUD_PUSH_ENABLED=true but CLOUD_HUB_URL/CLOUD_AGENT_ID/CLOUD_AGENT_TOKEN missing"
+                "CLOUD_PUSH_ENABLED=true but CLOUD_HUB_URL/CLOUD_AGENT_TOKEN missing"
             ),
         }
     }

@@ -24,9 +24,11 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
   - **SSH Monitoring**: Telegram alerts on login (PAM hook).
   - **Hardening Checks**: Audits SSH config, Fail2Ban status, UFW firewall, and listening ports.
   - **Sensitive-File Integrity**: opt-in, low-privilege drift detection with a local private baseline.
+  - **TLS Certificate Monitoring**: opt-in checks for up to 32 explicitly configured served endpoints; no filesystem or private-key discovery.
   - **Trusted IPs**: Whitelist management for secure access.
 - **📊 System Monitoring**: CPU/RAM/Disk usage + metrics history.
 - **🔔 Alerts**: Telegram alerts for CPU and disk thresholds + security state changes.
+- **☁️ Fleet Observation Push**: optional, outbound-only v1 projection of minimized system, security, and certificate state to an operator-controlled Hub.
 - **💾 Disk Analysis**: inspect build, dependency, Docker, and journal disk usage in a read-only dashboard.
 - **🌍 Localization**: Full support for English and Russian languages.
 
@@ -143,6 +145,12 @@ Production recommendations:
   cleanup cannot be enabled in this release.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
+
+The repository contains an opt-in agent-side Fleet observation protocol, but no
+hosted Hub or bundled Fleet server. Its current implementation status, privacy
+boundary, and receiver contract are documented in
+[docs/CLOUD_PUSH.md](docs/CLOUD_PUSH.md) and
+[docs/FLEET_INTEGRATION.md](docs/FLEET_INTEGRATION.md).
 
 Documentation index: [docs/README.md](docs/README.md)
 

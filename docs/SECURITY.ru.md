@@ -216,10 +216,11 @@ language-neutral single-flight snapshot аудита. Concurrent refresh-зап�
 `security_audit_unavailable`, а не устаревший healthy result.
 
 Unknown или incomplete facts остаются видимыми как `WARN` и помечают snapshot
-как `degraded`. Cloud Push только читает snapshot и пропускает push, если он
-отсутствует, degraded или старше удвоенного audit interval: текущий security
-payload не умеет честно представить unknown values без misleading zero/healthy
-полей.
+как `degraded`. Cloud Push только читает snapshot и никогда не запускает audit.
+Fleet Observation v1 сохраняет server heartbeat и выставляет
+`security.status` в `missing`, `stale` или `degraded` без score/counts, если
+snapshot нельзя безопасно публиковать. Unknown state никогда не заменяется
+нулём или healthy-значением.
 
 ## Контроль целостности sensitive files
 
@@ -348,8 +349,12 @@ direct-TLS probe и atomic state/event/outbox transaction. Для ручной �
 действует per-target cooldown 60 секунд; она не overlap-ится с scheduled или
 другим manual cycle, а busy cycle отклоняется сразу без удержания HTTP request.
 Unknown ID, disabled state, cooldown, busy state и storage failure возвращают
-закрытые redacted errors. Эта возможность не добавляет Cloud Push fields,
-renewal automation или discovery локальных certificate files.
+закрытые redacted errors. Если включены обе opt-in возможности, Fleet
+Observation v1 передаёт только target ID, настроенный TLS `server_name`, port,
+freshness, timestamps, bounded status enums, `not_after` и закрытый error code.
+Target label, connect host, issuer, fingerprint, certificate bytes, SAN, paths
+и keys не передаются. Эта возможность не добавляет renewal automation или
+discovery локальных certificate files.
 
 ## Baseline listening ports
 
