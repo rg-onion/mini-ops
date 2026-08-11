@@ -7,6 +7,34 @@ export interface SystemStats {
     timestamp: number;
 }
 
+export type MetricsHistoryWindow = "1h" | "6h" | "24h" | "7d";
+
+export type MetricsHistoryResolution = "raw" | "5m" | "1h";
+
+export interface MetricsHistoryAggregate {
+    avg: number;
+    max: number;
+}
+
+export interface MetricsHistoryPoint {
+    timestamp: number;
+    sample_count: number;
+    cpu_percent: MetricsHistoryAggregate;
+    memory_percent: MetricsHistoryAggregate | null;
+    disk_percent: MetricsHistoryAggregate | null;
+}
+
+export interface MetricsHistoryResponse {
+    schema_version: 1;
+    window: MetricsHistoryWindow;
+    resolution: MetricsHistoryResolution;
+    requested_start: number;
+    oldest_timestamp: number | null;
+    newest_timestamp: number | null;
+    partial: boolean;
+    points: MetricsHistoryPoint[];
+}
+
 export interface ContainerInfo {
     id: string;
     name: string;
@@ -15,6 +43,13 @@ export interface ContainerInfo {
     state: string;
     ports: string;
 }
+
+export type SecurityAuditResultKind =
+    | "pass"
+    | "finding"
+    | "recommendation"
+    | "unverified"
+    | "coverage";
 
 export interface AuditSecurityEventEvidenceData<Status extends "FAIL" | "WARN"> {
     check_id: string;

@@ -7,9 +7,12 @@ Available on the main page at `/`.
 Displays:
 - **CPU**: Processor load (%).
 - **RAM**: Used / Total memory.
-- **Disk**: Used / Total space.
+- **Disk**: Used / Free / Total capacity.
 
-Graphs store history for the last **60 minutes**.
+The CPU, RAM, and disk graphs offer bounded **1h**, **6h**, **24h**, and **7d**
+windows. The dashboard distinguishes loading, empty, unavailable, and partial
+history instead of filling missing data with zero. See
+[Metrics History](METRICS_HISTORY.md) for retention, resolution, and API details.
 
 ## 🐳 Docker Logs
 You can view Docker container logs in real-time:

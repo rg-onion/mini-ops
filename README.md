@@ -23,13 +23,14 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, embedded into the binary at
 - **🛡️ Security Auditor**:
   - **SSH Monitoring**: Telegram alerts on login (PAM hook).
   - **Hardening Checks**: Audits SSH config, Fail2Ban status, UFW firewall, and listening ports.
+  - **Truthful Posture**: Separates confirmed findings and recommendations from partial audit coverage.
   - **Sensitive-File Integrity**: opt-in, low-privilege drift detection with a local private baseline.
   - **TLS Certificate Monitoring**: opt-in checks for up to 32 explicitly configured served endpoints; no filesystem or private-key discovery.
   - **Trusted IPs**: Whitelist management for secure access.
-- **📊 System Monitoring**: CPU/RAM/Disk usage + metrics history.
+- **📊 System Monitoring**: current CPU, RAM, and disk capacity plus
+  [bounded metrics history](docs/METRICS_HISTORY.md) from one hour to seven days.
 - **🔔 Alerts**: Telegram alerts for CPU and disk thresholds + security state changes.
 - **☁️ Fleet Observation Push**: optional, outbound-only v1 projection of minimized system, security, and certificate state to an operator-controlled Hub.
-- **💾 Disk Analysis**: inspect build, dependency, Docker, and journal disk usage in a read-only dashboard.
 - **🌍 Localization**: Full support for English and Russian languages.
 
 ---
@@ -138,11 +139,8 @@ Production recommendations:
 - Put Mini-Ops behind HTTPS reverse proxy (Nginx/Caddy/Cloudflare Tunnel).
 - Avoid exposing port `8090` publicly without TLS.
 - Run service as dedicated non-root user whenever possible.
-- Keep the experimental web source-build endpoint disabled unless explicitly
-  needed (`MINI_OPS_ALLOW_WEB_UPDATE=false` by default). It does not install or
-  restart the running service.
-- Disk cleanup is disabled by default and unavailable in the dashboard. Docker
-  cleanup cannot be enabled in this release.
+- Perform upgrades through the documented host deployment workflow with a
+  verified artifact, backup, rollback point, and post-change health checks.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for details.
 

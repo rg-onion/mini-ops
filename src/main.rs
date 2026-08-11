@@ -3,13 +3,11 @@ mod certificate_monitor;
 mod certificate_probe;
 mod cloud_payload;
 mod cloud_push;
-mod deployment;
-mod disk_ops;
 mod docker;
 mod file_integrity;
-mod history;
 mod i18n;
 mod metrics;
+mod metrics_history;
 mod notifications;
 mod retention;
 mod runtime;
@@ -30,42 +28,37 @@ use rand::Rng;
 use auth::auth_middleware;
 use axum::{
     Json, Router,
-    extract::{FromRef, Path, Query, Request, State},
+    extract::{Path, Query, RawQuery, Request, State},
     http::{StatusCode, header},
-    middleware::{self, Next},
+    middleware,
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{delete, get, post},
+    routing::{any, delete, get, post},
 };
 use certificate_monitor::{
     CertificateMonitorConfig, CertificateMonitorService, CertificateMonitorStatus,
     CertificateRefreshError,
 };
-use deployment::{
-    DeploymentService, api_error_response, deploy_logs_sse_handler, trigger_update_handler,
-};
-use disk_ops::{DiskOps, DiskUsageBreakdown};
 use docker::DockerService;
 use file_integrity::{
     FileIntegrityConfig, FileIntegrityOperationError, FileIntegrityService, ReEnrollRequest,
     TrustCurrentStateRequest,
 };
-use history::HistoryManager;
 use metrics::{MetricsState, SystemStats};
+use metrics_history::HistoryError;
 use notifications::{
     NotificationEvent, NotificationOutbox, NotificationOutcome, NotificationService,
 };
 use rust_embed::RustEmbed;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tracing::{Level, Metadata};
 use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
-const DISK_CLEANUP_ENV: &str = "MINI_OPS_ALLOW_DISK_CLEANUP";
 const RESTRICTED_LOG_TARGETS: &[&str] = &[
     "bollard",
     "h2",
@@ -77,33 +70,24 @@ const RESTRICTED_LOG_TARGETS: &[&str] = &[
     "tokio_rustls",
 ];
 
-#[derive(Clone, Copy)]
-struct DiskCleanupGate {
-    enabled: bool,
+#[derive(Serialize)]
+struct ApiErrorEnvelope {
+    error: ApiError,
 }
 
-impl DiskCleanupGate {
-    fn from_env() -> Self {
-        Self {
-            enabled: disk_cleanup_enabled(std::env::var(DISK_CLEANUP_ENV).ok().as_deref()),
-        }
-    }
+#[derive(Serialize)]
+struct ApiError {
+    code: &'static str,
 }
 
-fn disk_cleanup_enabled(value: Option<&str>) -> bool {
-    value == Some("true")
-}
-
-async fn require_disk_cleanup(
-    State(gate): State<DiskCleanupGate>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if !gate.enabled {
-        return api_error_response(StatusCode::FORBIDDEN, "capability_disabled");
-    }
-
-    next.run(request).await
+fn api_error_response(status: StatusCode, code: &'static str) -> Response {
+    (
+        status,
+        Json(ApiErrorEnvelope {
+            error: ApiError { code },
+        }),
+    )
+        .into_response()
 }
 
 #[derive(RustEmbed)]
@@ -301,9 +285,6 @@ async fn main() {
         security_monitor.run_loop().await;
     });
 
-    let deployment_service = Arc::new(DeploymentService::new());
-    let history_manager = Arc::new(HistoryManager::new("history.json"));
-
     // Cloud Push (optional)
     if std::env::var("CLOUD_PUSH_ENABLED").as_deref() == Ok("true") {
         match (
@@ -447,7 +428,6 @@ async fn main() {
     let protected_api = Router::new()
         .route("/stats", get(get_stats_handler))
         .route("/stats/history", get(get_history_handler))
-        .route("/history", get(list_deployments_handler))
         .route("/test-notification", post(test_notification_handler))
         .route("/docker/containers", get(list_containers_handler))
         .route(
@@ -455,16 +435,6 @@ async fn main() {
             post(container_action_handler),
         )
         .route("/docker/containers/{id}/logs", get(docker_logs_sse_handler)) // SSE by default now
-        .route("/disk/usage", get(get_disk_usage_handler))
-        .route(
-            "/disk/clean",
-            post(clean_disk_handler).route_layer(middleware::from_fn_with_state(
-                DiskCleanupGate::from_env(),
-                require_disk_cleanup,
-            )),
-        )
-        .route("/deploy/webhook", post(trigger_update_handler))
-        .route("/deploy/logs", get(deploy_logs_sse_handler))
         .route("/security/audit", get(get_security_audit_handler))
         .route("/security/certificates", get(get_certificates_handler))
         .route(
@@ -503,6 +473,9 @@ async fn main() {
 
     let app = Router::new()
         .nest("/api", api_routes)
+        .route("/api", any(api_not_found_handler))
+        .route("/api/", any(api_not_found_handler))
+        .route("/api/{*path}", any(api_not_found_handler))
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
         .route("/{*path}", get(handler)) // Modern catch-all
@@ -512,8 +485,6 @@ async fn main() {
             db: pool,
             notifier: notifications,
             docker: docker_service,
-            deployment: deployment_service,
-            history: history_manager,
             ssh_alerts: ssh_alerts_service,
             security_events,
             security_snapshots,
@@ -719,8 +690,6 @@ struct AppState {
     db: sqlx::SqlitePool,
     notifier: Arc<NotificationService>,
     docker: Option<Arc<DockerService>>,
-    deployment: Arc<DeploymentService>,
-    history: Arc<HistoryManager>,
     ssh_alerts: Arc<SshAlertsService>,
     security_events: Arc<SecurityEventService>,
     security_snapshots: Arc<SecuritySnapshotService>,
@@ -728,50 +697,52 @@ struct AppState {
     certificate_monitor: Option<Arc<CertificateMonitorService>>,
 }
 
-impl FromRef<AppState> for Arc<DeploymentService> {
-    fn from_ref(state: &AppState) -> Self {
-        state.deployment.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<HistoryManager> {
-    fn from_ref(state: &AppState) -> Self {
-        state.history.clone()
-    }
-}
-
 async fn get_stats_handler(State(state): State<AppState>) -> Json<SystemStats> {
     Json(state.metrics.get_current())
 }
 
-async fn get_history_handler(State(state): State<AppState>) -> Json<Vec<SystemStats>> {
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT cpu_usage, memory_used, memory_total, disk_used, disk_total, timestamp FROM metrics ORDER BY timestamp DESC LIMIT 60"
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+async fn get_history_handler(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match metrics_history::parse_history_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(error) => return history_error_response(error),
+    };
 
-    let stats = rows
-        .into_iter()
-        .map(|row| SystemStats {
-            cpu_usage: row.get::<f64, _>("cpu_usage") as f32,
-            memory_used: row.get::<i64, _>("memory_used") as u64,
-            memory_total: row.get::<i64, _>("memory_total") as u64,
-            disk_used: row.get::<i64, _>("disk_used") as u64,
-            disk_total: row.get::<i64, _>("disk_total") as u64,
-            timestamp: row.get::<i64, _>("timestamp"),
-        })
-        .collect();
-
-    Json(stats)
+    match query {
+        None => match metrics_history::fetch_legacy_history(&state.db).await {
+            Ok(stats) => Json(stats).into_response(),
+            Err(error) => history_error_response(error),
+        },
+        Some(query) => {
+            match metrics_history::fetch_history(&state.db, query, chrono::Utc::now().timestamp())
+                .await
+            {
+                Ok(history) => Json(history).into_response(),
+                Err(error) => history_error_response(error),
+            }
+        }
+    }
 }
 
-async fn list_deployments_handler(
-    State(state): State<AppState>,
-) -> Json<Vec<history::DeploymentRecord>> {
-    Json(state.history.get_history())
+fn history_error_response(error: HistoryError) -> Response {
+    match error {
+        HistoryError::InvalidQuery => {
+            api_error_response(StatusCode::BAD_REQUEST, "invalid_history_query")
+        }
+        HistoryError::ResolutionTooFine => {
+            api_error_response(StatusCode::BAD_REQUEST, "history_resolution_too_fine")
+        }
+        HistoryError::Unavailable => api_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics_history_unavailable",
+        ),
+    }
+}
+
+async fn api_not_found_handler() -> Response {
+    api_error_response(StatusCode::NOT_FOUND, "not_found")
 }
 
 async fn test_notification_handler(
@@ -913,54 +884,6 @@ async fn docker_logs_sse_handler(
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
-}
-
-async fn get_disk_usage_handler() -> Json<DiskUsageBreakdown> {
-    Json(DiskOps::get_usage(".").await)
-}
-
-#[derive(serde::Deserialize)]
-struct CleanRequest {
-    target: String,
-}
-
-#[derive(Clone, Copy)]
-enum DiskCleanupTarget {
-    Target,
-    NodeModules,
-    Logs,
-}
-
-async fn clean_disk_handler(Json(payload): Json<CleanRequest>) -> Response {
-    dispatch_disk_cleanup(&payload.target, |target| async move {
-        match target {
-            DiskCleanupTarget::Target => DiskOps::clean_target(".").await,
-            DiskCleanupTarget::NodeModules => DiskOps::clean_node_modules(".").await,
-            DiskCleanupTarget::Logs => DiskOps::clean_logs().await,
-        }
-    })
-    .await
-}
-
-async fn dispatch_disk_cleanup<F, Fut>(target: &str, execute: F) -> Response
-where
-    F: FnOnce(DiskCleanupTarget) -> Fut,
-    Fut: std::future::Future<Output = Result<String, String>>,
-{
-    let target = match target {
-        "target" => DiskCleanupTarget::Target,
-        "node_modules" => DiskCleanupTarget::NodeModules,
-        "logs" => DiskCleanupTarget::Logs,
-        "docker" => {
-            return api_error_response(StatusCode::FORBIDDEN, "operation_unavailable");
-        }
-        _ => return api_error_response(StatusCode::BAD_REQUEST, "invalid_target"),
-    };
-
-    match execute(target).await {
-        Ok(msg) => (StatusCode::OK, msg).into_response(),
-        Err(_) => api_error_response(StatusCode::INTERNAL_SERVER_ERROR, "operation_failed"),
-    }
 }
 
 async fn index_handler() -> impl IntoResponse {
@@ -1315,15 +1238,12 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::{Request as HttpRequest, header::CONTENT_TYPE},
+        http::{Method, Request as HttpRequest, header::CONTENT_TYPE},
     };
     use serde_json::Value;
     use std::io::{self, Write};
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tower::Service;
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    use tower::ServiceExt;
 
     #[derive(Clone)]
     struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
@@ -1339,13 +1259,6 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-    }
-
-    #[derive(Default)]
-    struct SideEffectCounters {
-        command_calls: AtomicUsize,
-        history_writes: AtomicUsize,
-        file_writes: AtomicUsize,
     }
 
     #[test]
@@ -1388,16 +1301,6 @@ mod tests {
         assert!(!output.contains("TELEGRAM_TOKEN_SENTINEL"));
         assert!(output.contains("dependency_warning"));
         assert!(output.contains("app_debug_visible"));
-    }
-
-    async fn counted_cleanup_handler(
-        State(counters): State<Arc<SideEffectCounters>>,
-        Json(_payload): Json<CleanRequest>,
-    ) -> StatusCode {
-        counters.command_calls.fetch_add(1, Ordering::SeqCst);
-        counters.history_writes.fetch_add(1, Ordering::SeqCst);
-        counters.file_writes.fetch_add(1, Ordering::SeqCst);
-        StatusCode::OK
     }
 
     async fn assert_error_code(response: Response, expected: &str) {
@@ -1528,11 +1431,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disk_cleanup_gate_requires_exact_lowercase_true() {
-        assert!(disk_cleanup_enabled(Some("true")));
-        for value in [None, Some(""), Some(" true "), Some("TRUE"), Some("1")] {
-            assert!(!disk_cleanup_enabled(value));
+    #[tokio::test]
+    async fn metrics_history_errors_use_typed_closed_envelopes() {
+        for (error, status, code) in [
+            (
+                HistoryError::InvalidQuery,
+                StatusCode::BAD_REQUEST,
+                "invalid_history_query",
+            ),
+            (
+                HistoryError::ResolutionTooFine,
+                StatusCode::BAD_REQUEST,
+                "history_resolution_too_fine",
+            ),
+            (
+                HistoryError::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metrics_history_unavailable",
+            ),
+        ] {
+            let response = history_error_response(error);
+            assert_eq!(response.status(), status);
+            assert_error_code(response, code).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_api_paths_do_not_fall_through_to_the_spa() {
+        let app = Router::new()
+            .route("/api", any(api_not_found_handler))
+            .route("/api/", any(api_not_found_handler))
+            .route("/api/{*path}", any(api_not_found_handler))
+            .route("/{*path}", get(|| async { StatusCode::OK }));
+
+        for (method, path) in [
+            (Method::GET, "/api"),
+            (Method::GET, "/api/"),
+            (Method::GET, "/api/disk/usage"),
+            (Method::POST, "/api/disk/clean"),
+            (Method::GET, "/api/history"),
+            (Method::POST, "/api/deploy/webhook"),
+            (Method::GET, "/api/deploy/logs"),
+        ] {
+            let request = HttpRequest::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .expect("test request should build");
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("test router should respond");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_error_code(response, "not_found").await;
         }
     }
 
@@ -1567,56 +1520,6 @@ mod tests {
                 .expect("strong standalone token should be accepted"),
             Some(token)
         );
-    }
-
-    #[tokio::test]
-    async fn disabled_malformed_disk_post_is_rejected_before_parsing_or_side_effects() {
-        let counters = Arc::new(SideEffectCounters::default());
-        let mut app = Router::new()
-            .route(
-                "/disk/clean",
-                post(counted_cleanup_handler).route_layer(middleware::from_fn_with_state(
-                    DiskCleanupGate { enabled: false },
-                    require_disk_cleanup,
-                )),
-            )
-            .with_state(counters.clone());
-        let request = HttpRequest::builder()
-            .method("POST")
-            .uri("/disk/clean")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from("{not-json"))
-            .expect("test request should build");
-
-        let response = Service::call(&mut app, request)
-            .await
-            .expect("test router should respond");
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_error_code(response, "capability_disabled").await;
-        assert_eq!(counters.command_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.history_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.file_writes.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn docker_cleanup_is_unavailable_without_executor_side_effects() {
-        let counters = Arc::new(SideEffectCounters::default());
-        let captured = counters.clone();
-
-        let response = dispatch_disk_cleanup("docker", move |_target| async move {
-            captured.command_calls.fetch_add(1, Ordering::SeqCst);
-            captured.history_writes.fetch_add(1, Ordering::SeqCst);
-            captured.file_writes.fetch_add(1, Ordering::SeqCst);
-            Ok("unexpected".to_string())
-        })
-        .await;
-
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert_error_code(response, "operation_unavailable").await;
-        assert_eq!(counters.command_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.history_writes.load(Ordering::SeqCst), 0);
-        assert_eq!(counters.file_writes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -134,8 +134,6 @@ APP_HOST=127.0.0.1
 APP_PORT=3000
 DATABASE_URL=sqlite:///var/lib/mini-ops/mini-ops.db
 MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token
-MINI_OPS_ALLOW_WEB_UPDATE=false
-MINI_OPS_ALLOW_DISK_CLEANUP=false
 ```
 
 Сгенерируйте `AUTH_TOKEN` командой `openssl rand -hex 32`. Managed startup
@@ -187,3 +185,9 @@ service account в root-equivalent группу Docker. Docker integration тр�
 Для существующей установки с mutable state под `/opt/mini-ops` нельзя заменять
 только binary или unit на этот layout. Сохраните текущий сервис и state до
 миграции при остановленном сервисе с проверенным backup и rollback point.
+
+Managed-обновления продолжают сохранять существующий `history.json` как
+неактивный legacy state. Работающий агент не разбирает и не дописывает этот
+файл; bootstrap только сохраняет его, включает в snapshot и восстанавливает при
+rollback. Администратор может отдельно архивировать или удалить его
+после окончания rollback window; bootstrap не удаляет его автоматически.

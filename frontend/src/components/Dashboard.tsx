@@ -1,12 +1,30 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, AlertTriangle, Cpu, HardDrive, LayoutDashboard, LoaderCircle, RefreshCcw } from "lucide-react";
+import {
+    Activity,
+    AlertTriangle,
+    Cpu,
+    HardDrive,
+    LayoutDashboard,
+    LoaderCircle,
+    RefreshCcw,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { apiFetch } from "@/api";
 import { Button } from "@/components/ui/button";
-import type { SystemStats } from "@/types";
+import { decodeMetricsHistoryResponse, readBoundedMetricsHistoryJson } from "@/lib/metricsHistory";
+import type {
+    MetricsHistoryAggregate,
+    MetricsHistoryPoint,
+    MetricsHistoryResponse,
+    MetricsHistoryWindow,
+    SystemStats,
+} from "@/types";
 import { StatsCard } from "./StatsCard";
-import { StatsChart } from "./StatsChart";
+import { StatsChart, type StatsChartDatum } from "./StatsChart";
+
+const HISTORY_WINDOWS: MetricsHistoryWindow[] = ["1h", "6h", "24h", "7d"];
 
 function isSystemStats(value: unknown): value is SystemStats {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -41,14 +59,13 @@ async function fetchStats(): Promise<SystemStats> {
     return payload;
 }
 
-async function fetchHistory(): Promise<SystemStats[]> {
-    const response = await apiFetch("/stats/history");
+async function fetchHistory(window: MetricsHistoryWindow): Promise<MetricsHistoryResponse> {
+    const response = await apiFetch(`/stats/history?window=${window}&resolution=auto`);
     if (!response.ok) throw new Error("metrics_history_request_failed");
-    const payload: unknown = await response.json();
-    if (!Array.isArray(payload) || !payload.every(isSystemStats)) {
-        throw new Error("metrics_history_invalid_response");
-    }
-    return payload;
+    const payload = await readBoundedMetricsHistoryJson(response);
+    const history = decodeMetricsHistoryResponse(payload, window);
+    if (history === null) throw new Error("metrics_history_invalid_response");
+    return history;
 }
 
 function formatBytes(bytes: number | undefined) {
@@ -69,16 +86,38 @@ function formatPercent(value: number | undefined, total?: number) {
     return `${value.toFixed(1)}%`;
 }
 
+function formatTimestamp(timestamp: number, locale: string) {
+    return new Intl.DateTimeFormat(locale, {
+        dateStyle: "medium",
+        timeStyle: "short",
+    }).format(timestamp * 1000);
+}
+
+function chartData(
+    points: MetricsHistoryPoint[],
+    selectAggregate: (point: MetricsHistoryPoint) => MetricsHistoryAggregate | null,
+): StatsChartDatum[] {
+    return points.map(point => {
+        const aggregate = selectAggregate(point);
+        return {
+            timestamp: point.timestamp,
+            average: aggregate?.avg ?? null,
+            peak: aggregate?.max ?? null,
+        };
+    });
+}
+
 export default function Dashboard() {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
+    const [historyWindow, setHistoryWindow] = useState<MetricsHistoryWindow>("1h");
     const statsQuery = useQuery({
         queryKey: ["metrics-current"],
         queryFn: fetchStats,
         refetchInterval: 5000,
     });
     const historyQuery = useQuery({
-        queryKey: ["metrics-history"],
-        queryFn: fetchHistory,
+        queryKey: ["metrics-history", historyWindow],
+        queryFn: () => fetchHistory(historyWindow),
         refetchInterval: 30000,
     });
 
@@ -90,14 +129,21 @@ export default function Dashboard() {
         : statsUnavailable
             ? t("dashboard.current_unavailable")
             : undefined;
+    const diskFree = displayStats === undefined
+        ? undefined
+        : displayStats.disk_total - displayStats.disk_used;
+    const history = historyQuery.data;
+    const historyPoints = history?.points ?? [];
+    const cpuHistory = chartData(historyPoints, point => point.cpu_percent);
+    const memoryHistory = chartData(historyPoints, point => point.memory_percent);
+    const diskHistory = chartData(historyPoints, point => point.disk_percent);
+    const locale = i18n.resolvedLanguage ?? i18n.language;
 
     return (
-        <div className="flex-1 space-y-4 p-8 pt-6">
-            <div className="flex items-center justify-between space-y-2">
-                <h2 className="text-3xl font-bold tracking-tight">{t("common.dashboard")}</h2>
-                <div className="flex items-center space-x-2">
-                    <LayoutDashboard className="h-6 w-6 text-muted-foreground" />
-                </div>
+        <div className="flex-1 space-y-6">
+            <div className="flex items-center justify-between gap-4">
+                <h2 className="text-2xl font-bold tracking-tight sm:text-3xl">{t("common.dashboard")}</h2>
+                <LayoutDashboard className="h-6 w-6 shrink-0 text-muted-foreground" aria-hidden="true" />
             </div>
 
             {statsUnavailable && (
@@ -106,7 +152,7 @@ export default function Dashboard() {
                     className="flex flex-col items-start justify-between gap-3 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-700 sm:flex-row sm:items-center dark:text-red-300"
                 >
                     <div className="flex items-center gap-2">
-                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
                         <span>{t("dashboard.current_error")}</span>
                     </div>
                     <Button
@@ -115,13 +161,13 @@ export default function Dashboard() {
                         onClick={() => statsQuery.refetch()}
                         disabled={statsQuery.isFetching}
                     >
-                        <RefreshCcw className="h-3.5 w-3.5" />
+                        <RefreshCcw className="h-3.5 w-3.5" aria-hidden="true" />
                         {t("common.retry")}
                     </Button>
                 </div>
             )}
 
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3" aria-busy={statsQuery.isLoading}>
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3" aria-busy={statsQuery.isLoading}>
                 <StatsCard
                     title={t("common.cpu")}
                     value={statsQuery.isLoading ? "—" : formatPercent(displayStats?.cpu_usage)}
@@ -138,66 +184,127 @@ export default function Dashboard() {
                     title={t("common.disk")}
                     value={statsQuery.isLoading ? "—" : formatPercent(displayStats?.disk_used, displayStats?.disk_total)}
                     icon={<HardDrive className="h-4 w-4 text-muted-foreground" />}
-                    description={currentDescription ?? `${formatBytes(displayStats?.disk_used)} / ${formatBytes(displayStats?.disk_total)}`}
+                    description={currentDescription ?? t("dashboard.disk_usage", {
+                        used: formatBytes(displayStats?.disk_used),
+                        total: formatBytes(displayStats?.disk_total),
+                        free: formatBytes(diskFree),
+                    })}
                 />
             </div>
 
-            <div className="grid gap-4">
-                <div className="col-span-full">
-                    {historyQuery.isLoading ? (
+            <section className="space-y-4" aria-labelledby="metrics-history-title">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+                    <div className="min-w-0">
+                        <h3 id="metrics-history-title" className="text-xl font-semibold tracking-tight">
+                            {t("dashboard.history_title")}
+                        </h3>
+                        {history !== undefined && history.points.length > 0 && (
+                            <p className="mt-1 text-xs text-muted-foreground">
+                                {t("dashboard.history_meta", {
+                                    count: history.points.length,
+                                    resolution: t(`dashboard.history_resolutions.${history.resolution}`),
+                                })}
+                            </p>
+                        )}
+                    </div>
+                    <div className="flex flex-col items-start gap-2 sm:items-end">
+                        {historyQuery.isFetching && !historyQuery.isLoading && (
+                            <span role="status" className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                                <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                                {t("dashboard.history_refreshing")}
+                            </span>
+                        )}
                         <div
-                            aria-busy="true"
-                            className="flex items-center justify-center gap-2 rounded-md border px-4 py-10 text-sm text-muted-foreground"
+                            role="group"
+                            aria-label={t("dashboard.history_range")}
+                            className="grid w-full grid-cols-4 gap-1 rounded-lg border bg-muted/40 p-1 sm:w-auto"
                         >
-                            <LoaderCircle className="h-4 w-4 animate-spin" />
-                            <span>{t("dashboard.history_loading")}</span>
+                            {HISTORY_WINDOWS.map(window => (
+                                <Button
+                                    key={window}
+                                    type="button"
+                                    size="sm"
+                                    variant={historyWindow === window ? "default" : "ghost"}
+                                    aria-pressed={historyWindow === window}
+                                    onClick={() => setHistoryWindow(window)}
+                                    className="min-w-14 px-2"
+                                >
+                                    {t(`dashboard.history_windows.${window}`)}
+                                </Button>
+                            ))}
                         </div>
-                    ) : historyQuery.isError || !historyQuery.data ? (
-                        <div
-                            role="alert"
-                            className="flex flex-col items-center justify-center gap-3 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-8 text-center text-sm text-red-700 dark:text-red-300"
-                        >
-                            <div className="flex items-center gap-2">
-                                <AlertTriangle className="h-4 w-4" />
-                                <span>{t("dashboard.history_error")}</span>
-                            </div>
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => historyQuery.refetch()}
-                                disabled={historyQuery.isFetching}
-                            >
-                                <RefreshCcw className="h-3.5 w-3.5" />
-                                {t("common.retry")}
-                            </Button>
-                        </div>
-                    ) : historyQuery.data.length === 0 ? (
-                        <div className="rounded-md border px-4 py-10 text-center text-sm text-muted-foreground">
-                            {t("dashboard.history_empty")}
-                        </div>
-                    ) : (
-                        <div className="grid gap-4 md:grid-cols-2">
-                            <StatsChart
-                                title={t("common.cpu_history")}
-                                data={historyQuery.data}
-                                dataKey="cpu_usage"
-                                color="#3b82f6"
-                            />
-                            <StatsChart
-                                title={t("common.ram_history")}
-                                data={historyQuery.data
-                                    .filter(item => item.memory_total > 0)
-                                    .map(item => ({
-                                        ...item,
-                                        ram_percent: (item.memory_used / item.memory_total) * 100,
-                                    }))}
-                                dataKey="ram_percent"
-                                color="#8b5cf6"
-                            />
-                        </div>
-                    )}
+                    </div>
                 </div>
-            </div>
+
+                {historyQuery.isLoading ? (
+                    <div
+                        aria-busy="true"
+                        className="flex items-center justify-center gap-2 rounded-md border px-4 py-10 text-sm text-muted-foreground"
+                    >
+                        <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        <span>{t("dashboard.history_loading")}</span>
+                    </div>
+                ) : historyQuery.isError || history === undefined ? (
+                    <div
+                        role="alert"
+                        className="flex flex-col items-center justify-center gap-3 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-8 text-center text-sm text-red-700 dark:text-red-300"
+                    >
+                        <div className="flex items-center gap-2">
+                            <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+                            <span>{t("dashboard.history_error")}</span>
+                        </div>
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => historyQuery.refetch()}
+                            disabled={historyQuery.isFetching}
+                        >
+                            <RefreshCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                            {t("common.retry")}
+                        </Button>
+                    </div>
+                ) : history.points.length === 0 ? (
+                    <div className="rounded-md border px-4 py-10 text-center text-sm text-muted-foreground">
+                        {t("dashboard.history_empty")}
+                    </div>
+                ) : (
+                    <div className="space-y-4">
+                        {history.partial && history.oldest_timestamp !== null && (
+                            <div
+                                role="status"
+                                className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200"
+                            >
+                                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                                <span>
+                                    {t("dashboard.history_partial", {
+                                        time: formatTimestamp(history.oldest_timestamp, locale),
+                                    })}
+                                </span>
+                            </div>
+                        )}
+                        <div className="grid min-w-0 gap-4 xl:grid-cols-3">
+                            <StatsChart
+                                title={t("dashboard.cpu_history")}
+                                data={cpuHistory}
+                                color="#2563eb"
+                                window={historyWindow}
+                            />
+                            <StatsChart
+                                title={t("dashboard.ram_history")}
+                                data={memoryHistory}
+                                color="#7c3aed"
+                                window={historyWindow}
+                            />
+                            <StatsChart
+                                title={t("dashboard.disk_history")}
+                                data={diskHistory}
+                                color="#059669"
+                                window={historyWindow}
+                            />
+                        </div>
+                    </div>
+                )}
+            </section>
         </div>
     );
 }

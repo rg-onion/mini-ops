@@ -81,6 +81,17 @@ Mini-Ops включает в себя встроенную систему ауд
         incomplete.
     *   **Риск**: Привилегированные или опасно настроенные контейнеры расширяют blast radius.
 
+10. **Доступ Mini-Ops к управлению Docker**:
+    *   Доступ к управлению Docker подтверждается только успешным bounded API
+        запросом к daemon. Когда Mini-Ops подтверждает доступ к обычному local
+        daemon, отдельная recommendation `runtime.docker_control_access` явно
+        показывает эту privilege boundary. Недоступный или неоднозначный
+        доступ остаётся unverified.
+    *   Доступ к обычному rootful daemon следует считать root-equivalent.
+        Отдельно ограниченный или rootless daemon требует собственной проверки
+        threat boundary. Если управление контейнерами не нужно, доступ сервиса
+        к socket/API следует отозвать.
+
 ## 🔒 SSH Security & Alerts
 
 Mini-Ops обеспечивает мониторинг SSH-подключений через PAM hook. При старте
@@ -94,6 +105,11 @@ proxy/curlrc behavior. Повторные уведомления огранич�
 ## API Exposure
 
 Mini-Ops не ограничивает частоту запросов ко всем API routes самостоятельно. Если dashboard доступен вне trusted network, используйте reverse proxy, VPN или edge-сервис с TLS и request throttling.
+
+Mini-Ops не предоставляет dashboard- или API-действие, которое получает
+исходный код, устанавливает binary или перезапускает агент. Обновление остаётся
+явной host-level операцией с проверкой артефакта, backup, rollback и health
+checks после изменения, как описано в [Deploy Guide](DEPLOY.ru.md).
 
 Embedded HTML применяет строгую same-origin Content Security Policy и не
 загружает third-party browser resources. Поддерживаемый Nginx renderer добавляет
@@ -113,34 +129,16 @@ persistence credential, но не эквивалентно server session с
 основным control. CLI/API clients продолжают использовать
 `Authorization: Bearer`.
 
-## Экспериментальная web-сборка исходников
-
-Endpoint `POST /api/deploy/webhook` остается защищенным через `AUTH_TOKEN`, но
-по умолчанию выключен. Включайте `MINI_OPS_ALLOW_WEB_UPDATE=true` только если
-этот хост должен принимать экспериментальные запросы на сборку исходников.
-
-Когда флаг включен, Mini-Ops запускает `scripts/update.sh` из локального git
-checkout. Скрипт отказывается работать вне git checkout и при tracked local
-changes, использует `git pull --ff-only`, ставит frontend dependencies из
-lockfile при наличии и собирает backend через `cargo build --release --locked`.
-Одновременно может идти только одно обновление, а `/api/deploy/logs` передаёт
-через SSE bounded status events без raw command output. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS`
-ограничивает runtime каждой web-сборки (`1800` секунд по умолчанию). Успешный
-terminal state означает только завершение сборки исходников. Установка файла,
-перезапуск сервиса, health validation и rollback выполняются вручную; dashboard
-не показывает этот endpoint как готовое обновление агента.
-
-## Очистка диска
-
-Dashboard показывает использование диска, но не предлагает действий очистки.
-Server-side endpoint выключен, если не задано точное значение
-`MINI_OPS_ALLOW_DISK_CLEANUP=true`. Даже при включённом экспериментальном gate
-target `docker` всегда возвращает `403 operation_unavailable` и не может
-запустить `docker system prune -af`.
-
 ## События безопасности
 
-Mini-Ops сохраняет результаты аудита безопасности как локальные события в SQLite. События создаются, когда проверка возвращает `FAIL` или `WARN`, обновляются пока проблема активна и закрываются, когда проверка снова возвращает `PASS`.
+Mini-Ops сохраняет подтверждённые findings и непроверенные состояния покрытия
+как локальные события в SQLite. `FAIL` открывает finding event; `WARN` открывает
+event для unverified результата или явно partial coverage. Известные hardening
+recommendations с полным покрытием остаются в текущем audit posture и не
+становятся инцидентами. Synthetic
+`audit.collection` остаётся частью degraded snapshot, но не отображается как
+отдельный active high-severity event. Старые aggregate/recommendation rows
+закрываются без удаления и без лишнего уведомления.
 
 - Активные события отображаются на странице Security.
 - Открытое событие можно принять, чтобы снизить шум, но сохранить evidence.
@@ -179,6 +177,11 @@ Mini-Ops ограничивает локальную operational history, что
 - Закрытые security events используют `SECURITY_EVENTS_RETENTION_HOURS`, как
   описано выше.
 
+Аутентифицированный API истории метрик только читает уже сохранённые строки
+с ограниченным сроком хранения. Он не обходит каталоги и не запускает
+привилегированные команды для файловой системы. Формат ответа и ошибок описан в
+[Истории метрик](METRICS_HISTORY.ru.md).
+
 Приложение создает индексы `metrics(timestamp)`, `ssh_logins(timestamp)` и
 `ssh_logins(ip, timestamp)` для retention и history queries. Удаление старых
 строк не обязано сразу уменьшать размер SQLite-файла; если нужно вернуть место
@@ -214,6 +217,14 @@ language-neutral single-flight snapshot аудита. Concurrent refresh-зап�
 `X-Security-Collection-Status`. Если в bounded collection window не появился
 новый publishable snapshot, route возвращает `503` с кодом
 `security_audit_unavailable`, а не устаревший healthy result.
+
+Каждая projected audit check содержит одно bounded значение
+`metadata.result_kind`: `pass`, `finding`, `recommendation`, `unverified` или
+`coverage`. Non-`PASS` check с неполным supporting inspection может
+дополнительно содержать `metadata.coverage_status=["partial"]`; `PASS` не может
+быть partial. Dashboard показывает покрытие отдельно от результата, поэтому
+подтверждённый failure остаётся видимым даже при неполном выполнении другой
+проверки. Старые поля response и array body не меняются.
 
 Unknown или incomplete facts остаются видимыми как `WARN` и помечают snapshot
 как `degraded`. Cloud Push только читает snapshot и никогда не запускает audit.
@@ -257,6 +268,9 @@ observation generations; stale запрос получает `409`. Логиче
 baseline требует отдельного подтверждаемого re-enrollment и свежего complete
 observation. Оба действия никогда не запускаются автоматически после package
 update. Структурная SQLite corruption остаётся restore-from-backup condition.
+Если coverage деградировано, но в наблюдаемом subset нет drift, dashboard явно
+показывает оба факта; недоступные targets не выдаются ни за baseline corruption,
+ни за clean full-coverage результат.
 
 `SECURITY_FILE_INTEGRITY_INTERVAL_SECS` по умолчанию равен `300` и clamp-ится в
 `60..86400`. Каждый single-flight scan ограничен `256` distinct path IDs,

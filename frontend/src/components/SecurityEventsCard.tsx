@@ -10,17 +10,31 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { decodeSecurityEvent } from "@/lib/securityEventEvidence";
-import type { SecurityEvent } from "@/types";
+import {
+    auditCheckNameKey,
+    classifySecurityResult,
+    isAggregateAuditCheck,
+} from "@/lib/securityAudit";
+import type { SecurityAuditResultKind, SecurityEvent } from "@/types";
 
 async function fetchSecurityEvents(): Promise<SecurityEvent[]> {
     const response = await apiFetch("/security/events?status=active&limit=20");
     if (!response.ok) throw new Error("security_events_request_failed");
     const payload: unknown = await response.json();
-    if (!Array.isArray(payload)) throw new Error("security_events_invalid_response");
+    if (!Array.isArray(payload) || payload.length > 20) {
+        throw new Error("security_events_invalid_response");
+    }
 
     const events = payload.map(decodeSecurityEvent);
     if (events.some(event => event === null)) throw new Error("security_events_invalid_response");
-    return events as SecurityEvent[];
+    return (events as SecurityEvent[]).filter(event => {
+        if (event.event_key === "audit:audit.collection") return false;
+        return !(
+            event.evidence.error_code === null
+            && (event.evidence.kind === "audit.check_failed" || event.evidence.kind === "audit.check_warning")
+            && isAggregateAuditCheck(event.evidence.data.check_id)
+        );
+    });
 }
 
 async function acknowledgeSecurityEvent(id: number) {
@@ -48,6 +62,19 @@ function severityClass(severity: SecurityEvent["severity"]) {
     }
 }
 
+function auditResultClass(kind: SecurityAuditResultKind) {
+    if (kind === "finding") {
+        return "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300";
+    }
+    if (kind === "recommendation") {
+        return "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200";
+    }
+    if (kind === "pass") {
+        return "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    }
+    return "border-amber-500/40 bg-amber-500/10 text-amber-800 dark:text-amber-200";
+}
+
 function EvidenceSummary({ event }: { event: SecurityEvent }) {
     const { t } = useTranslation();
     const evidence = event.evidence;
@@ -59,14 +86,18 @@ function EvidenceSummary({ event }: { event: SecurityEvent }) {
     switch (evidence.kind) {
         case "audit.check_failed":
         case "audit.check_warning":
-            return (
-                <span>
-                    {t("security.evidence.audit", {
-                        checkId: evidence.data.check_id,
-                        status: evidence.data.status,
-                    })}
-                </span>
-            );
+            {
+                const checkNameKey = auditCheckNameKey(evidence.data.check_id);
+                const checkName = checkNameKey ? t(checkNameKey) : evidence.data.check_id;
+                return (
+                    <span>
+                        {t("security.evidence.audit", {
+                            check: checkName,
+                            status: t(`security.check_status.${evidence.data.status}`),
+                        })}
+                    </span>
+                );
+            }
         case "ssh.untrusted_source_ip":
             return (
                 <span>
@@ -218,18 +249,65 @@ export function SecurityEventsCard() {
                                 {eventsQuery.data.map(event => {
                                     const ackPending = pendingAckIds.has(event.id);
                                     const ackError = failedAckIds.has(event.id);
+                                    const auditEvidence = event.evidence.error_code === null
+                                        && (event.evidence.kind === "audit.check_failed"
+                                            || event.evidence.kind === "audit.check_warning")
+                                        ? event.evidence.data
+                                        : null;
+                                    const checkNameKey = auditEvidence
+                                        ? auditCheckNameKey(auditEvidence.check_id)
+                                        : null;
+                                    const auditResultKind = auditEvidence
+                                        ? classifySecurityResult(
+                                            auditEvidence.status,
+                                            auditEvidence.metadata,
+                                        )
+                                        : null;
+                                    const hasPartialAuditCoverage = auditEvidence?.metadata.coverage_status?.[0]
+                                        === "partial";
+                                    const isOpenCoverageState = event.status === "open"
+                                        && (
+                                            auditResultKind === "unverified"
+                                            || auditResultKind === "coverage"
+                                            || (
+                                                auditEvidence?.status === "WARN"
+                                                && auditResultKind === "recommendation"
+                                                && hasPartialAuditCoverage
+                                            )
+                                        );
+                                    const eventTitle = checkNameKey ? t(checkNameKey) : event.title;
+                                    let eventMessage = event.message;
+                                    if (auditEvidence && auditResultKind && checkNameKey) {
+                                        const riskCount = auditEvidence.metadata.risk_count?.[0];
+                                        eventMessage = auditEvidence.check_id === "docker.container_hardening" && riskCount
+                                            ? t("security.audit_event_message.docker_container_hardening", {
+                                                count: Number(riskCount),
+                                            })
+                                            : t(`security.audit_event_message.${auditResultKind}`);
+                                        if (hasPartialAuditCoverage) {
+                                            eventMessage = `${eventMessage} ${t("security.audit_event_message.partial_coverage")}`;
+                                        }
+                                    }
 
                                     return (
                                         <TableRow key={`${event.event_type}:${event.event_key}`}>
                                             <TableCell>
                                                 <div className="space-y-1.5">
                                                     <div className="flex flex-wrap items-center gap-1.5">
-                                                        <span className="font-medium">{event.title}</span>
+                                                        <span className="font-medium">{eventTitle}</span>
                                                         <Badge variant="outline" className={severityClass(event.severity)}>
-                                                            {event.severity}
+                                                            {t(`security.severity.${event.severity}`)}
                                                         </Badge>
+                                                        {auditResultKind && (
+                                                            <Badge
+                                                                variant="outline"
+                                                                className={auditResultClass(auditResultKind)}
+                                                            >
+                                                                {t(`security.result_kind.${auditResultKind}`)}
+                                                            </Badge>
+                                                        )}
                                                     </div>
-                                                    <div className="text-sm text-muted-foreground">{event.message}</div>
+                                                    <div className="text-sm text-muted-foreground">{eventMessage}</div>
                                                     <div className="font-mono text-xs text-muted-foreground">
                                                         <EvidenceSummary event={event} />
                                                     </div>
@@ -239,21 +317,37 @@ export function SecurityEventsCard() {
                                                 </div>
                                             </TableCell>
                                             <TableCell>
-                                                <div className="flex items-center gap-2 whitespace-nowrap">
-                                                    {event.status === "open" ? (
-                                                        <AlertTriangle className="h-4 w-4 text-red-500" />
-                                                    ) : event.status === "acknowledged" ? (
-                                                        <Info className="h-4 w-4 text-amber-600 dark:text-amber-300" />
-                                                    ) : (
-                                                        <CheckCheck className="h-4 w-4 text-emerald-500" />
+                                                <div className="space-y-1 whitespace-nowrap">
+                                                    <div className="flex items-center gap-2">
+                                                        {event.status === "open" ? (
+                                                            <AlertTriangle className={`h-4 w-4 ${isOpenCoverageState
+                                                                ? "text-amber-500"
+                                                                : "text-red-500"}`}
+                                                            />
+                                                        ) : event.status === "acknowledged" ? (
+                                                            <Info className="h-4 w-4 text-amber-600 dark:text-amber-300" />
+                                                        ) : (
+                                                            <CheckCheck className="h-4 w-4 text-emerald-500" />
+                                                        )}
+                                                        <span
+                                                            className={event.status === "acknowledged" || isOpenCoverageState
+                                                                ? "text-amber-700 dark:text-amber-300"
+                                                                : event.status === "open"
+                                                                    ? "text-red-700 dark:text-red-300"
+                                                                    : undefined}
+                                                        >
+                                                            {isOpenCoverageState
+                                                                ? t("security.result_kind.unverified")
+                                                                : t(`security.event_status.${event.status}`)}
+                                                        </span>
+                                                    </div>
+                                                    {isOpenCoverageState && (
+                                                        <div className="text-xs text-muted-foreground">
+                                                            {t("security.event_lifecycle", {
+                                                                status: t(`security.event_status.${event.status}`),
+                                                            })}
+                                                        </div>
                                                     )}
-                                                    <span
-                                                        className={event.status === "acknowledged"
-                                                            ? "text-amber-700 dark:text-amber-300"
-                                                            : undefined}
-                                                    >
-                                                        {t(`security.event_status.${event.status}`)}
-                                                    </span>
                                                 </div>
                                             </TableCell>
                                             <TableCell>

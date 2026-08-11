@@ -136,8 +136,6 @@ APP_HOST=127.0.0.1
 APP_PORT=3000
 DATABASE_URL=sqlite:///var/lib/mini-ops/mini-ops.db
 MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token
-MINI_OPS_ALLOW_WEB_UPDATE=false
-MINI_OPS_ALLOW_DISK_CLEANUP=false
 ```
 
 Generate `AUTH_TOKEN` with `openssl rand -hex 32`. Managed startup fails if the
@@ -191,3 +189,9 @@ Existing installations that keep mutable state under `/opt/mini-ops` must not
 replace only the binary or unit with this layout. Preserve the current service
 and state until you can perform a stopped-service migration with a verified
 backup and rollback point.
+
+Managed upgrades continue to preserve an existing `history.json` as inert
+legacy state. The running agent neither parses nor appends to this file;
+bootstrap only preserves, snapshots, and restores it for rollback. An
+administrator may archive or remove it separately after the deployment rollback
+window; the bootstrap does not delete it automatically.

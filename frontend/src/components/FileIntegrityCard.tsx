@@ -172,6 +172,13 @@ function actionErrorCode(error: Error | null): DisplayErrorCode | null {
     return error instanceof FileIntegrityMutationError ? error.code : error ? "invalid_response" : null;
 }
 
+function isPartialCoverageWithoutDetectedDrift(status: FileIntegrityStatus): boolean {
+    return status.status === "degraded"
+        && status.degraded_reason === "coverage_unavailable"
+        && status.drift_file_count === 0
+        && status.coverage.unavailable_target_count > 0;
+}
+
 export function FileIntegrityCard() {
     const { t } = useTranslation();
     const queryClient = useQueryClient();
@@ -392,6 +399,7 @@ function FileIntegrityStatusContent({
     const { t } = useTranslation();
     const lastScan = formatTimestamp(status.last_scan_at);
     const tone = statusClass(status);
+    const partialWithoutDrift = isPartialCoverageWithoutDetectedDrift(status);
 
     return (
         <div className="space-y-4">
@@ -399,11 +407,19 @@ function FileIntegrityStatusContent({
                 <div className="flex flex-wrap items-center gap-2">
                     <StatusIcon status={status} />
                     <Badge variant="outline" className={tone}>
-                        {t(`security.file_integrity.status.${status.status}`)}
+                        {t(partialWithoutDrift
+                            ? "security.file_integrity.status.partial"
+                            : `security.file_integrity.status.${status.status}`)}
                     </Badge>
-                    <span>{t(`security.file_integrity.detail.${status.status}`)}</span>
+                    <span>
+                        {partialWithoutDrift
+                            ? t("security.file_integrity.detail.partial_no_drift", {
+                                unavailable: status.coverage.unavailable_target_count,
+                            })
+                            : t(`security.file_integrity.detail.${status.status}`)}
+                    </span>
                 </div>
-                {status.degraded_reason && (
+                {status.degraded_reason && !partialWithoutDrift && (
                     <div className="mt-2">
                         {t(`security.file_integrity.reason.${status.degraded_reason}`)}
                     </div>
