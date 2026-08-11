@@ -71,6 +71,7 @@ pub(crate) struct CloudPushConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloudPushConfigError {
+    MissingRequiredConfig,
     InvalidInterval,
     InvalidHubUrl,
     HubUrlMustBeOrigin,
@@ -83,6 +84,7 @@ pub(crate) enum CloudPushConfigError {
 impl CloudPushConfigError {
     pub(crate) const fn code(self) -> &'static str {
         match self {
+            Self::MissingRequiredConfig => "missing_required_config",
             Self::InvalidInterval => "invalid_interval",
             Self::InvalidHubUrl => "invalid_hub_url",
             Self::HubUrlMustBeOrigin => "hub_url_must_be_origin",
@@ -553,6 +555,14 @@ mod tests {
                 Err(CloudPushConfigError::HubUrlMustBeOrigin)
             );
         }
+    }
+
+    #[test]
+    fn missing_required_cloud_config_uses_a_closed_error_code() {
+        assert_eq!(
+            CloudPushConfigError::MissingRequiredConfig.code(),
+            "missing_required_config"
+        );
     }
 
     #[test]

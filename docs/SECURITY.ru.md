@@ -392,23 +392,6 @@ SECURITY_ALLOWED_LOOPBACK_PORTS=53,5435,9001
 Некорректные значения переводят port check в `WARN`. Evidence содержит только
 closed configuration error code и количество ошибок, но не raw env value.
 
-## 🔔 Alerting (Оповещения)
-
-Система работает в фоновом режиме с interval из `SECURITY_AUDIT_INTERVAL_SECS`
-и отправляет уведомления в Telegram.
-
-### Логика работы
-*   **Инцидент**: Если статус проверки меняется с `PASS` на `FAIL` -> Шлется уведомление 🚨.
-*   **Восстановление**: Если статус меняется с `FAIL` на `PASS` -> Шлется уведомление ✅.
-*   **Anti-Spam**: Уведомление шлется только при **смене статуса**.
-
-### Настройка Telegram
-Для работы уведомлений убедитесь, что в `.env` заданы:
-```env
-TELEGRAM_BOT_TOKEN=ваш_токен
-TELEGRAM_CHAT_ID=ваш_id
-```
-
 ## 🌐 Безопасность развертывания (Deployment)
 
 ### Deployment boundary

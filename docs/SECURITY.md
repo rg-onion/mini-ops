@@ -353,9 +353,6 @@ listeners, and it does not change firewall rules or close ports.
 
 The built-in baseline includes:
 
-- `22`
-- `80`
-- `443`
 - public/wildcard: `22`, `80`, `443`, `DEPLOY_NGINX_PORT` (`8090` by default)
 - loopback-only: `APP_PORT` (`3000` by default)
 

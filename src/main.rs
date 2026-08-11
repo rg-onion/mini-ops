@@ -332,7 +332,9 @@ async fn main() {
                 }
             }
             _ => tracing::warn!(
-                "CLOUD_PUSH_ENABLED=true but CLOUD_HUB_URL/CLOUD_AGENT_TOKEN missing"
+                configuration_error =
+                    cloud_push::CloudPushConfigError::MissingRequiredConfig.code(),
+                "Cloud push disabled: required configuration missing"
             ),
         }
     }

@@ -2,7 +2,7 @@
 
 ## Core
 - [Deploy Guide](DEPLOY.md) - Installation and deployment instructions.
-- [Configuration](DEPLOY.md#important-variables) - Environment variables.
+- [Configuration](../.env.example) - Environment variables.
 - [Security](SECURITY.md) - Security principles and hardening.
 - [Metrics History](METRICS_HISTORY.md) - Bounded CPU, memory, and disk history API.
 - [Cloud Push](CLOUD_PUSH.md) - Optional minimized Fleet observation transparency.
