@@ -24,12 +24,23 @@ configuration examples, and operational documentation.
 1. Complete the release audit and resolve every blocker.
 2. Update Rust and frontend versions together in an explicit version task.
 3. Review the exact diff and run the local CI-equivalent checks.
-4. Commit and push the release-ready tree.
-5. Create and push the matching signed or annotated `vX.Y.Z` tag.
+4. Commit, review, and merge the release-ready tree without creating the tag;
+   require the post-merge default-branch CI to pass.
+5. Deploy that exact default-branch commit to the test VPS with a rollback point and
+   complete a continuous 72-hour soak. Require `NRestarts=0`, RSS below 50 MiB,
+   a healthy SQLite quick check, no new warning/error pattern, and at least one
+   scheduled certificate cycle when that collector is enabled. Any source
+   change creates a new candidate and restarts the soak.
+6. Create and push the matching signed or annotated `vX.Y.Z` tag on the exact
+   soaked commit.
 
 Pushing the tag starts `.github/workflows/release.yml`. Do not manually replace
 assets under an existing tag. Prefer immutable GitHub Releases when the
 repository setting is available.
+
+After publication, download the official archive and verify its checksum and
+attestations before the final test-VPS smoke. A locally built candidate is soak
+evidence, not a substitute for verifying the published artifact.
 
 If the tag-triggered workflow fails before publishing a release, fix the
 workflow on the default branch and retry it with `workflow_dispatch`, passing

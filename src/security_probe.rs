@@ -756,7 +756,9 @@ mod tests {
     async fn timeout_kills_and_reaps_process() {
         let executable =
             TestExecutable::new("printf '%s\\n' \"$$\"\nwhile :; do /usr/bin/sleep 1; done");
-        let outcome = run_test(&executable, &[], Duration::from_millis(100)).await;
+        // Give a loaded CI worker enough time to start the shell and publish
+        // its PID before exercising the timeout/reap path.
+        let outcome = run_test(&executable, &[], Duration::from_secs(1)).await;
         let pid = parse_pid(&outcome.stdout.bytes);
 
         assert_eq!(outcome.completion, ProbeCompletion::TimedOut);

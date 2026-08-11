@@ -24,12 +24,23 @@ embedded frontend не публикуются отдельно в crates.io ил
 1. Завершите release audit и устраните все blockers.
 2. В отдельной version-задаче одновременно обновите Rust и frontend versions.
 3. Проверьте exact diff и выполните локальные CI-equivalent checks.
-4. Закоммитьте и отправьте release-ready tree.
-5. Создайте и отправьте соответствующий signed или annotated tag `vX.Y.Z`.
+4. Закоммитьте, проверьте и смержите release-ready tree без создания tag;
+   post-merge CI default branch должен пройти.
+5. Разверните этот exact default-branch commit на test VPS с rollback point и проведите
+   непрерывный 72-часовой soak. Требуются `NRestarts=0`, RSS ниже 50 MiB,
+   успешный SQLite quick check, отсутствие новых warning/error patterns и хотя
+   бы один плановый certificate cycle при включённом collector. Любое изменение
+   source создаёт нового кандидата и перезапускает soak.
+6. Создайте и отправьте соответствующий signed или annotated tag `vX.Y.Z` на
+   exact commit, прошедший soak.
 
 Push tag запускает `.github/workflows/release.yml`. Не заменяйте вручную assets
 существующего tag. По возможности включите immutable GitHub Releases в
 настройках репозитория.
+
+После публикации скачайте официальный archive и проверьте checksum и
+attestations до финального smoke на test VPS. Локально собранный candidate
+является soak evidence, но не заменяет проверку опубликованного artifact.
 
 Если workflow, запущенный tag, завершился до публикации release, исправьте его
 в default branch и повторите через `workflow_dispatch`, передав существующий
