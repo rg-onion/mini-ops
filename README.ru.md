@@ -110,7 +110,7 @@ Shipped unit оставляет код и конфигурацию root-owned, �
    ```bash
    git clone https://github.com/rg-onion/mini-ops.git
    cd mini-ops/frontend
-   npm install
+   npm ci --strict-allow-scripts
    npm run build
    ```
 

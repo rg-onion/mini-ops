@@ -53,6 +53,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix frontend ci --strict-allow-scripts
 
+      - name: Verify macOS install-script policy
+        run: npm --prefix frontend ci --dry-run --strict-allow-scripts --os=darwin --cpu=x64
+
       - name: Audit complete frontend dependency graph
         run: npm --prefix frontend audit --audit-level=moderate
 

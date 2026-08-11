@@ -11,8 +11,8 @@ Thank you for your interest in contributing to Mini-Ops! We welcome contribution
     cd mini-ops
     ```
 3.  **Install dependencies**:
-    - Rust (latest stable)
-    - Node.js (v20+)
+    - Rust (`1.93.0`)
+    - Node.js (`24.17.x`) and npm (`12.0.x`)
 
 ## Development Workflow
 
@@ -26,7 +26,7 @@ cargo run
 The frontend is a Vite + React app located in `frontend/`.
 ```bash
 cd frontend
-npm install
+npm ci --strict-allow-scripts
 npm run dev
 ```
 
@@ -38,12 +38,12 @@ npm run dev
     ```
 2.  Make your changes and commit them with descriptive messages.
 3.  Push your branch to your fork.
-4.  Submit a Pull Request to the `main` branch of the original repository.
+4.  Submit a Pull Request to the `master` branch of the original repository.
 
 ## Coding Standards
 
 - **Rust**: Use `cargo fmt` and `cargo clippy` before submitting.
-- **Frontend**: Use `eslint` and `prettier`.
+- **Frontend**: Run `npm run lint` (ESLint) before submitting.
 - **Commits**: Use conventional commits (e.g., `feat: add new widget`, `fix: resolve crash on startup`).
 
 For dependency changes, install `cargo-audit` and run:

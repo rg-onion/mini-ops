@@ -71,7 +71,7 @@ cmp -s "$TMP_ROOT/default.out" "$TMP_ROOT/default-repeat.out" || fail 'default d
 cmp -s "$TMP_ROOT/default.err" "$TMP_ROOT/default-repeat.err" || fail 'default dry-run warnings are not deterministic'
 assert_contains "$TMP_ROOT/default.out" 'mode=production target=/opt/mini-ops app-user=miniops app-bind=127.0.0.1:3000'
 assert_contains "$TMP_ROOT/default.out" 'host-key=strict-existing-key'
-assert_contains "$TMP_ROOT/default.out" 'build=frontend:npm-ci backend:cargo-release-locked architecture=artifact-vs-remote'
+assert_contains "$TMP_ROOT/default.out" 'build=frontend:npm-ci-strict(node=24.17.x,npm=12.0.x) backend:cargo-release-locked architecture=artifact-vs-remote'
 assert_contains "$TMP_ROOT/default.out" 'upload=private-unpredictable:/tmp/mini-ops-deploy.XXXXXXXX:0700'
 assert_contains "$TMP_ROOT/default.out" 'code=/opt/mini-ops:root:root:0755 env=root:root:0600 unit=root:root:0644'
 assert_contains "$TMP_ROOT/default.out" 'state=/var/lib/mini-ops:miniops:miniops:0700 files:0600 runtime=/run/mini-ops:0700'
@@ -80,9 +80,43 @@ assert_contains "$TMP_ROOT/default.out" 'network=not-executed build=not-executed
 [[ ! -s "$TMP_ROOT/default.err" ]] || fail 'safe default emitted a warning'
 [[ ! -e "$NETWORK_MARKER" ]] || fail 'default dry-run reached a network/build command'
 
+BAD_TOOLCHAIN_BIN="$TMP_ROOT/bad-toolchain-bin"
+BAD_TOOLCHAIN_MARKER="$TMP_ROOT/bad-toolchain-network-called"
+mkdir -p "$BAD_TOOLCHAIN_BIN"
+for command_name in ssh scp cargo; do
+    {
+        printf '#!/bin/bash\n'
+        printf 'printf called > %q\n' "$BAD_TOOLCHAIN_MARKER"
+        printf 'exit 97\n'
+    } > "$BAD_TOOLCHAIN_BIN/$command_name"
+    chmod 0755 "$BAD_TOOLCHAIN_BIN/$command_name"
+done
+printf '#!/bin/bash\nprintf "v20.19.3\\n"\n' > "$BAD_TOOLCHAIN_BIN/node"
+{
+    printf '#!/bin/bash\n'
+    # The generated fixture must inspect its own first argument.
+    # shellcheck disable=SC2016
+    printf 'if [[ "${1:-}" == "--version" ]]; then\n'
+    printf '    printf "11.4.2\\n"\n'
+    printf '    exit 0\n'
+    printf 'fi\n'
+    printf 'printf called > %q\n' "$BAD_TOOLCHAIN_MARKER"
+    printf 'exit 97\n'
+} > "$BAD_TOOLCHAIN_BIN/npm"
+chmod 0755 "$BAD_TOOLCHAIN_BIN/node" "$BAD_TOOLCHAIN_BIN/npm"
+if env -i \
+    PATH="$BAD_TOOLCHAIN_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    DEPLOY_HOST=192.0.2.10 \
+    /bin/bash "$BOOTSTRAP" \
+    > "$TMP_ROOT/bad-toolchain.out" 2> "$TMP_ROOT/bad-toolchain.err"; then
+    fail 'managed source build accepted an unsupported local toolchain'
+fi
+assert_contains "$TMP_ROOT/bad-toolchain.err" 'local Node.js must match v24.17.x'
+[[ ! -e "$BAD_TOOLCHAIN_MARKER" ]] || fail 'toolchain rejection happened after network/build activity'
+
 run_dry no-local-build DEPLOY_RUN_LOCAL_BUILD=0
 assert_contains "$TMP_ROOT/no-local-build.out" 'build=existing-release-artifact:no-local-build'
-assert_not_contains "$TMP_ROOT/no-local-build.out" 'build=frontend:npm-ci'
+assert_not_contains "$TMP_ROOT/no-local-build.out" 'build=frontend:npm-ci-strict'
 
 run_dry exact-nginx-listener DEPLOY_SETUP_NGINX=1 DEPLOY_NGINX_EXTRA_LISTEN_IP=172.17.0.1
 assert_contains "$TMP_ROOT/exact-nginx-listener.out" 'nginx=loopback+exact:127.0.0.1:8090,172.17.0.1:8090'
@@ -191,9 +225,28 @@ assert_not_contains "$BOOTSTRAP" 'api-header.'
 assert_not_contains "$BOOTSTRAP" 'rollback-api-header.'
 assert_not_contains "$BOOTSTRAP" 'pre-snapshot-header.'
 assert_not_contains "$BOOTSTRAP" '--header "@'
+assert_contains "$BOOTSTRAP" 'require_command node'
+# The source contract intentionally contains the literal project-root variable.
+# shellcheck disable=SC2016
+assert_contains "$BOOTSTRAP" 'npm --prefix "$PROJECT_ROOT/frontend" ci --strict-allow-scripts'
 
 # shellcheck source=scripts/lib/deploy_contract.sh
 source "$CONTRACT"
+deploy_validate_local_build_toolchain v24.17.0 12.0.1
+for invalid_node in v20.19.3 24.17.0 v24.18.0 v24.17; do
+    if deploy_validate_local_build_toolchain "$invalid_node" 12.0.1 \
+        > "$TMP_ROOT/invalid-node.out" 2> "$TMP_ROOT/invalid-node.err"; then
+        fail "accepted unsupported Node.js version: $invalid_node"
+    fi
+    assert_contains "$TMP_ROOT/invalid-node.err" 'local Node.js must match v24.17.x'
+done
+for invalid_npm in 11.4.2 v12.0.1 12.1.0 12.0; do
+    if deploy_validate_local_build_toolchain v24.17.0 "$invalid_npm" \
+        > "$TMP_ROOT/invalid-npm.out" 2> "$TMP_ROOT/invalid-npm.err"; then
+        fail "accepted unsupported npm version: $invalid_npm"
+    fi
+    assert_contains "$TMP_ROOT/invalid-npm.err" 'local npm must match 12.0.x'
+done
 deploy_render_unit "$UNIT_TEMPLATE" miniops 0 > "$TMP_ROOT/default.service"
 assert_contains "$TMP_ROOT/default.service" 'User=miniops'
 assert_contains "$TMP_ROOT/default.service" 'Group=miniops'

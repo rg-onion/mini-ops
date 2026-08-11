@@ -39,6 +39,10 @@ strict existing-host-key policy, устанавливает non-root серви�
 или Nginx, не публикует HTTP, не меняет UFW, не добавляет Docker group и не
 изменяет PAM.
 
+Local-build mode требует Node.js `24.17.x` и npm `12.0.x`; bootstrap
+отклоняет другие версии до установки dependencies. Frontend dependencies
+устанавливаются со strict allowlist-policy для install scripts.
+
 Для существующей managed installation default сохраняет и нормализует текущий
 root-owned `.env`:
 
@@ -91,7 +95,7 @@ exact loopback и extra sockets и отклоняет wildcard или неожи
 ## Локальная сборка
 
 ```bash
-npm --prefix frontend ci
+npm --prefix frontend ci --strict-allow-scripts
 npm --prefix frontend run build
 cargo build --release --locked
 ```

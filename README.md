@@ -114,7 +114,7 @@ installation and verification commands in [docs/DEPLOY.md](docs/DEPLOY.md).
    ```bash
    git clone https://github.com/rg-onion/mini-ops.git
    cd mini-ops/frontend
-   npm install
+   npm ci --strict-allow-scripts
    npm run build
    ```
 

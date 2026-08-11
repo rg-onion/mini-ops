@@ -38,6 +38,10 @@ binds the app to `127.0.0.1:3000`, and performs paired backup/rollback plus
 service, API, SQLite path, owner, and mode proofs. It does not install Docker or
 Nginx, expose HTTP, change UFW, add the Docker group, or write PAM.
 
+Local-build mode requires Node.js `24.17.x` and npm `12.0.x`; the bootstrap
+rejects other versions before dependency installation. Frontend dependencies
+are installed with npm's strict install-script allowlist policy.
+
 For an existing managed installation, the default preserves and normalizes its
 existing root-owned `.env`:
 
@@ -93,7 +97,7 @@ unexpected listeners.
 ## Build locally
 
 ```bash
-npm --prefix frontend ci
+npm --prefix frontend ci --strict-allow-scripts
 npm --prefix frontend run build
 cargo build --release --locked
 ```

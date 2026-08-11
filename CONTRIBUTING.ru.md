@@ -11,8 +11,8 @@
     cd mini-ops
     ```
 3.  **Установите зависимости**:
-    - Rust (последний stable)
-    - Node.js (v20+)
+    - Rust (`1.93.0`)
+    - Node.js (`24.17.x`) и npm (`12.0.x`)
 
 ## Рабочий процесс (Workflow)
 
@@ -26,7 +26,7 @@ cargo run
 Фронтенд — это приложение на Vite + React в папке `frontend/`.
 ```bash
 cd frontend
-npm install
+npm ci --strict-allow-scripts
 npm run dev
 ```
 
@@ -38,12 +38,12 @@ npm run dev
     ```
 2.  Внесите изменения и сделайте коммит с понятным описанием.
 3.  Запушьте ветку в ваш fork.
-4.  Создайте Pull Request в ветку `main` оригинального репозитория.
+4.  Создайте Pull Request в ветку `master` оригинального репозитория.
 
 ## Стандарты кода
 
 - **Rust**: Используйте `cargo fmt` и `cargo clippy` перед отправкой.
-- **Frontend**: Используйте `eslint` и `prettier`.
+- **Frontend**: Перед отправкой выполните `npm run lint` (ESLint).
 - **Коммиты**: Используйте convention commits (например, `feat: add new widget`, `fix: resolve crash on startup`).
 
 При изменении зависимостей установите `cargo-audit` и выполните:

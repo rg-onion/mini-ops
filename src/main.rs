@@ -897,7 +897,19 @@ async fn handler(Path(path): Path<String>) -> impl IntoResponse {
 fn serve_file(path: &str) -> Response {
     if let Some(content) = Asset::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        return ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response();
+        let mut response = ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response();
+        if path == "index.html" {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            );
+        } else if path.starts_with("assets/") {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+        }
+        return response;
     }
 
     if path.starts_with("assets/") {
@@ -906,7 +918,12 @@ fn serve_file(path: &str) -> Response {
 
     if let Some(content) = Asset::get("index.html") {
         let mime = mime_guess::mime::TEXT_HTML;
-        return ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response();
+        let mut response = ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-cache"),
+        );
+        return response;
     }
 
     (StatusCode::NOT_FOUND, "index.html not found").into_response()
@@ -1487,6 +1504,34 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             assert_error_code(response, "not_found").await;
         }
+    }
+
+    #[test]
+    fn frontend_cache_headers_support_lazy_chunk_deploys() {
+        for path in ["index.html", "client-side-route"] {
+            let response = serve_file(path);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&header::HeaderValue::from_static("text/html"))
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&header::HeaderValue::from_static("no-cache"))
+            );
+        }
+
+        let asset_path = Asset::iter()
+            .find(|path| path.starts_with("assets/"))
+            .expect("frontend build should contain a hashed asset");
+        let response = serve_file(asset_path.as_ref());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static(
+                "public, max-age=31536000, immutable"
+            ))
+        );
     }
 
     #[test]
