@@ -10,6 +10,7 @@ import type {
     NotificationSecurityEventEvidenceData,
     SecurityEvent,
     SecurityEventEvidence,
+    SecurityAuditResultKind,
     SensitiveFileChangedEvidenceData,
     SensitiveFileChangeKind,
     SensitiveFileCompleteEvidenceMetadata,
@@ -17,6 +18,7 @@ import type {
     SensitiveFileObservedEvidenceMetadata,
     SshSecurityEventEvidenceData,
 } from "@/types";
+import { auditResultKindMatchesStatus } from "@/lib/securityAudit";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -51,6 +53,8 @@ const NOTIFICATION_DELIVERY_ERROR_CODES = new Set<NotificationDeliveryErrorCode>
     "retention_expired",
 ]);
 const AUDIT_METADATA_KEYS = new Set([
+    "result_kind",
+    "coverage_status",
     "suspicious_ports",
     "unexpected_listeners",
     "open_ports",
@@ -68,6 +72,13 @@ const AUDIT_METADATA_KEYS = new Set([
     "medium_risks",
     "low_risks",
     "info_risks",
+]);
+const AUDIT_RESULT_KINDS = new Set<SecurityAuditResultKind>([
+    "pass",
+    "finding",
+    "recommendation",
+    "unverified",
+    "coverage",
 ]);
 const AUDIT_PORT_KEYS = new Set([
     "suspicious_ports",
@@ -232,10 +243,10 @@ function isCanonicalCount(value: string): boolean {
     return Number.isSafeInteger(count) && count >= 0 && count <= 1_000_000 && String(count) === value;
 }
 
-function readAuditMetadata(value: unknown): Record<string, string[]> | null {
+export function readAuditMetadata(value: unknown): Record<string, string[]> | null {
     if (!isRecord(value)) return null;
     const entries = Object.entries(value);
-    if (entries.length > 16) return null;
+    if (entries.length > 18) return null;
 
     let totalBytes = 0;
     const result: Record<string, string[]> = {};
@@ -251,6 +262,13 @@ function readAuditMetadata(value: unknown): Record<string, string[]> | null {
             values.push(raw);
         }
         if (AUDIT_COUNT_KEYS.has(key) && (values.length !== 1 || !isCanonicalCount(values[0]))) {
+            return null;
+        }
+        if (key === "result_kind" && (
+            values.length !== 1
+            || !AUDIT_RESULT_KINDS.has(values[0] as SecurityAuditResultKind)
+        )) return null;
+        if (key === "coverage_status" && (values.length !== 1 || values[0] !== "partial")) {
             return null;
         }
         totalBytes += utf8Length(key) + valueBytes;
@@ -286,6 +304,7 @@ function readAuditData(
         || !isBoundedText(value.remediation, 4096, true)
         || containsPrivateMarker(value.remediation)
         || !metadata
+        || !auditResultKindMatchesStatus(value.status as "FAIL" | "WARN", metadata)
     ) return null;
 
     return {

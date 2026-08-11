@@ -13,7 +13,7 @@ use crate::security::{SecurityAuditor, SecurityCheck};
 
 const SNAPSHOT_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const SNAPSHOT_WAIT_DEADLINE: Duration = Duration::from_secs(21);
-const REQUIRED_CHECK_IDS: [&str; 9] = [
+const REQUIRED_CHECK_IDS: [&str; 10] = [
     "ssh.root_login",
     "ssh.password_auth",
     "firewall.ufw",
@@ -22,7 +22,17 @@ const REQUIRED_CHECK_IDS: [&str; 9] = [
     "intrusion.fail2ban",
     "network.listening_ports",
     "docker.tcp_api",
+    "runtime.docker_control_access",
     "docker.container_hardening",
+];
+const RESULT_KIND_METADATA_KEY: &str = "result_kind";
+const COVERAGE_STATUS_METADATA_KEY: &str = "coverage_status";
+const RESULT_KINDS: [&str; 5] = [
+    "pass",
+    "finding",
+    "recommendation",
+    "unverified",
+    "coverage",
 ];
 
 type CollectorFuture<'a> = Pin<Box<dyn Future<Output = Vec<SecurityCheck>> + Send + 'a>>;
@@ -136,7 +146,10 @@ impl SecurityCheckFact {
             status: "WARN".to_string(),
             evidence: vec![format!("snapshot_error={code}")],
             references: Vec::new(),
-            metadata: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::from([(
+                RESULT_KIND_METADATA_KEY.to_string(),
+                vec!["coverage".to_string()],
+            )]),
             name_key: "audit.collection.name",
             message_key: "audit.collection.degraded",
             message_detail: None,
@@ -292,6 +305,18 @@ fn presentation_for(
                 "audit.docker_api.remediation",
             )
         }
+        "runtime.docker_control_access" => (
+            "audit.docker_control.name",
+            if check.status == "PASS" {
+                "audit.docker_control.pass"
+            } else if result_kind(check) == Some("unverified") {
+                "audit.docker_control.unverified"
+            } else {
+                "audit.docker_control.recommendation"
+            },
+            None,
+            "audit.docker_control.remediation",
+        ),
         "docker.container_hardening" => {
             let risk_count = check
                 .metadata
@@ -663,9 +688,11 @@ impl SecuritySnapshotService {
 
 fn collection_is_complete(checks: &[SecurityCheck]) -> bool {
     if checks.len() != REQUIRED_CHECK_IDS.len()
-        || checks
-            .iter()
-            .any(|check| !matches!(check.status.as_str(), "PASS" | "FAIL" | "WARN"))
+        || checks.iter().any(|check| {
+            !matches!(check.status.as_str(), "PASS" | "FAIL" | "WARN")
+                || !result_kind_matches_status(check)
+                || !coverage_status_is_valid(check)
+        })
     {
         return false;
     }
@@ -680,13 +707,22 @@ fn collection_is_complete(checks: &[SecurityCheck]) -> bool {
 }
 
 fn check_has_unknown_facts(check: &SecurityCheck) -> bool {
+    if has_partial_coverage(check) {
+        return true;
+    }
     if check.evidence.iter().any(|fact| {
         fact.starts_with("probe_error=")
             || fact.starts_with("config_error=")
             || fact.starts_with("snapshot_error=")
+            || fact.starts_with("docker_audit_incomplete=")
             || fact.ends_with("=unknown")
     }) {
         return true;
+    }
+    match result_kind(check) {
+        Some("unverified" | "coverage") => return true,
+        Some("pass" | "finding" | "recommendation") => return false,
+        _ => {}
     }
     if check.status != "WARN" {
         return false;
@@ -719,6 +755,41 @@ fn check_has_unknown_facts(check: &SecurityCheck) -> bool {
         _ => false,
     };
     !proven_known_warn
+}
+
+fn coverage_status_is_valid(check: &SecurityCheck) -> bool {
+    match check.metadata.get(COVERAGE_STATUS_METADATA_KEY) {
+        None => true,
+        Some(values) => {
+            check.status != "PASS" && matches!(values.as_slice(), [value] if value == "partial")
+        }
+    }
+}
+
+fn has_partial_coverage(check: &SecurityCheck) -> bool {
+    matches!(
+        check.metadata.get(COVERAGE_STATUS_METADATA_KEY),
+        Some(values) if matches!(values.as_slice(), [value] if value == "partial")
+    )
+}
+
+fn result_kind(check: &SecurityCheck) -> Option<&str> {
+    match check.metadata.get(RESULT_KIND_METADATA_KEY)?.as_slice() {
+        [value] if RESULT_KINDS.contains(&value.as_str()) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn result_kind_matches_status(check: &SecurityCheck) -> bool {
+    matches!(
+        (check.status.as_str(), result_kind(check)),
+        ("PASS", Some("pass"))
+            | ("FAIL", Some("finding"))
+            | (
+                "WARN",
+                Some("finding" | "recommendation" | "unverified" | "coverage")
+            )
+    )
 }
 
 #[derive(Serialize)]
@@ -762,6 +833,11 @@ fn parse_duration_secs(value: Option<&str>, default: u64, min: u64, max: u64) ->
 
 #[cfg(test)]
 fn test_check(id: &str, status: &str) -> SecurityCheck {
+    let result_kind = match status {
+        "PASS" => "pass",
+        "FAIL" => "finding",
+        _ => "unverified",
+    };
     SecurityCheck {
         id: id.to_string(),
         name: "unused localized name".to_string(),
@@ -782,7 +858,10 @@ fn test_check(id: &str, status: &str) -> SecurityCheck {
         } else {
             Vec::new()
         },
-        metadata: std::collections::HashMap::new(),
+        metadata: std::collections::HashMap::from([(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec![result_kind.to_string()],
+        )]),
     }
 }
 
@@ -917,7 +996,123 @@ mod tests {
             assert_eq!(en.status, ru.status);
             assert_eq!(en.evidence, ru.evidence);
             assert_eq!(en.metadata, ru.metadata);
+            assert_eq!(en.metadata[RESULT_KIND_METADATA_KEY].len(), 1);
             assert!(en.name != ru.name || en.message != ru.message);
+        }
+    }
+
+    #[test]
+    fn required_checks_need_one_known_result_kind() {
+        let mut checks = test_checks();
+        assert!(collection_is_complete(&checks));
+
+        checks[0]
+            .metadata
+            .insert(RESULT_KIND_METADATA_KEY.to_string(), Vec::new());
+        assert!(!collection_is_complete(&checks));
+
+        checks[0].metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["pass".to_string(), "finding".to_string()],
+        );
+        assert!(!collection_is_complete(&checks));
+
+        checks[0].metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["other".to_string()],
+        );
+        assert!(!collection_is_complete(&checks));
+
+        checks[0].metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["finding".to_string()],
+        );
+        assert!(!collection_is_complete(&checks));
+    }
+
+    #[test]
+    fn coverage_status_is_absent_or_exact_partial() {
+        let mut checks = test_checks();
+        assert!(collection_is_complete(&checks));
+
+        for invalid in [
+            Vec::new(),
+            vec!["full".to_string()],
+            vec!["partial".to_string(), "partial".to_string()],
+        ] {
+            checks[0]
+                .metadata
+                .insert(COVERAGE_STATUS_METADATA_KEY.to_string(), invalid);
+            assert!(!collection_is_complete(&checks));
+        }
+
+        checks[0].metadata.insert(
+            COVERAGE_STATUS_METADATA_KEY.to_string(),
+            vec!["partial".to_string()],
+        );
+        assert!(!collection_is_complete(&checks));
+
+        checks[0].status = "FAIL".to_string();
+        checks[0].metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["finding".to_string()],
+        );
+        assert!(collection_is_complete(&checks));
+        assert!(check_has_unknown_facts(&checks[0]));
+    }
+
+    #[tokio::test]
+    async fn pass_with_partial_coverage_is_replaced_by_a_degraded_aggregate() {
+        let mut checks = test_checks();
+        checks[0].metadata.insert(
+            COVERAGE_STATUS_METADATA_KEY.to_string(),
+            vec!["partial".to_string()],
+        );
+
+        let service = SecuritySnapshotService::test_service(Arc::new(AtomicUsize::new(0)));
+        service.publish_checks(checks, Instant::now()).await;
+        let snapshot = service.latest().await.expect("snapshot should publish");
+
+        assert_eq!(
+            snapshot.collection_status(),
+            SecurityCollectionStatus::Degraded
+        );
+        let projected = snapshot.project(&Lang::EN);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "audit.collection");
+        assert_eq!(
+            projected[0].metadata[RESULT_KIND_METADATA_KEY],
+            ["coverage"]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_coverage_status_degrades_the_published_collection() {
+        for invalid in [
+            Vec::new(),
+            vec!["full".to_string()],
+            vec!["partial".to_string(), "partial".to_string()],
+        ] {
+            let mut checks = test_checks();
+            checks[0]
+                .metadata
+                .insert(COVERAGE_STATUS_METADATA_KEY.to_string(), invalid);
+
+            let service = SecuritySnapshotService::test_service(Arc::new(AtomicUsize::new(0)));
+            service.publish_checks(checks, Instant::now()).await;
+            let snapshot = service.latest().await.expect("snapshot should publish");
+
+            assert_eq!(
+                snapshot.collection_status(),
+                SecurityCollectionStatus::Degraded
+            );
+            let projected = snapshot.project(&Lang::EN);
+            assert_eq!(projected.len(), 1);
+            assert_eq!(projected[0].id, "audit.collection");
+            assert_eq!(
+                projected[0].metadata[RESULT_KIND_METADATA_KEY],
+                ["coverage"]
+            );
         }
     }
 
@@ -1121,6 +1316,10 @@ mod tests {
             .expect("SSH root fixture should exist");
         ssh.status = "WARN".to_string();
         ssh.evidence = vec!["permitrootlogin=unknown".to_string()];
+        ssh.metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["unverified".to_string()],
+        );
         fixtures.push(ssh_unknown);
 
         let mut docker_unavailable = test_checks();
@@ -1132,6 +1331,10 @@ mod tests {
         docker.evidence.clear();
         docker.references.clear();
         docker.metadata.clear();
+        docker.metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec!["unverified".to_string()],
+        );
         fixtures.push(docker_unavailable);
 
         for checks in fixtures {
@@ -1156,13 +1359,25 @@ mod tests {
                 "ssh.root_login" => {
                     check.status = "WARN".to_string();
                     check.evidence = vec!["permitrootlogin=prohibit-password".to_string()];
+                    check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
                 }
                 "system.disk_encryption" => {
                     check.status = "WARN".to_string();
                     check.evidence.clear();
+                    check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
                 }
                 "network.listening_ports" => {
                     check.status = "WARN".to_string();
+                    check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
                     check
                         .metadata
                         .insert("suspicious_ports".to_string(), vec!["5432".to_string()]);
@@ -1170,12 +1385,27 @@ mod tests {
                 "docker.tcp_api" => {
                     check.status = "WARN".to_string();
                     check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
+                    check.metadata.insert(
                         "loopback_listeners".to_string(),
                         vec!["tcp://127.0.0.1:2375".to_string()],
                     );
                 }
+                "runtime.docker_control_access" => {
+                    check.status = "WARN".to_string();
+                    check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
+                }
                 "docker.container_hardening" => {
                     check.status = "WARN".to_string();
+                    check.metadata.insert(
+                        RESULT_KIND_METADATA_KEY.to_string(),
+                        vec!["recommendation".to_string()],
+                    );
                     check
                         .metadata
                         .insert("risk_count".to_string(), vec!["1".to_string()]);
@@ -1189,6 +1419,49 @@ mod tests {
 
         assert_eq!(snapshot.collection_status(), SecurityCollectionStatus::Full);
         assert_eq!(snapshot.project(&Lang::EN).len(), REQUIRED_CHECK_IDS.len());
+    }
+
+    #[tokio::test]
+    async fn partial_coverage_degrades_known_findings_and_recommendations_without_markers() {
+        for (status, result_kind) in [("FAIL", "finding"), ("WARN", "recommendation")] {
+            let mut checks = test_checks();
+            let docker = checks
+                .iter_mut()
+                .find(|check| check.id == "docker.container_hardening")
+                .expect("Docker fixture should exist");
+            docker.status = status.to_string();
+            docker.evidence = vec!["known_risk=true".to_string()];
+            docker.metadata.insert(
+                RESULT_KIND_METADATA_KEY.to_string(),
+                vec![result_kind.to_string()],
+            );
+            docker.metadata.insert(
+                COVERAGE_STATUS_METADATA_KEY.to_string(),
+                vec!["partial".to_string()],
+            );
+            docker
+                .metadata
+                .insert("risk_count".to_string(), vec!["1".to_string()]);
+
+            let service = SecuritySnapshotService::test_service(Arc::new(AtomicUsize::new(0)));
+            service.publish_checks(checks, Instant::now()).await;
+            let snapshot = service.latest().await.expect("snapshot should publish");
+
+            assert_eq!(
+                snapshot.collection_status(),
+                SecurityCollectionStatus::Degraded
+            );
+            let projected = snapshot.project(&Lang::EN);
+            assert!(projected.iter().any(|check| {
+                check.id == "audit.collection"
+                    && check.metadata[RESULT_KIND_METADATA_KEY] == ["coverage"]
+            }));
+            assert!(projected.iter().any(|check| {
+                check.id == "docker.container_hardening"
+                    && check.metadata[COVERAGE_STATUS_METADATA_KEY] == ["partial"]
+                    && check.metadata[RESULT_KIND_METADATA_KEY] == [result_kind]
+            }));
+        }
     }
 
     #[test]

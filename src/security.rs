@@ -16,13 +16,13 @@ use probe::{
     Fact, OUTPUT_CAP_BYTES, ProbeCancellation, ProbeProgram, ProbeRunner, UnknownReason,
 };
 
-use crate::docker::{DockerSecurityIncompleteReason, DockerSecurityRisk, DockerService};
+use crate::docker::{
+    DEFAULT_DOCKER_SOCKET_PATH, DockerSecurityIncompleteReason, DockerSecurityRisk, DockerService,
+};
 use crate::i18n::Lang;
 use crate::notifications::{NotificationOutbox, NotificationService};
 use crate::security_events::SecurityEventService;
-use crate::security_snapshot::{
-    SecurityCollectionStatus, SecuritySnapshotIdentity, SecuritySnapshotService,
-};
+use crate::security_snapshot::{SecuritySnapshotIdentity, SecuritySnapshotService};
 
 const AUDIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const FILE_READ_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
@@ -36,6 +36,40 @@ const SSHD_ROOT_EVALUATION_CONTEXT: &str =
 const SSHD_PASSWORD_EVALUATION_CONTEXT: &str =
     "user=nobody,host=security-audit.invalid,addr=198.51.100.10,laddr=192.0.2.10,lport=22";
 const SSHD_EFFECTIVE_SOURCE: &str = "sshd -T -C";
+const RESULT_KIND_METADATA_KEY: &str = "result_kind";
+const COVERAGE_STATUS_METADATA_KEY: &str = "coverage_status";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecurityResultKind {
+    Pass,
+    Finding,
+    Recommendation,
+    Unverified,
+    Coverage,
+}
+
+impl SecurityResultKind {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Finding => "finding",
+            Self::Recommendation => "recommendation",
+            Self::Unverified => "unverified",
+            Self::Coverage => "coverage",
+        }
+    }
+
+    fn from_code(value: &str) -> Option<Self> {
+        match value {
+            "pass" => Some(Self::Pass),
+            "finding" => Some(Self::Finding),
+            "recommendation" => Some(Self::Recommendation),
+            "unverified" => Some(Self::Unverified),
+            "coverage" => Some(Self::Coverage),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SecurityCheck {
@@ -61,6 +95,11 @@ impl SecurityCheck {
         message: String,
         remediation: String,
     ) -> Self {
+        let result_kind = match status {
+            "PASS" => SecurityResultKind::Pass,
+            "FAIL" => SecurityResultKind::Finding,
+            _ => SecurityResultKind::Unverified,
+        };
         Self {
             id: id.to_string(),
             name,
@@ -71,7 +110,10 @@ impl SecurityCheck {
             evidence: Vec::new(),
             remediation,
             references: Vec::new(),
-            metadata: HashMap::new(),
+            metadata: HashMap::from([(
+                RESULT_KIND_METADATA_KEY.to_string(),
+                vec![result_kind.code().to_string()],
+            )]),
         }
     }
 
@@ -89,6 +131,21 @@ impl SecurityCheck {
         self.metadata
             .insert(key.to_string(), bounded_strings(values, 4 * 1024, 128));
         self
+    }
+
+    fn with_result_kind(mut self, result_kind: SecurityResultKind) -> Self {
+        self.metadata.insert(
+            RESULT_KIND_METADATA_KEY.to_string(),
+            vec![result_kind.code().to_string()],
+        );
+        self
+    }
+
+    fn result_kind(&self) -> Option<SecurityResultKind> {
+        match self.metadata.get(RESULT_KIND_METADATA_KEY)?.as_slice() {
+            [value] => SecurityResultKind::from_code(value),
+            _ => None,
+        }
     }
 }
 
@@ -170,6 +227,58 @@ fn docker_audit_evidence(
             .map(|risk| format!("{}: {}", risk.finding, risk.evidence)),
     );
     evidence
+}
+
+fn annotate_docker_audit_result(
+    mut check: SecurityCheck,
+    has_known_risks: bool,
+    has_incomplete_facts: bool,
+) -> SecurityCheck {
+    if check.status == "WARN" && has_known_risks {
+        check = check.with_result_kind(SecurityResultKind::Recommendation);
+    }
+    if has_incomplete_facts {
+        check = check.with_metadata(COVERAGE_STATUS_METADATA_KEY, vec!["partial".to_string()]);
+    }
+    check
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DockerControlAccess {
+    Absent,
+    Confirmed,
+    Unverified,
+}
+
+struct DockerContainerAuditResult {
+    check: SecurityCheck,
+    control_access: DockerControlAccess,
+}
+
+fn docker_control_access_from_facts(
+    daemon_api_access_confirmed: bool,
+    default_socket_error: Option<std::io::ErrorKind>,
+) -> DockerControlAccess {
+    if daemon_api_access_confirmed {
+        DockerControlAccess::Confirmed
+    } else if default_socket_error == Some(std::io::ErrorKind::NotFound) {
+        DockerControlAccess::Absent
+    } else {
+        DockerControlAccess::Unverified
+    }
+}
+
+async fn docker_control_access_after_audit(
+    daemon_api_access_confirmed: bool,
+) -> DockerControlAccess {
+    if daemon_api_access_confirmed {
+        return DockerControlAccess::Confirmed;
+    }
+    let default_socket_error = tokio::fs::metadata(DEFAULT_DOCKER_SOCKET_PATH)
+        .await
+        .err()
+        .map(|error| error.kind());
+    docker_control_access_from_facts(false, default_socket_error)
 }
 
 async fn read_bounded_text_file(
@@ -340,6 +449,7 @@ impl SecurityAuditor {
             crate::i18n::t("audit.collection.error", lang),
             crate::i18n::t("audit.collection.remediation", lang),
         )
+        .with_result_kind(SecurityResultKind::Coverage)
         .with_evidence(unknown_evidence(UnknownReason::AuditDeadlineExceeded))
     }
 
@@ -381,7 +491,11 @@ impl SecurityAuditor {
         let listeners = port_scan.listeners.clone();
         checks.push(port_scan.check);
         checks.push(Self::check_docker_tcp_api_ports(lang, &listeners));
-        checks.push(docker_containers);
+        checks.push(Self::check_docker_control_access(
+            lang,
+            docker_containers.control_access,
+        ));
+        checks.push(docker_containers.check);
 
         checks
     }
@@ -406,22 +520,6 @@ impl SecurityAuditor {
             .sum();
 
         ((earned * 100) / total_weight).min(100)
-    }
-
-    pub fn extract_open_ports(checks: &[SecurityCheck]) -> Vec<u16> {
-        let mut ports = checks
-            .iter()
-            .find(|check| check.id == "network.listening_ports")
-            .and_then(|check| check.metadata.get("open_ports"))
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|port| port.parse::<u16>().ok())
-            .collect::<Vec<_>>();
-
-        ports.sort_unstable();
-        ports.dedup();
-        ports
     }
 
     fn severity_weight(check: &SecurityCheck) -> u32 {
@@ -661,6 +759,7 @@ impl SecurityAuditor {
                     crate::i18n::t("audit.ssh_root.warn_restricted", lang),
                     remediation,
                 )
+                .with_result_kind(SecurityResultKind::Recommendation)
                 .with_evidence(evidence)
             }
             _ => SecurityCheck::new(
@@ -837,7 +936,7 @@ impl SecurityAuditor {
     async fn check_docker_socket(lang: &Lang) -> SecurityCheck {
         let name = crate::i18n::t("audit.docker_sock.name", lang);
         let remediation = crate::i18n::t("audit.docker_sock.remediation", lang);
-        let path = "/var/run/docker.sock";
+        let path = DEFAULT_DOCKER_SOCKET_PATH;
 
         match tokio::fs::symlink_metadata(path).await {
             Ok(metadata) => match docker_socket_facts(&metadata) {
@@ -926,7 +1025,8 @@ impl SecurityAuditor {
                 "WARN",
                 crate::i18n::t("audit.disk_enc.warn", lang),
                 remediation,
-            ),
+            )
+            .with_result_kind(SecurityResultKind::Recommendation),
             Fact::Unknown(reason) => SecurityCheck::new(
                 "system.disk_encryption",
                 name,
@@ -1159,6 +1259,7 @@ impl SecurityAuditor {
                         ),
                         remediation,
                     )
+                    .with_result_kind(SecurityResultKind::Recommendation)
                     .with_metadata("suspicious_ports", suspicious_strings)
                     .with_metadata("unexpected_listeners", unexpected_listeners)
                 }
@@ -1256,10 +1357,17 @@ impl SecurityAuditor {
         if invalid_token_count == 0 {
             return check;
         }
+        let preserves_known_recommendation =
+            check.result_kind() == Some(SecurityResultKind::Recommendation);
         if check.status == "PASS" {
             check.status = "WARN".to_string();
             check.message = crate::i18n::t("audit.ports.config_error", lang);
         }
+        check = if preserves_known_recommendation {
+            check.with_metadata(COVERAGE_STATUS_METADATA_KEY, vec!["partial".to_string()])
+        } else {
+            check.with_result_kind(SecurityResultKind::Unverified)
+        };
         check
             .with_metadata(
                 "invalid_allowed_port_count",
@@ -1425,6 +1533,7 @@ impl SecurityAuditor {
                 crate::i18n::t("audit.docker_api.fail", lang),
                 remediation,
             )
+            .with_result_kind(SecurityResultKind::Recommendation)
             .with_evidence(
                 loopback_listeners
                     .iter()
@@ -1493,44 +1602,98 @@ impl SecurityAuditor {
         }
     }
 
+    fn check_docker_control_access(lang: &Lang, access: DockerControlAccess) -> SecurityCheck {
+        let name = crate::i18n::t("audit.docker_control.name", lang);
+        let remediation = crate::i18n::t("audit.docker_control.remediation", lang);
+
+        match access {
+            DockerControlAccess::Confirmed => SecurityCheck::new(
+                "runtime.docker_control_access",
+                name,
+                "runtime",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.docker_control.recommendation", lang),
+                remediation,
+            )
+            .with_result_kind(SecurityResultKind::Recommendation)
+            .with_evidence(vec![
+                "docker_api_access=confirmed".to_string(),
+                "docker_endpoint=local_default_socket".to_string(),
+            ])
+            .with_references(vec!["https://docs.docker.com/engine/security/"]),
+            DockerControlAccess::Unverified => SecurityCheck::new(
+                "runtime.docker_control_access",
+                name,
+                "runtime",
+                "high",
+                "WARN",
+                crate::i18n::t("audit.docker_control.unverified", lang),
+                remediation,
+            )
+            .with_evidence(vec![
+                "docker_api_access=unverified".to_string(),
+                "docker_endpoint=local_default_socket".to_string(),
+            ])
+            .with_references(vec!["https://docs.docker.com/engine/security/"]),
+            DockerControlAccess::Absent => SecurityCheck::new(
+                "runtime.docker_control_access",
+                name,
+                "runtime",
+                "high",
+                "PASS",
+                crate::i18n::t("audit.docker_control.pass", lang),
+                remediation,
+            )
+            .with_evidence(vec!["docker_default_socket=absent".to_string()])
+            .with_references(vec!["https://docs.docker.com/engine/security/"]),
+        }
+    }
+
     async fn check_docker_container_risks(
         lang: &Lang,
         docker: Option<&DockerService>,
         cancellation: &ProbeCancellation,
-    ) -> SecurityCheck {
+    ) -> DockerContainerAuditResult {
         let name = crate::i18n::t("audit.docker_containers.name", lang);
         let remediation = crate::i18n::t("audit.docker_containers.remediation", lang);
 
         let Some(docker) = docker else {
-            let socket = tokio::fs::metadata("/var/run/docker.sock").await;
-            let (status, message, evidence) = match socket {
+            let socket = tokio::fs::metadata(DEFAULT_DOCKER_SOCKET_PATH).await;
+            let (status, message, evidence, control_access) = match socket {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
                     "PASS",
                     crate::i18n::t("audit.docker_containers.no_runtime", lang),
                     Vec::new(),
+                    DockerControlAccess::Absent,
                 ),
                 Ok(_) => (
                     "WARN",
                     crate::i18n::t("audit.docker_containers.unavailable", lang),
                     Vec::new(),
+                    DockerControlAccess::Unverified,
                 ),
                 Err(error) => (
                     "WARN",
                     crate::i18n::t("audit.docker_containers.error", lang),
                     unknown_evidence(filesystem_unknown_reason(&error)),
+                    DockerControlAccess::Unverified,
                 ),
             };
 
-            return SecurityCheck::new(
-                "docker.container_hardening",
-                name,
-                "docker",
-                "high",
-                status,
-                message,
-                remediation,
-            )
-            .with_evidence(evidence);
+            return DockerContainerAuditResult {
+                check: SecurityCheck::new(
+                    "docker.container_hardening",
+                    name,
+                    "docker",
+                    "high",
+                    status,
+                    message,
+                    remediation,
+                )
+                .with_evidence(evidence),
+                control_access,
+            };
         };
 
         let docker_timeout = env_duration_secs(
@@ -1554,36 +1717,46 @@ impl SecurityAuditor {
         };
 
         match audit_result {
-            DockerAuditResult::Cancelled(reason) => SecurityCheck::new(
-                "docker.container_hardening",
-                name,
-                "docker",
-                "high",
-                "WARN",
-                crate::i18n::t("audit.docker_containers.error", lang),
-                remediation,
-            )
-            .with_evidence(unknown_evidence(reason)),
-            DockerAuditResult::Completed(outcome)
-                if outcome.risks.is_empty() && outcome.incomplete_reasons.is_empty() =>
-            {
-                SecurityCheck::new(
+            DockerAuditResult::Cancelled(reason) => DockerContainerAuditResult {
+                check: SecurityCheck::new(
                     "docker.container_hardening",
                     name,
                     "docker",
                     "high",
-                    "PASS",
-                    crate::i18n::t("audit.docker_containers.pass", lang),
+                    "WARN",
+                    crate::i18n::t("audit.docker_containers.error", lang),
                     remediation,
                 )
-                .with_references(vec!["https://docs.docker.com/engine/security/"])
+                .with_evidence(unknown_evidence(reason)),
+                control_access: DockerControlAccess::Unverified,
+            },
+            DockerAuditResult::Completed(outcome)
+                if outcome.risks.is_empty() && outcome.incomplete_reasons.is_empty() =>
+            {
+                let control_access =
+                    docker_control_access_after_audit(outcome.daemon_api_access_confirmed).await;
+                DockerContainerAuditResult {
+                    check: SecurityCheck::new(
+                        "docker.container_hardening",
+                        name,
+                        "docker",
+                        "high",
+                        "PASS",
+                        crate::i18n::t("audit.docker_containers.pass", lang),
+                        remediation,
+                    )
+                    .with_references(vec!["https://docs.docker.com/engine/security/"]),
+                    control_access,
+                }
             }
             DockerAuditResult::Completed(outcome) => {
+                let control_access =
+                    docker_control_access_after_audit(outcome.daemon_api_access_confirmed).await;
                 let risks = outcome.risks;
                 let mut incomplete_reasons = outcome.incomplete_reasons;
                 incomplete_reasons.sort_by_key(|reason| reason.code());
-                let (severity, status) =
-                    docker_audit_severity_status(&risks, !incomplete_reasons.is_empty());
+                let has_incomplete_facts = !incomplete_reasons.is_empty();
+                let (severity, status) = docker_audit_severity_status(&risks, has_incomplete_facts);
                 let evidence = docker_audit_evidence(&risks, &incomplete_reasons);
 
                 let mut by_severity: HashMap<String, Vec<String>> = HashMap::new();
@@ -1616,11 +1789,17 @@ impl SecurityAuditor {
                 .with_references(vec!["https://docs.docker.com/engine/security/"])
                 .with_metadata("risk_count", vec![risks.len().to_string()]);
 
+                check =
+                    annotate_docker_audit_result(check, !risks.is_empty(), has_incomplete_facts);
+
                 for (severity, values) in by_severity {
                     check = check.with_metadata(&format!("{}_risks", severity), values);
                 }
 
-                check
+                DockerContainerAuditResult {
+                    check,
+                    control_access,
+                }
             }
         }
     }
@@ -1633,6 +1812,37 @@ pub struct SecurityMonitor {
     events: Arc<SecurityEventService>,
     interval: Duration,
     processed_snapshots: SnapshotIdentityTracker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuditEventAction {
+    Retire,
+    Resolve,
+    RaiseFailure,
+    RaiseWarning,
+}
+
+fn audit_event_action(check: &SecurityCheck) -> AuditEventAction {
+    if check.id == "audit.collection" {
+        return AuditEventAction::Retire;
+    }
+    if check.status == "FAIL" {
+        return AuditEventAction::RaiseFailure;
+    }
+    if check
+        .metadata
+        .get(COVERAGE_STATUS_METADATA_KEY)
+        .is_some_and(|values| values.as_slice() == ["partial"])
+    {
+        return AuditEventAction::RaiseWarning;
+    }
+    if check.result_kind() == Some(SecurityResultKind::Recommendation) {
+        return AuditEventAction::Retire;
+    }
+    match check.status.as_str() {
+        "WARN" => AuditEventAction::RaiseWarning,
+        _ => AuditEventAction::Resolve,
+    }
 }
 
 #[derive(Default)]
@@ -1702,89 +1912,83 @@ impl SecurityMonitor {
         if !self.processed_snapshots.claim(identity).await {
             return;
         }
-        if snapshot.collection_status() == SecurityCollectionStatus::Full {
-            let collection_check = SecurityCheck::new(
-                "audit.collection",
-                crate::i18n::t("audit.collection.name", &default_lang),
-                "system",
-                "high",
-                "PASS",
-                crate::i18n::t("security.resolved", &default_lang),
-                crate::i18n::t("audit.collection.remediation", &default_lang),
+        if self
+            .events
+            .retire_audit_event("audit.collection")
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event_error = "database",
+                check_id = "audit.collection",
+                "Failed to retire legacy collection event"
             );
-            let recovery_text = self.notifier.render_alert_text(&format!(
-                "{}\n\n{}: {}",
-                crate::i18n::t("security.resolved", &default_lang),
-                crate::i18n::t("security.check", &default_lang),
-                collection_check.name
-            ));
-            if self
-                .events
-                .resolve_audit_event_with_notification(
-                    &collection_check,
-                    &self.outbox,
-                    &recovery_text,
-                )
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    event_error = "database",
-                    check_id = "audit.collection",
-                    "Failed to resolve recovered collection event"
-                );
-            }
         }
         let checks = snapshot.project(&default_lang);
 
         for check in &checks {
-            if check.status == "FAIL" {
-                let alert = self.notifier.render_alert_text(&format!(
-                    "{}\n\n{}: {}\n{}: {}",
-                    crate::i18n::t("security.detected", &default_lang),
-                    crate::i18n::t("security.check", &default_lang),
-                    check.name,
-                    crate::i18n::t("security.message", &default_lang),
-                    check.message
-                ));
-                if self
-                    .events
-                    .raise_audit_event_with_notification(check, &self.outbox, &alert)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        event_error = "database",
-                        check_id = %check.id,
-                        "Failed to persist security event and notification"
-                    );
+            match audit_event_action(check) {
+                AuditEventAction::Retire => {
+                    if check.id != "audit.collection"
+                        && self.events.retire_audit_event(&check.id).await.is_err()
+                    {
+                        tracing::warn!(
+                            event_error = "database",
+                            check_id = %check.id,
+                            "Failed to retire non-incident audit event"
+                        );
+                    }
                 }
-            } else if check.status == "WARN" {
-                if self.events.raise_audit_event(check).await.is_err() {
-                    tracing::warn!(
-                        event_error = "database",
-                        check_id = %check.id,
-                        "Failed to persist warning security event"
-                    );
+                AuditEventAction::RaiseFailure => {
+                    let alert = self.notifier.render_alert_text(&format!(
+                        "{}\n\n{}: {}\n{}: {}",
+                        crate::i18n::t("security.detected", &default_lang),
+                        crate::i18n::t("security.check", &default_lang),
+                        check.name,
+                        crate::i18n::t("security.message", &default_lang),
+                        check.message
+                    ));
+                    if self
+                        .events
+                        .raise_audit_event_with_notification(check, &self.outbox, &alert)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            event_error = "database",
+                            check_id = %check.id,
+                            "Failed to persist security event and notification"
+                        );
+                    }
                 }
-            } else if check.status == "PASS" {
-                let alert = self.notifier.render_alert_text(&format!(
-                    "{}\n\n{}: {}",
-                    crate::i18n::t("security.resolved", &default_lang),
-                    crate::i18n::t("security.check", &default_lang),
-                    check.name
-                ));
-                if self
-                    .events
-                    .resolve_audit_event_with_notification(check, &self.outbox, &alert)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        event_error = "database",
-                        check_id = %check.id,
-                        "Failed to resolve security event and notification"
-                    );
+                AuditEventAction::RaiseWarning => {
+                    if self.events.raise_audit_event(check).await.is_err() {
+                        tracing::warn!(
+                            event_error = "database",
+                            check_id = %check.id,
+                            "Failed to persist warning security event"
+                        );
+                    }
+                }
+                AuditEventAction::Resolve => {
+                    let alert = self.notifier.render_alert_text(&format!(
+                        "{}\n\n{}: {}",
+                        crate::i18n::t("security.resolved", &default_lang),
+                        crate::i18n::t("security.check", &default_lang),
+                        check.name
+                    ));
+                    if self
+                        .events
+                        .resolve_audit_event_with_notification(check, &self.outbox, &alert)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            event_error = "database",
+                            check_id = %check.id,
+                            "Failed to resolve security event"
+                        );
+                    }
                 }
             }
         }
@@ -2170,6 +2374,151 @@ mod tests {
     }
 
     #[test]
+    fn docker_control_access_distinguishes_confirmed_unverified_and_absent() {
+        assert_eq!(
+            docker_control_access_from_facts(true, Some(std::io::ErrorKind::NotFound)),
+            DockerControlAccess::Confirmed
+        );
+        assert_eq!(
+            docker_control_access_from_facts(false, Some(std::io::ErrorKind::NotFound)),
+            DockerControlAccess::Absent
+        );
+        assert_eq!(
+            docker_control_access_from_facts(false, None),
+            DockerControlAccess::Unverified
+        );
+        assert_eq!(
+            docker_control_access_from_facts(false, Some(std::io::ErrorKind::PermissionDenied)),
+            DockerControlAccess::Unverified
+        );
+
+        let available =
+            SecurityAuditor::check_docker_control_access(&Lang::EN, DockerControlAccess::Confirmed);
+        assert_eq!(available.id, "runtime.docker_control_access");
+        assert_eq!(available.status, "WARN");
+        assert_eq!(
+            available.metadata[RESULT_KIND_METADATA_KEY],
+            ["recommendation"]
+        );
+        assert_eq!(
+            available.evidence,
+            [
+                "docker_api_access=confirmed",
+                "docker_endpoint=local_default_socket"
+            ]
+        );
+        let serialized = serde_json::to_string(&available).expect("check should serialize");
+        assert!(!serialized.contains("gid"));
+        assert!(!serialized.contains("group"));
+
+        let unverified = SecurityAuditor::check_docker_control_access(
+            &Lang::EN,
+            DockerControlAccess::Unverified,
+        );
+        assert_eq!(unverified.status, "WARN");
+        assert_eq!(
+            unverified.metadata[RESULT_KIND_METADATA_KEY],
+            ["unverified"]
+        );
+        assert_eq!(
+            unverified.evidence,
+            [
+                "docker_api_access=unverified",
+                "docker_endpoint=local_default_socket"
+            ]
+        );
+        assert_eq!(
+            audit_event_action(&unverified),
+            AuditEventAction::RaiseWarning
+        );
+
+        let absent =
+            SecurityAuditor::check_docker_control_access(&Lang::EN, DockerControlAccess::Absent);
+        assert_eq!(absent.status, "PASS");
+        assert_eq!(absent.metadata[RESULT_KIND_METADATA_KEY], ["pass"]);
+        assert_eq!(absent.evidence, ["docker_default_socket=absent"]);
+    }
+
+    #[test]
+    fn event_policy_separates_recommendations_findings_and_coverage() {
+        let recommendation =
+            SecurityAuditor::check_docker_control_access(&Lang::EN, DockerControlAccess::Confirmed);
+        assert_eq!(
+            audit_event_action(&recommendation),
+            AuditEventAction::Retire
+        );
+
+        let mut partially_verified_recommendation = recommendation.clone();
+        partially_verified_recommendation.metadata.insert(
+            COVERAGE_STATUS_METADATA_KEY.to_string(),
+            vec!["partial".to_string()],
+        );
+        assert_eq!(
+            audit_event_action(&partially_verified_recommendation),
+            AuditEventAction::RaiseWarning
+        );
+
+        let finding = SecurityCheck::new(
+            "fixture.finding",
+            "Finding".to_string(),
+            "fixture",
+            "high",
+            "FAIL",
+            "Finding".to_string(),
+            "Fix".to_string(),
+        );
+        assert_eq!(audit_event_action(&finding), AuditEventAction::RaiseFailure);
+
+        let unverified = SecurityCheck::new(
+            "fixture.unverified",
+            "Unverified".to_string(),
+            "fixture",
+            "high",
+            "WARN",
+            "Unverified".to_string(),
+            "Verify".to_string(),
+        );
+        assert_eq!(
+            audit_event_action(&unverified),
+            AuditEventAction::RaiseWarning
+        );
+
+        let collection = SecurityAuditor::deadline_exceeded_check(&Lang::EN);
+        assert_eq!(collection.metadata[RESULT_KIND_METADATA_KEY], ["coverage"]);
+        assert_eq!(audit_event_action(&collection), AuditEventAction::Retire);
+    }
+
+    #[test]
+    fn mixed_docker_recommendation_and_partial_coverage_keeps_both_axes() {
+        let check = SecurityCheck::new(
+            "docker.container_hardening",
+            "Docker".to_string(),
+            "docker",
+            "medium",
+            "WARN",
+            "Known recommendations and incomplete inspection".to_string(),
+            "Review".to_string(),
+        );
+        let mixed = annotate_docker_audit_result(check, true, true);
+
+        assert_eq!(mixed.metadata[RESULT_KIND_METADATA_KEY], ["recommendation"]);
+        assert_eq!(mixed.metadata[COVERAGE_STATUS_METADATA_KEY], ["partial"]);
+        assert_eq!(audit_event_action(&mixed), AuditEventAction::RaiseWarning);
+
+        let complete = SecurityCheck {
+            metadata: HashMap::new(),
+            ..mixed.clone()
+        };
+        let complete = annotate_docker_audit_result(complete, true, false);
+        assert_eq!(
+            complete.metadata[RESULT_KIND_METADATA_KEY],
+            ["recommendation"]
+        );
+        assert!(!complete.metadata.contains_key(COVERAGE_STATUS_METADATA_KEY));
+        assert_eq!(audit_event_action(&complete), AuditEventAction::Retire);
+    }
+
+    #[test]
     fn test_parse_listening_sockets_extracts_ports() {
         let output = "\
 tcp LISTEN 0 4096 127.0.0.1:3000 0.0.0.0:*
@@ -2231,6 +2580,7 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
         let check = SecurityAuditor::apply_invalid_allowed_port_warning(&Lang::EN, pass, 3);
 
         assert_eq!(check.status, "WARN");
+        assert_eq!(check.metadata[RESULT_KIND_METADATA_KEY], ["unverified"]);
         assert_eq!(check.evidence[0], "config_error=invalid_allowed_port");
         assert_eq!(check.metadata["invalid_allowed_port_count"], vec!["3"]);
         assert!(
@@ -2239,6 +2589,30 @@ udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*
                 .iter()
                 .all(|value| !value.contains("bad") && !value.contains("70000"))
         );
+    }
+
+    #[test]
+    fn invalid_allowed_ports_preserve_known_listener_recommendation_and_mark_partial() {
+        let recommendation = SecurityCheck::new(
+            "network.listening_ports",
+            "Listening ports".to_string(),
+            "network",
+            "medium",
+            "WARN",
+            "Unexpected listeners".to_string(),
+            "Review listeners".to_string(),
+        )
+        .with_result_kind(SecurityResultKind::Recommendation)
+        .with_metadata("suspicious_ports", vec!["5432".to_string()]);
+
+        let check =
+            SecurityAuditor::apply_invalid_allowed_port_warning(&Lang::EN, recommendation, 2);
+
+        assert_eq!(check.status, "WARN");
+        assert_eq!(check.metadata[RESULT_KIND_METADATA_KEY], ["recommendation"]);
+        assert_eq!(check.metadata[COVERAGE_STATUS_METADATA_KEY], ["partial"]);
+        assert_eq!(check.metadata["suspicious_ports"], ["5432"]);
+        assert_eq!(audit_event_action(&check), AuditEventAction::RaiseWarning);
     }
 
     #[test]
@@ -2530,7 +2904,7 @@ this line is not valid ss output
     }
 
     #[tokio::test]
-    async fn full_snapshot_resolves_collection_warning_without_notification() {
+    async fn monitor_retires_legacy_collection_warning_without_notification() {
         use sqlx::sqlite::SqlitePoolOptions;
         use std::sync::atomic::AtomicUsize;
 
@@ -2549,17 +2923,37 @@ this line is not valid ss output
         let snapshots =
             SecuritySnapshotService::test_degraded_then_full_service(Arc::clone(&counter));
         let monitor = SecurityMonitor::new(notifier, outbox, snapshots, Arc::clone(&events));
+        let legacy_collection = SecurityAuditor::deadline_exceeded_check(&Lang::EN);
+        assert!(
+            !events
+                .raise_audit_event(&legacy_collection)
+                .await
+                .expect("legacy collection event should persist without alert")
+        );
+
         monitor.check_once().await;
         let active = events
             .list(Some("active"), 100)
             .await
             .expect("active events should be readable");
-        assert!(active.iter().any(|event| {
-            event.event_key == "audit:audit.collection" && event.event_type == "audit.check_warning"
-        }));
+        assert!(
+            !active
+                .iter()
+                .any(|event| event.event_key == "audit:audit.collection")
+        );
         assert!(active.iter().any(|event| {
             event.event_key == "audit:firewall.ufw" && event.event_type == "audit.check_warning"
         }));
+
+        let first_resolved = events
+            .list(Some("resolved"), 100)
+            .await
+            .expect("resolved events should be readable");
+        assert!(
+            first_resolved
+                .iter()
+                .any(|event| event.event_key == "audit:audit.collection")
+        );
 
         monitor.check_once().await;
 

@@ -1386,6 +1386,24 @@ impl SecurityEventService {
         Ok(())
     }
 
+    pub(crate) async fn retire_audit_event(&self, check_id: &str) -> Result<bool, sqlx::Error> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE security_events
+             SET status = 'resolved', last_seen = ?, resolved_at = ?
+             WHERE event_key = ?
+               AND event_type IN ('audit.check_failed', 'audit.check_warning')
+               AND status IN ('open', 'acknowledged')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(Self::audit_event_key(check_id))
+        .execute(&self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn get_state_by_key(
         &self,
         event_key: &str,
@@ -1840,6 +1858,7 @@ fn parse_audit_evidence(event_type: &str, stored: &str) -> Option<AuditEventEvid
             MAX_AUDIT_EVIDENCE_BYTES,
         )
         || !valid_audit_metadata(&evidence.metadata)
+        || !audit_result_kind_matches_status(&evidence.status, &evidence.metadata)
         || ((evidence.category == "certificate" || evidence.check_id.starts_with("certificate."))
             && !valid_certificate_audit_evidence(&evidence))
     {
@@ -1854,6 +1873,27 @@ fn parse_audit_evidence(event_type: &str, stored: &str) -> Option<AuditEventEvid
         _ => false,
     };
     status_is_valid.then_some(evidence)
+}
+
+fn audit_result_kind_matches_status(
+    status: &str,
+    metadata: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    let Some(values) = metadata.get("result_kind") else {
+        return true;
+    };
+    let [result_kind] = values.as_slice() else {
+        return false;
+    };
+    matches!(
+        (status, result_kind.as_str()),
+        ("PASS", "pass")
+            | ("FAIL", "finding")
+            | ("WARN", "finding")
+            | ("WARN", "recommendation")
+            | ("WARN", "unverified")
+            | ("WARN", "coverage")
+    )
 }
 
 fn valid_certificate_audit_evidence(evidence: &AuditEventEvidenceV1) -> bool {
@@ -2407,6 +2447,8 @@ fn is_allowed_audit_metadata_key(key: &str) -> bool {
             | "medium_risks"
             | "low_risks"
             | "info_risks"
+            | "result_kind"
+            | "coverage_status"
     )
 }
 
@@ -2432,6 +2474,15 @@ fn valid_audit_metadata_values(key: &str, values: &[String]) -> bool {
                 .map(|count| count <= 1_000_000 && value == &count.to_string())
                 .unwrap_or(false))
         }
+        "result_kind" => matches!(
+            values,
+            [value]
+                if matches!(
+                    value.as_str(),
+                    "pass" | "finding" | "recommendation" | "unverified" | "coverage"
+                )
+        ),
+        "coverage_status" => matches!(values, [value] if value == "partial"),
         _ => true,
     }
 }
@@ -2993,7 +3044,11 @@ mod tests {
             "status": "FAIL",
             "evidence": ["probe_error=timeout"],
             "remediation": "Fix it",
-            "metadata": {"open_ports": ["22"]},
+            "metadata": {
+                "open_ports": ["22"],
+                "result_kind": ["finding"],
+                "coverage_status": ["partial"]
+            },
         });
         let invalid_audit_payloads = [
             serde_json::json!({
@@ -3044,6 +3099,46 @@ mod tests {
                 "evidence": [],
                 "remediation": "Fix it",
                 "metadata": {"open_ports": ["0"]},
+            }),
+            serde_json::json!({
+                "check_id": "test.failure",
+                "category": "test",
+                "status": "FAIL",
+                "evidence": [],
+                "remediation": "Fix it",
+                "metadata": {"result_kind": ["finding", "recommendation"]},
+            }),
+            serde_json::json!({
+                "check_id": "test.failure",
+                "category": "test",
+                "status": "FAIL",
+                "evidence": [],
+                "remediation": "Fix it",
+                "metadata": {"result_kind": ["other"]},
+            }),
+            serde_json::json!({
+                "check_id": "test.failure",
+                "category": "test",
+                "status": "FAIL",
+                "evidence": [],
+                "remediation": "Fix it",
+                "metadata": {"result_kind": ["recommendation"]},
+            }),
+            serde_json::json!({
+                "check_id": "test.failure",
+                "category": "test",
+                "status": "WARN",
+                "evidence": [],
+                "remediation": "Fix it",
+                "metadata": {"result_kind": ["pass"]},
+            }),
+            serde_json::json!({
+                "check_id": "test.failure",
+                "category": "test",
+                "status": "FAIL",
+                "evidence": [],
+                "remediation": "Fix it",
+                "metadata": {"coverage_status": ["partial", "full"]},
             }),
         ];
         assert!(parse_audit_evidence("audit.check_failed", &valid_audit.to_string()).is_some());
@@ -3121,6 +3216,31 @@ mod tests {
             r#"{"reason":"backpressure","live_limit":1000,"terminal_limit":200,"error":"RAW_SENTINEL"}"#,
         ] {
             assert!(parse_notification_delivery_degraded_evidence(payload).is_none());
+        }
+    }
+
+    #[test]
+    fn audit_result_kind_status_matrix_is_exact_and_legacy_compatible() {
+        assert!(audit_result_kind_matches_status("FAIL", &BTreeMap::new()));
+
+        for (status, result_kind, expected) in [
+            ("PASS", "pass", true),
+            ("PASS", "finding", false),
+            ("FAIL", "finding", true),
+            ("FAIL", "recommendation", false),
+            ("WARN", "finding", true),
+            ("WARN", "recommendation", true),
+            ("WARN", "unverified", true),
+            ("WARN", "coverage", true),
+            ("WARN", "pass", false),
+        ] {
+            let metadata =
+                BTreeMap::from([("result_kind".to_string(), vec![result_kind.to_string()])]);
+            assert_eq!(
+                audit_result_kind_matches_status(status, &metadata),
+                expected,
+                "unexpected matrix result for {status}/{result_kind}"
+            );
         }
     }
 
@@ -3879,6 +3999,103 @@ mod tests {
         let resolved = service.list(Some("resolved"), 10).await.unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].event_type, "audit.check_warning");
+    }
+
+    #[tokio::test]
+    async fn legacy_collection_event_is_retired_without_deletion_or_notification() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        assert!(
+            !service
+                .retire_audit_event("audit.collection")
+                .await
+                .unwrap()
+        );
+
+        let mut collection = warning_check();
+        collection.id = "audit.collection".to_string();
+        collection
+            .metadata
+            .insert("result_kind".to_string(), vec!["coverage".to_string()]);
+        assert_eq!(
+            service
+                .raise_audit_event_with_notification(
+                    &collection,
+                    &outbox,
+                    "coverage warning must not deliver",
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(service.list(Some("active"), 10).await.unwrap().len(), 1);
+
+        assert!(
+            service
+                .retire_audit_event("audit.collection")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .retire_audit_event("audit.collection")
+                .await
+                .unwrap()
+        );
+
+        let resolved = service.list(Some("resolved"), 10).await.unwrap();
+        assert_eq!(resolved.len(), 1, "legacy evidence remains auditable");
+        assert_eq!(resolved[0].event_key, "audit:audit.collection");
+        assert_eq!(resolved[0].status, "resolved");
+        assert!(resolved[0].resolved_at.is_some());
+        let outbox_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_outbox
+             WHERE source_event_key = 'audit:audit.collection'",
+        )
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(outbox_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_event_retired_as_recommendation_does_not_enqueue_recovery() {
+        let service = test_service().await;
+        let outbox = enabled_outbox(&service);
+        assert!(matches!(
+            service
+                .raise_audit_event_with_notification(
+                    &failed_check(),
+                    &outbox,
+                    "original confirmed failure",
+                )
+                .await
+                .unwrap(),
+            Some(EnqueueOutcome::Pending { .. })
+        ));
+        let event_key = SecurityEventService::audit_event_key("test.failure");
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_outbox WHERE source_event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(before, 1);
+
+        assert!(service.retire_audit_event("test.failure").await.unwrap());
+
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_outbox WHERE source_event_key = ?",
+        )
+        .bind(&event_key)
+        .fetch_one(&service.db)
+        .await
+        .unwrap();
+        assert_eq!(after, before, "silent retirement must not enqueue recovery");
+        let resolved = service.list(Some("resolved"), 10).await.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].event_key, event_key);
     }
 
     #[tokio::test]

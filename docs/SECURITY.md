@@ -23,6 +23,11 @@ openssl rand -hex 32
 ### API Exposure
 Mini-Ops does not throttle all API routes itself. If the dashboard is reachable outside a trusted network, put it behind a reverse proxy, VPN, or edge service that provides TLS and request throttling.
 
+Mini-Ops does not expose a dashboard or API action that pulls source code,
+installs a binary, or restarts the agent. Upgrades remain explicit host-level
+operations with artifact verification, backup, rollback, and post-change health
+checks as described in the [Deploy Guide](DEPLOY.md).
+
 The embedded HTML applies a restrictive same-origin Content Security Policy and
 does not load third-party browser resources. The supported Nginx renderer adds
 the equivalent response CSP plus clickjacking, MIME-sniffing, referrer,
@@ -39,30 +44,6 @@ credential persistence but is not equivalent to an `HttpOnly` server
 session: script execution in the active page can still act with that page's
 authority, so CSP remains defense-in-depth rather than the primary control.
 CLI/API clients continue to use `Authorization: Bearer`.
-
-### Experimental Web Source Builds
-The `POST /api/deploy/webhook` endpoint remains protected by `AUTH_TOKEN`, but
-it is disabled by default. Set `MINI_OPS_ALLOW_WEB_UPDATE=true` only when this
-host should accept an experimental source-build request.
-
-When enabled, Mini-Ops runs `scripts/update.sh` from the local checkout. The
-script refuses non-git directories and tracked local changes, uses
-`git pull --ff-only`, installs frontend dependencies from the lockfile when
-available, and builds the backend with `cargo build --release --locked`. Only
-one update can run at a time, and `/api/deploy/logs` streams bounded status
-events without raw command output. `MINI_OPS_WEB_UPDATE_TIMEOUT_SECS` bounds each web-triggered update
-(`1800` seconds by default). A successful terminal state means only that the
-source build completed. Installation, service restart, health validation, and
-rollback remain manual; the dashboard does not present this endpoint as an
-agent update action.
-
-### Disk Cleanup
-
-The dashboard reports disk usage but does not expose cleanup actions. The
-server-side cleanup endpoint is disabled unless
-`MINI_OPS_ALLOW_DISK_CLEANUP=true` is set exactly. Even with that experimental
-gate enabled, the `docker` target always returns `403 operation_unavailable`
-and cannot invoke `docker system prune -af`.
 
 ## 📝 SSH Monitoring
 
@@ -101,6 +82,14 @@ The "Security Audit" section checks:
     - `/var/run/docker.sock` must be a real final Unix socket and must not be
       world-writable and must be owned by root; a symlink or another file type
       cannot pass the check.
+    - Only a successful bounded daemon API request proves Docker control
+      access. When Mini-Ops confirms access to the conventional local daemon,
+      a separate `runtime.docker_control_access` recommendation makes that
+      privilege boundary explicit. Unreachable or ambiguous access remains
+      unverified. Access to a conventional rootful daemon must be treated as
+      root-equivalent; an independently constrained or rootless daemon needs
+      its own threat-boundary review. Revoke the service's socket/API access
+      when container control is not required.
     - TCP API listeners on `2375`/`2376`: public or wildcard listeners fail,
       loopback-only listeners warn, and UDP listeners with the same port
       number do not count as the Docker TCP API.
@@ -120,9 +109,14 @@ The "Security Audit" section checks:
 
 ## Security Events
 
-Mini-Ops stores security audit findings as local events in SQLite. Events are
-created when an audit check reports `FAIL` or `WARN`, updated while the finding
-remains active, and resolved when the check returns to `PASS`.
+Mini-Ops stores confirmed audit findings and unverified coverage states as
+local events in SQLite. A `FAIL` opens a finding event; a `WARN` opens an event
+when its result is unverified or its coverage is explicitly partial. Known
+hardening recommendations with complete coverage stay in the current audit
+posture instead of becoming incidents. The synthetic
+`audit.collection` fact remains part of a degraded snapshot but is not a
+separate active high-severity event. Legacy aggregate and recommendation rows
+are resolved without deletion or notification noise.
 
 - Active events are shown on the Security page.
 - Operators can acknowledge open events to reduce noise while keeping evidence.
@@ -161,6 +155,10 @@ forever:
 - Resolved security events use `SECURITY_EVENTS_RETENTION_HOURS` as described
   above.
 
+The authenticated metrics-history API reads only these existing bounded rows.
+It does not traverse directories or run privileged filesystem commands. See
+[Metrics History](METRICS_HISTORY.md) for its response and error contract.
+
 The app creates indexes on `metrics(timestamp)`, `ssh_logins(timestamp)`, and
 `ssh_logins(ip, timestamp)` for these retention and history queries. Deleting old
 rows does not necessarily shrink the SQLite file immediately; run `VACUUM`
@@ -196,11 +194,19 @@ publishable snapshot is available within the bounded collection window, the
 route returns `503` with error code `security_audit_unavailable` rather than a
 stale healthy result.
 
+Every projected audit check carries one bounded `metadata.result_kind` value:
+`pass`, `finding`, `recommendation`, `unverified`, or `coverage`. A non-`PASS`
+check with incomplete supporting inspection may additionally carry
+`metadata.coverage_status=["partial"]`; a `PASS` cannot be partial. The dashboard
+uses these facts to show coverage separately from findings, so a confirmed
+failure remains visible even when another check cannot be completed. Older
+response fields and the array body remain unchanged.
+
 Unknown or incomplete facts remain visible as `WARN` and mark the snapshot
-`degraded`. Cloud Push reads snapshots only; it skips a push when the snapshot
-is missing, degraded, or older than twice the audit interval, because its
-current security payload cannot express unknown values without misleading
-zero/healthy fields.
+`degraded`. Cloud Push reads snapshots only and never starts an audit. Fleet
+Observation v1 keeps the server heartbeat and reports `security.status` as
+`missing`, `stale`, or `degraded` with no score/counts when the snapshot is not
+publishable. It never substitutes zero or a healthy value for unknown state.
 
 ## Sensitive-File Integrity
 
@@ -237,6 +243,9 @@ baseline/observation generation CAS; stale requests return `409`. Logical
 baseline corruption requires a distinct confirmed re-enrollment action and a
 fresh complete observation. Neither action runs automatically after package
 updates. Structural SQLite corruption remains a restore-from-backup condition.
+When coverage is degraded but the observed subset has zero drift, the dashboard
+states both facts explicitly; it does not describe unavailable targets as
+baseline corruption or as a clean full-coverage result.
 
 `SECURITY_FILE_INTEGRITY_INTERVAL_SECS` defaults to `300` and is clamped to
 `60..86400`. Each single-flight scan is limited to `256` distinct path IDs,
@@ -329,8 +338,12 @@ state/event/outbox transaction. Manual checks have a 60-second per-target
 cooldown and do not overlap a scheduled or other manual cycle; a busy cycle is
 rejected immediately rather than holding the HTTP request. Unknown IDs,
 disabled state, cooldown, busy state, and storage failure return closed,
-redacted errors. This feature does not add Cloud Push fields, renewal
-automation, or local certificate-file discovery.
+redacted errors. When both opt-in features are enabled, Fleet Observation v1
+projects only target ID, configured TLS `server_name`, port, freshness,
+timestamps, bounded status enums, `not_after`, and a closed error code. It omits
+the target label, connect host, issuer, fingerprint, certificate bytes, SANs,
+paths, and keys. This feature does not add renewal automation or local
+certificate-file discovery.
 
 ## Listening Port Baseline
 
@@ -340,9 +353,6 @@ listeners, and it does not change firewall rules or close ports.
 
 The built-in baseline includes:
 
-- `22`
-- `80`
-- `443`
 - public/wildcard: `22`, `80`, `443`, `DEPLOY_NGINX_PORT` (`8090` by default)
 - loopback-only: `APP_PORT` (`3000` by default)
 

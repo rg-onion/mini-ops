@@ -19,11 +19,14 @@ Backend: **Rust** (Axum), Frontend: **React** (Vite, вшит в бинарны�
 - **🛡️ Аудит безопасности**:
   - **SSH Мониторинг**: Telegram уведомления при входе (PAM хук).
   - **Проверки Hardening**: Аудит конфига SSH, статуса Fail2Ban, UFW фаервола и открытых портов.
+  - **Честный posture**: Подтверждённые findings и рекомендации отделены от неполного покрытия аудита.
   - **Целостность sensitive files**: opt-in low-privilege обнаружение drift с локальным private baseline.
+  - **Мониторинг TLS-сертификатов**: opt-in проверки до 32 явно заданных обслуживаемых endpoints без поиска по filesystem и чтения private keys.
   - **Доверенные IP**: Управление белым списком для безопасного доступа.
-- **📊 Системный мониторинг**: Загрузка CPU/RAM/Disk + история метрик.
+- **📊 Системный мониторинг**: текущие CPU, RAM и ёмкость диска плюс
+  [ограниченная история метрик](docs/METRICS_HISTORY.ru.md) от часа до семи дней.
 - **🔔 Уведомления**: Telegram алерты при превышении порогов CPU и диска + изменения статуса безопасности.
-- **💾 Анализ диска**: просмотр использования диска сборками, зависимостями, Docker и journald в режиме только для чтения.
+- **☁️ Fleet Observation Push**: optional outbound-only v1 projection минимизированного system, security и certificate state в Hub оператора.
 - **🌍 Локализация**: Полная поддержка Русского и Английского языков.
 
 ---
@@ -107,7 +110,7 @@ Shipped unit оставляет код и конфигурацию root-owned, �
    ```bash
    git clone https://github.com/rg-onion/mini-ops.git
    cd mini-ops/frontend
-   npm install
+   npm ci --strict-allow-scripts
    npm run build
    ```
 
@@ -132,13 +135,16 @@ Mini-Ops разработан с учетом безопасности:
 - Используйте HTTPS reverse proxy.
 - Не открывайте порты `3000` или `8090` публично без TLS/сетевого ограничения.
 - Запускайте сервис от отдельного пользователя (non-root).
-- Держите экспериментальную web-сборку исходников выключенной, если она явно
-  не нужна (`MINI_OPS_ALLOW_WEB_UPDATE=false` по умолчанию). Она не устанавливает
-  собранный файл и не перезапускает работающий сервис.
-- Очистка диска по умолчанию выключена и недоступна в dashboard. Очистку Docker
-  нельзя включить в этой версии.
+- Выполняйте обновления через документированный host deployment workflow с
+  проверенным артефактом, backup, rollback point и проверками после изменения.
 
 Подробнее: [docs/SECURITY.ru.md](docs/SECURITY.ru.md).
+
+В репозитории реализован opt-in agent-side протокол Fleet observations, но нет
+hosted Hub или встроенного Fleet server. Текущий implementation status, privacy
+boundary и контракт receiver описаны в
+[docs/CLOUD_PUSH.ru.md](docs/CLOUD_PUSH.ru.md) и
+[docs/FLEET_INTEGRATION.ru.md](docs/FLEET_INTEGRATION.ru.md).
 
 Индекс документации: [docs/README.md](docs/README.md).
 

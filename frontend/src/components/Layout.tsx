@@ -1,9 +1,8 @@
 import { Link, useLocation } from "react-router-dom";
-import { LayoutDashboard, Box, Settings, LogOut, Terminal, History as HistoryIcon, Languages, ShieldAlert } from "lucide-react";
+import { LayoutDashboard, Box, LogOut, Terminal, Languages, ShieldAlert } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "./ui/button";
 import { useState, useEffect } from "react";
-import { DiskManager } from "./DiskManager";
 import { Toaster } from "sonner";
 import { apiFetch, clearAuthToken } from "@/api";
 import { useTranslation } from "react-i18next";
@@ -41,7 +40,6 @@ export default function Layout({ children }: LayoutProps) {
     const navItems: NavItem[] = [
         { path: "/",           icon: LayoutDashboard, label: t('common.dashboard') },
         { path: "/containers", icon: Box,              label: t('common.containers') },
-        { path: "/history",    icon: HistoryIcon,      label: t('common.history') },
         { path: "/security",   icon: ShieldAlert,      label: t('security.short_title') },
     ];
 
@@ -78,23 +76,6 @@ export default function Layout({ children }: LayoutProps) {
                         </Link>
                     ))}
 
-                    <div className="pt-4 mt-4 border-t">
-                        <div className="px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-                            {t('common.system')}
-                        </div>
-                        <DiskManager />
-                        <div
-                            aria-disabled="true"
-                            className="mt-1 flex w-full cursor-not-allowed items-center gap-3 rounded-lg px-3 py-2 text-left text-sm font-medium text-muted-foreground/70"
-                            title={t('update.unavailable_detail')}
-                        >
-                            <Settings className="h-4 w-4" />
-                            {t('update.unavailable')}
-                        </div>
-                        <p className="px-3 text-[11px] leading-4 text-muted-foreground">
-                            {t('update.unavailable_detail')}
-                        </p>
-                    </div>
                 </nav>
 
                 <div className="p-4 border-t">
@@ -143,22 +124,22 @@ export default function Layout({ children }: LayoutProps) {
                 </header>
 
                 {/* Scrollable main content */}
-                <main className="flex-1 min-h-0 overflow-y-auto pb-4 md:pb-0">
+                <main className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto pb-4 md:pb-0">
                     <div className="container py-6 px-4 md:py-8 md:px-8 max-w-7xl mx-auto">
                         {children}
                     </div>
                 </main>
 
                 {/* Mobile bottom navigation */}
-                <nav className="md:hidden shrink-0 border-t bg-background">
-                    <div className="flex h-16 gap-1 px-1 items-center">
+                <nav className="w-full max-w-full shrink-0 overflow-hidden border-t bg-background md:hidden">
+                    <div className="grid h-16 w-full min-w-0 grid-cols-3 items-center gap-1 px-1">
                         {navItems.map(({ path, icon: Icon, label }) => {
                             const active = isActive(path);
                             return (
                                 <Link
                                     key={path}
                                     to={path}
-                                    className={`flex flex-1 min-w-0 flex-col items-center justify-center gap-0.5 h-12 rounded-xl transition-all border ${
+                                    className={`flex min-w-0 flex-col items-center justify-center gap-0.5 h-12 rounded-xl transition-all border ${
                                         active
                                             ? "bg-primary text-primary-foreground border-primary shadow-sm"
                                             : "bg-muted text-muted-foreground border-border/70 border-2 hover:text-foreground"

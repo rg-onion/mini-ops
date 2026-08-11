@@ -81,6 +81,14 @@ artifact_architecture() {
 for required in ssh scp mktemp readelf awk chmod; do
     require_command "$required"
 done
+if [[ "$DEPLOY_RUN_LOCAL_BUILD" == "1" ]]; then
+    require_command node
+    require_command npm
+    require_command cargo
+    [[ -f "$PROJECT_ROOT/frontend/package-lock.json" ]] || deploy_error 'frontend/package-lock.json is required'
+    [[ -f "$PROJECT_ROOT/Cargo.lock" ]] || deploy_error 'Cargo.lock is required'
+    deploy_validate_local_build_toolchain "$(node --version)" "$(npm --version)"
+fi
 
 if [[ -n "$SSH_KEY_PATH" ]]; then
     if [[ ! -f "$SSH_KEY_PATH" || -L "$SSH_KEY_PATH" ]]; then
@@ -542,11 +550,7 @@ remote_arch="$(normalize_architecture "$remote_arch")"
 
 printf '%s\n' '[2/8] Locked local build and architecture proof'
 if [[ "$DEPLOY_RUN_LOCAL_BUILD" == "1" ]]; then
-    require_command npm
-    require_command cargo
-    [[ -f "$PROJECT_ROOT/frontend/package-lock.json" ]] || deploy_error 'frontend/package-lock.json is required'
-    [[ -f "$PROJECT_ROOT/Cargo.lock" ]] || deploy_error 'Cargo.lock is required'
-    npm --prefix "$PROJECT_ROOT/frontend" ci
+    npm --prefix "$PROJECT_ROOT/frontend" ci --strict-allow-scripts
     npm --prefix "$PROJECT_ROOT/frontend" run build
     cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked
 fi

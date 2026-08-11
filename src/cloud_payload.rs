@@ -1,89 +1,95 @@
-use chrono::{DateTime, Utc};
+use crate::certificate_probe::{
+    CertificateProbeErrorCode, ExpiryStatus, HostnameStatus, ReachabilityStatus, TrustStatus,
+};
 use serde::Serialize;
+use uuid::Uuid;
 
-#[derive(Serialize)]
-pub struct SystemMetrics {
-    pub cpu_usage_percent: f32,
-    pub memory_total_mb: u64,
-    pub memory_used_mb: u64,
-    pub memory_usage_percent: f32,
-    pub disk_total_gb: f64,
-    pub disk_used_gb: f64,
-    pub disk_usage_percent: f32,
-    pub load_average_1m: f32,
-    pub load_average_5m: f32,
-    pub load_average_15m: f32,
-    pub uptime_seconds: u64,
-    pub os_name: String,
-    pub kernel_version: String,
+pub(crate) const FLEET_OBSERVATION_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FleetObservation {
+    pub(crate) schema_version: u64,
+    pub(crate) observation_id: Uuid,
+    pub(crate) observed_at: i64,
+    pub(crate) agent_version: &'static str,
+    pub(crate) system: SystemMetrics,
+    pub(crate) security: SecurityMetrics,
+    pub(crate) certificates: CertificateMetrics,
 }
 
-#[derive(Serialize)]
-pub struct ContainerMetrics {
-    pub id: String,
-    pub name: String,
-    pub image: String,
-    pub state: String,
-    pub status: String,
-    pub cpu_percent: f32,
-    pub memory_mb: u64,
+#[derive(Debug, Serialize)]
+pub(crate) struct SystemMetrics {
+    pub(crate) collected_at: i64,
+    pub(crate) cpu_usage_percent: Option<f32>,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) memory_used_bytes: u64,
+    pub(crate) disk_total_bytes: u64,
+    pub(crate) disk_used_bytes: u64,
+    pub(crate) load_average_1m: Option<f32>,
+    pub(crate) load_average_5m: Option<f32>,
+    pub(crate) load_average_15m: Option<f32>,
+    pub(crate) uptime_seconds: u64,
 }
 
-#[derive(Serialize)]
-pub struct DockerMetrics {
-    pub containers: Vec<ContainerMetrics>,
-    pub total_running: u32,
-    pub total_stopped: u32,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SecurityMetricsStatus {
+    Available,
+    Missing,
+    Stale,
+    Degraded,
 }
 
-#[derive(Serialize)]
-pub struct SshLoginInfo {
-    pub user: String,
-    pub ip: String,
-    pub timestamp: DateTime<Utc>,
-    pub is_trusted: bool,
+#[derive(Debug, Serialize)]
+pub(crate) struct SecurityFindingCounts {
+    pub(crate) pass: u32,
+    pub(crate) warn: u32,
+    pub(crate) fail: u32,
 }
 
-#[derive(Serialize)]
-pub struct SecurityMetrics {
-    pub ssh_hardening_score: u32,
-    pub fail2ban_active: bool,
-    pub ufw_enabled: bool,
-    pub open_ports: Vec<u16>,
-    /// Last SSH login event: username + source IP + timestamp.
-    /// Sent to a Hub-compatible endpoint so operators can show login activity
-    /// across multiple servers in one place. Never collected unless
-    /// CLOUD_PUSH_ENABLED=true is explicitly set by the operator.
-    pub last_ssh_login: Option<SshLoginInfo>,
-    /// IPs the operator marked as trusted in the local panel.
-    /// Sent so the Hub can correlate alerts correctly (e.g. suppress
-    /// false-positive alerts for known admin IPs). Same opt-in guarantee
-    /// as last_ssh_login above.
-    pub trusted_ips: Vec<String>,
+#[derive(Debug, Serialize)]
+pub(crate) struct SecurityMetrics {
+    pub(crate) status: SecurityMetricsStatus,
+    pub(crate) collected_at: Option<i64>,
+    pub(crate) score: Option<u32>,
+    pub(crate) findings: Option<SecurityFindingCounts>,
 }
 
-#[derive(Serialize)]
-pub struct AlertMetric {
-    pub alert_type: String,
-    pub severity: String,
-    pub message: String,
-    pub since: DateTime<Utc>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CertificateMetricsStatus {
+    Disabled,
+    Enabled,
+    Unavailable,
 }
 
-#[derive(Serialize)]
-pub struct AlertsMetrics {
-    pub active: Vec<AlertMetric>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CertificateObservationFreshness {
+    Pending,
+    Fresh,
+    Stale,
 }
 
-#[derive(Serialize)]
-pub struct CloudPayload {
-    pub agent_id: String,
-    pub agent_version: String,
-    pub server_name: String,
-    pub hostname: String,
-    pub timestamp: DateTime<Utc>,
-    pub system: SystemMetrics,
-    pub docker: DockerMetrics,
-    pub security: SecurityMetrics,
-    pub alerts: AlertsMetrics,
+#[derive(Debug, Serialize)]
+pub(crate) struct CertificateTargetMetrics {
+    pub(crate) target_id: String,
+    pub(crate) server_name: String,
+    pub(crate) port: u16,
+    pub(crate) freshness: CertificateObservationFreshness,
+    pub(crate) checked_at: Option<i64>,
+    pub(crate) last_success_at: Option<i64>,
+    pub(crate) reachability: Option<ReachabilityStatus>,
+    pub(crate) trust: Option<TrustStatus>,
+    pub(crate) hostname: Option<HostnameStatus>,
+    pub(crate) expiry: Option<ExpiryStatus>,
+    pub(crate) not_after: Option<i64>,
+    pub(crate) error_code: Option<CertificateProbeErrorCode>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CertificateMetrics {
+    pub(crate) status: CertificateMetricsStatus,
+    pub(crate) interval_seconds: Option<u64>,
+    pub(crate) targets: Vec<CertificateTargetMetrics>,
 }

@@ -232,7 +232,7 @@ function CertificateTargetRow({
 
     return (
         <TableRow>
-            <TableCell className="min-w-[190px] align-top">
+            <TableCell className="min-w-[190px] align-top lg:min-w-[230px]">
                 <div className="font-medium">{target.label}</div>
                 <div className="mt-1 font-mono text-xs text-muted-foreground">{tlsEndpoint}</div>
                 {target.connect_host !== target.server_name && (
@@ -403,7 +403,9 @@ export function CertificateMonitoringCard() {
                             <Table>
                                 <TableHeader>
                                     <TableRow>
-                                        <TableHead>{t("security.certificates.target")}</TableHead>
+                                        <TableHead className="min-w-[190px] lg:min-w-[230px]">
+                                            {t("security.certificates.target")}
+                                        </TableHead>
                                         <TableHead>{t("security.certificates.expiry_title")}</TableHead>
                                         <TableHead>{t("security.certificates.identity")}</TableHead>
                                         <TableHead>{t("security.certificates.last_check")}</TableHead>

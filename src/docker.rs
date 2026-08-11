@@ -16,6 +16,7 @@ const MAX_DOCKER_SECURITY_OPTIONS: usize = 64;
 const MAX_DOCKER_DAEMON_SECURITY_OPTIONS: usize = 64;
 const MAX_DOCKER_SYSTEM_PATHS: usize = 64;
 const MAX_DOCKER_SECURITY_RISKS: usize = 128;
+pub(crate) const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ContainerInfo {
@@ -44,6 +45,7 @@ pub struct DockerSecurityRisk {
 pub struct DockerSecurityAuditOutcome {
     pub risks: Vec<DockerSecurityRisk>,
     pub incomplete_reasons: Vec<DockerSecurityIncompleteReason>,
+    pub daemon_api_access_confirmed: bool,
 }
 
 impl DockerSecurityAuditOutcome {
@@ -56,6 +58,7 @@ impl DockerSecurityAuditOutcome {
     fn merge(&mut self, mut other: Self) {
         self.risks.append(&mut other.risks);
         self.enforce_risk_limit();
+        self.daemon_api_access_confirmed |= other.daemon_api_access_confirmed;
         for reason in other.incomplete_reasons {
             self.mark_incomplete(reason);
         }
@@ -967,6 +970,9 @@ impl DockerService {
                     return outcome;
                 }
             };
+        // A successful bounded list call proves that this process can reach
+        // the configured daemon API. Client construction alone does not.
+        outcome.daemon_api_access_confirmed = true;
         if invalid_identity {
             outcome.mark_incomplete(DockerSecurityIncompleteReason::InvalidContainerIdentity);
         }
@@ -2155,9 +2161,11 @@ mod tests {
                 evidence: "container=later privileged=true".to_string(),
             }],
             incomplete_reasons: Vec::new(),
+            daemon_api_access_confirmed: true,
         });
 
         assert_eq!(outcome.risks.len(), MAX_DOCKER_SECURITY_RISKS);
+        assert!(outcome.daemon_api_access_confirmed);
         assert!(outcome.risks.iter().any(|risk| risk.severity == "critical"));
         assert_incomplete(&outcome, DockerSecurityIncompleteReason::RiskLimitExceeded);
     }

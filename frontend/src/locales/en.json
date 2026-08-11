@@ -2,20 +2,14 @@
     "common": {
         "dashboard": "Dashboard",
         "containers": "Containers",
-        "history": "History",
-        "system": "System",
-        "update_agent": "Experimental Source Build",
         "logout": "Logout",
         "version": "Version",
         "loading": "Loading...",
         "error": "Error",
-        "confirm_update": "Start an experimental source build? Installation and restart remain manual.",
         "cpu": "CPU",
         "ram": "RAM",
         "disk": "Disk",
         "real_time_load": "Real-time load",
-        "cpu_history": "CPU History (%)",
-        "ram_history": "RAM History (%)",
         "security_audit": "Security Audit",
         "refresh": "Refresh",
         "retry": "Retry",
@@ -33,9 +27,33 @@
     "dashboard": {
         "current_error": "Current system metrics could not be loaded. Values are unavailable until a successful response.",
         "current_unavailable": "Current metrics unavailable",
+        "disk_usage": "{{used}} used / {{total}} total · {{free}} free",
+        "history_title": "Resource history",
+        "history_range": "Metrics history range",
+        "history_refreshing": "Refreshing history...",
         "history_loading": "Loading metrics history...",
         "history_error": "Metrics history could not be loaded.",
-        "history_empty": "No metrics history recorded yet."
+        "history_empty": "No metrics history recorded for this range yet.",
+        "history_partial": "Only retained history since {{time}} is available for this range.",
+        "history_meta": "{{count}} chart points · {{resolution}}",
+        "history_average": "Average",
+        "history_peak": "Peak",
+        "history_metric_empty": "No usable values were recorded for this metric.",
+        "history_chart_summary": "{{title}}: {{count}} chart points. Latest average {{average}}%, latest peak {{peak}}%.",
+        "cpu_history": "CPU history",
+        "ram_history": "RAM history",
+        "disk_history": "Disk history",
+        "history_windows": {
+            "1h": "1h",
+            "6h": "6h",
+            "24h": "24h",
+            "7d": "7d"
+        },
+        "history_resolutions": {
+            "raw": "raw samples",
+            "5m": "5-minute buckets",
+            "1h": "1-hour buckets"
+        }
     },
     "login": {
         "title": "Mini-Ops Login",
@@ -105,38 +123,6 @@
             "btn_all": "All"
         }
     },
-    "history": {
-        "title": "Deployment History",
-        "timeline": "Timeline",
-        "date": "Date",
-        "action": "Action",
-        "target": "Target",
-        "status": "Status",
-        "rollback": "Rollback",
-        "no_history": "No history recorded yet.",
-        "loading": "Loading history...",
-        "load_error": "Deployment history could not be loaded.",
-        "rollback_wip": "Rollback logic WIP",
-        "rollback_unavailable": "Rollback unavailable",
-        "rollback_unavailable_detail": "Rollback is not available in this release."
-    },
-    "disk": {
-        "trigger": "Disk Analyzer",
-        "title": "Disk Space Analyzer",
-        "rust_build": "Rust Build (target)",
-        "frontend_cache": "Frontend Cache",
-        "docker_system": "Docker System",
-        "system_logs": "System Logs",
-        "clean": "Clean",
-        "prune": "Prune",
-        "vacuum": "Vacuum",
-        "note": "Usage analysis is read-only. Cleanup actions are not exposed in the dashboard.",
-        "confirm_clean": "Are you sure you want to clean {{target}}?",
-        "prune_desc": "Docker data usage",
-        "analysis_only": "Read-only usage information",
-        "cleanup_unavailable": "Cleanup actions are disabled and are not exposed in the dashboard.",
-        "docker_unavailable": "Docker cleanup is unavailable in this release."
-    },
     "security": {
         "title": "Security Audit",
         "short_title": "Audit",
@@ -144,7 +130,7 @@
         "test_sending": "Sending...",
         "status": "Status",
         "check": "Check",
-        "risk": "Risk",
+        "risk": "Result / risk",
         "message": "Message",
         "events_title": "Security Events",
         "event": "Event",
@@ -156,6 +142,7 @@
         "event_ack_success": "Security event acknowledged",
         "event_ack_error": "Failed to acknowledge event",
         "ack_pending": "Acknowledging...",
+        "event_lifecycle": "Lifecycle: {{status}}",
         "event_status": {
             "open": "Open",
             "acknowledged": "Acknowledged",
@@ -163,18 +150,90 @@
         },
         "audit_loading": "Loading the security audit...",
         "audit_load_error": "The security audit could not be loaded. No security result is available.",
-        "audit_degraded_detail": "The audit is degraded: at least one check could not establish a trustworthy result.",
-        "audit_unknown_detail": "The audit collection state is unknown. Do not treat the displayed checks as a complete healthy audit.",
         "audit_no_data": "No trustworthy audit checks were returned.",
-        "audit_state": {
-            "healthy": "Healthy",
-            "findings": "Findings",
-            "degraded": "Degraded",
-            "unknown": "Unknown"
+        "check_status": {
+            "PASS": "Verified",
+            "FAIL": "Failed",
+            "WARN": "Needs attention"
+        },
+        "severity": {
+            "critical": "Critical",
+            "high": "High",
+            "medium": "Medium",
+            "low": "Low",
+            "info": "Info"
+        },
+        "category": {
+            "ssh": "SSH",
+            "firewall": "Firewall",
+            "docker": "Docker",
+            "system": "System",
+            "intrusion": "Intrusion protection",
+            "network": "Network",
+            "runtime": "Agent privileges"
+        },
+        "result_kind": {
+            "pass": "Verified",
+            "finding": "Confirmed risk",
+            "recommendation": "Recommendation",
+            "unverified": "Not verified",
+            "coverage": "Coverage limit"
+        },
+        "audit_checks": {
+            "ssh_root_login": "SSH root login",
+            "ssh_password_auth": "SSH password authentication",
+            "firewall_ufw": "Firewall (UFW)",
+            "docker_socket_permissions": "Docker socket permissions",
+            "system_disk_encryption": "System disk encryption",
+            "intrusion_fail2ban": "Fail2Ban",
+            "network_listening_ports": "Listening ports",
+            "docker_tcp_api": "Docker TCP API",
+            "docker_container_hardening": "Docker container hardening",
+            "runtime_docker_control_access": "Agent Docker control access"
+        },
+        "audit_summary": {
+            "coverage": "Coverage",
+            "result": "Result",
+            "coverage_state": {
+                "full": "Full",
+                "partial": "Partial",
+                "unknown": "Unknown"
+            },
+            "coverage_detail": {
+                "full": "All returned checks produced a trustworthy result.",
+                "partial": "One or more checks could not be verified with the agent's current access. Not verified: {{count}}.",
+                "partial_unknown_count": "At least one check could not be verified with the agent's current access.",
+                "unknown": "Collection completeness could not be established. Do not assume a complete healthy audit."
+            },
+            "result_state": {
+                "no_findings": "No confirmed risks",
+                "recommendations": "Recommendations",
+                "confirmed_risks": "Confirmed risks",
+                "unknown": "Unknown"
+            },
+            "result_detail": {
+                "no_findings": "No confirmed risks or hardening recommendations were found among the verified checks.",
+                "recommendations": "Verified hardening recommendations: {{count}}.",
+                "confirmed_risks": "Confirmed risk checks requiring review: {{count}}.",
+                "unknown": "No concrete check result is available in this snapshot."
+            },
+            "passed": "Verified checks",
+            "confirmed_risks": "Confirmed risks",
+            "recommendations": "Recommendations",
+            "unverified": "Not verified"
+        },
+        "audit_event_message": {
+            "pass": "The check is verified and currently has no finding.",
+            "finding": "The check confirmed a security risk that requires review.",
+            "recommendation": "The observed posture has a hardening recommendation.",
+            "unverified": "The agent could not verify this check with its current access.",
+            "coverage": "Audit coverage could not be established for this check.",
+            "docker_container_hardening": "Risky container settings found: {{count}}.",
+            "partial_coverage": "Coverage is partial; some targets could not be inspected."
         },
         "evidence": {
             "unavailable": "Typed evidence unavailable",
-            "audit": "Check {{checkId}} · {{status}}",
+            "audit": "Check {{check}} · {{status}}",
             "ssh": "Source {{ip}} · {{method}}",
             "notification": "Notification backpressure · live {{liveLimit}} · terminal {{terminalLimit}}",
             "file": "File {{path}} · {{changes}}",
@@ -191,11 +250,11 @@
             }
         },
         "certificates": {
-            "title": "TLS certificates",
-            "description": "Current state of explicitly configured direct-TLS endpoints. Checks do not send HTTP requests or read private keys.",
-            "loading": "Loading certificate monitoring state...",
-            "load_error": "Certificate monitoring state could not be loaded. No healthy result is assumed.",
-            "disabled": "Certificate monitoring is opt-in. Configure a root-owned targets file and set SECURITY_CERTIFICATE_MONITOR_ENABLED=true to enable it.",
+            "title": "TLS endpoints",
+            "description": "Current state of explicitly configured direct-TLS endpoints. Each endpoint is checked separately, even when several endpoints serve the same certificate. Checks do not send HTTP requests or read private keys.",
+            "loading": "Loading TLS endpoint monitoring state...",
+            "load_error": "TLS endpoint monitoring state could not be loaded. No healthy result is assumed.",
+            "disabled": "TLS endpoint monitoring is opt-in. Configure a root-owned targets file and set SECURITY_CERTIFICATE_MONITOR_ENABLED=true to enable it.",
             "unavailable": "Unavailable",
             "awaiting": "Awaiting first check",
             "not_checked": "Not checked yet",
@@ -204,23 +263,23 @@
                 "enabled": "Enabled"
             },
             "earliest_expiry": "Earliest expiry",
-            "targets": "Configured targets",
+            "targets": "Configured TLS endpoints",
             "interval": "Scheduled checks",
             "interval_hours": "Every {{count}} h",
             "interval_minutes": "Every {{count}} min",
             "interval_hours_minutes": "Every {{hours}} h {{minutes}} min",
             "cooldown": "Manual refresh cooldown: {{seconds}} s",
-            "target": "Target",
+            "target": "TLS endpoint",
             "expiry_title": "Expiry",
             "identity": "Hostname / trust",
             "last_check": "Last check",
-            "last_success": "Last certificate: {{timestamp}}",
+            "last_success": "Certificate last retrieved: {{timestamp}}",
             "remediation_title": "Remediation",
             "actions": "Actions",
             "connect_via": "Connect via {{endpoint}}",
-            "refresh": "Refresh",
-            "refresh_target": "Refresh certificate state for {{label}}",
-            "refresh_success": "Certificate state refreshed for {{label}}.",
+            "refresh": "Check",
+            "refresh_target": "Check TLS endpoint {{label}}",
+            "refresh_success": "TLS endpoint {{label}} checked.",
             "remaining_days": "{{count}} d",
             "remaining_hours": "{{count}} h",
             "remaining_less_hour": "less than 1 h",
@@ -270,13 +329,13 @@
                 "internal_error": "Internal check error"
             },
             "refresh_error": {
-                "invalid_request": "The refresh request was rejected. No target was changed.",
-                "certificate_monitor_disabled": "Certificate monitoring is disabled.",
-                "certificate_target_not_found": "The configured target no longer exists. Reload the current state.",
-                "certificate_refresh_busy": "A scheduled or manual certificate check is already running. Retry shortly.",
-                "certificate_refresh_cooldown": "This target was just checked. Retry in {{seconds}} seconds.",
-                "certificate_monitor_unavailable": "The refresh could not be completed safely. The stored state may be unchanged.",
-                "invalid_response": "The refresh result could not be verified. Reload the current state before retrying."
+                "invalid_request": "The check request was rejected. No TLS endpoint check was started.",
+                "certificate_monitor_disabled": "TLS endpoint monitoring is disabled.",
+                "certificate_target_not_found": "The configured TLS endpoint no longer exists. Reload the current state.",
+                "certificate_refresh_busy": "A scheduled or manual TLS endpoint check is already running. Retry shortly.",
+                "certificate_refresh_cooldown": "This TLS endpoint was just checked. Retry in {{seconds}} seconds.",
+                "certificate_monitor_unavailable": "The TLS endpoint check could not be completed safely. The stored state may be unchanged.",
+                "invalid_response": "The TLS endpoint check result could not be verified. Reload the current state before retrying."
             }
         },
         "file_integrity": {
@@ -297,14 +356,16 @@
                 "initializing": "Initializing",
                 "healthy": "Healthy",
                 "drift": "Drift detected",
-                "degraded": "Degraded"
+                "degraded": "Degraded",
+                "partial": "Partial coverage"
             },
             "detail": {
                 "disabled": "Polling is opt-in. Set SECURITY_FILE_INTEGRITY_ENABLED=true to enable it.",
                 "initializing": "The collector is waiting for its first bounded scan.",
                 "healthy": "The current observation matches the trusted baseline with full coverage.",
                 "drift": "One or more tracked paths differ from the trusted baseline.",
-                "degraded": "Coverage or baseline integrity could not be established safely. This is not a healthy result."
+                "degraded": "Coverage or baseline integrity could not be established safely. This is not a healthy result.",
+                "partial_no_drift": "No drift was detected among observable paths. Unavailable targets: {{unavailable}}. No integrity result is claimed for those targets."
             },
             "reason": {
                 "coverage_unavailable": "Some configured targets could not be observed safely.",
@@ -379,16 +440,6 @@
         "success_delete": "Snapshot deleted",
         "error_delete": "Failed to delete snapshot",
         "no_snapshots": "No snapshots found. Create one before updating!"
-    },
-    "update": {
-        "title": "Experimental Source Build",
-        "success_trigger": "Source build triggered. Connecting to the log stream...",
-        "success_complete": "Source build complete. Install the built artifact and restart the service manually to apply it.",
-        "ws_connected": "Log stream connected.",
-        "ws_closed": "Connection closed.",
-        "ws_error": "Log stream error.",
-        "unavailable": "Agent update unavailable",
-        "unavailable_detail": "The current experimental endpoint only builds source; it does not install, restart, health-check, or roll back the running agent."
     },
     "ssh": {
         "title": "SSH Security",

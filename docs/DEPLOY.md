@@ -38,6 +38,10 @@ binds the app to `127.0.0.1:3000`, and performs paired backup/rollback plus
 service, API, SQLite path, owner, and mode proofs. It does not install Docker or
 Nginx, expose HTTP, change UFW, add the Docker group, or write PAM.
 
+Local-build mode requires Node.js `24.17.x` and npm `12.0.x`; the bootstrap
+rejects other versions before dependency installation. Frontend dependencies
+are installed with npm's strict install-script allowlist policy.
+
 For an existing managed installation, the default preserves and normalizes its
 existing root-owned `.env`:
 
@@ -93,7 +97,7 @@ unexpected listeners.
 ## Build locally
 
 ```bash
-npm --prefix frontend ci
+npm --prefix frontend ci --strict-allow-scripts
 npm --prefix frontend run build
 cargo build --release --locked
 ```
@@ -136,8 +140,6 @@ APP_HOST=127.0.0.1
 APP_PORT=3000
 DATABASE_URL=sqlite:///var/lib/mini-ops/mini-ops.db
 MINI_OPS_INTERNAL_TOKEN_FILE=/run/mini-ops/internal.token
-MINI_OPS_ALLOW_WEB_UPDATE=false
-MINI_OPS_ALLOW_DISK_CLEANUP=false
 ```
 
 Generate `AUTH_TOKEN` with `openssl rand -hex 32`. Managed startup fails if the
@@ -191,3 +193,9 @@ Existing installations that keep mutable state under `/opt/mini-ops` must not
 replace only the binary or unit with this layout. Preserve the current service
 and state until you can perform a stopped-service migration with a verified
 backup and rollback point.
+
+Managed upgrades continue to preserve an existing `history.json` as inert
+legacy state. The running agent neither parses nor appends to this file;
+bootstrap only preserves, snapshots, and restores it for rollback. An
+administrator may archive or remove it separately after the deployment rollback
+window; the bootstrap does not delete it automatically.

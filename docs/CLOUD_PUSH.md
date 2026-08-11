@@ -1,127 +1,119 @@
-# Cloud Push - Transparency Document
+# Fleet Observation Push
 
-**Feature status:** Optional, opt-in client. Disabled by default.
-**Data destination:** The HTTPS endpoint configured in `CLOUD_HUB_URL`.
+**Status:** optional agent-side protocol preview; disabled by default.
 
-Mini-Ops does not send Cloud Push traffic unless the operator explicitly enables
-it and provides a destination URL, agent id, and agent token.
+**Destination:** only the operator-controlled origin in `CLOUD_HUB_URL`.
 
----
+**Hub included here:** no.
 
-## What is Cloud Push?
+Mini-Ops can periodically send a minimized, read-only observation to a Fleet
+Hub. The standalone dashboard, local monitoring, certificate alerts, and
+security checks do not depend on this feature.
 
-Cloud Push is an optional background task that periodically sends server metrics
-from a Mini-Ops agent to the configured API endpoint:
+The current source implements Observation schema v1. It replaces the older
+unversioned Cloud Push payload and route that exposed container names/images,
+SSH login identities/IPs, trusted IPs, listening ports, OS/kernel strings, and
+a body-provided agent ID. Those fields are intentionally not part of v1.
 
-```text
-{CLOUD_HUB_URL}/api/v1/agents/push
-```
-
-The module is compiled into the open-source binary, but it is completely dormant
-by default.
-
----
+> [!IMPORTANT]
+> Mini-Ops v1.1.0 did not ship Observation v1. Until a later release containing
+> this code is published, a source build is required for integration testing.
+> No end-to-end Hub deployment is proven by this repository yet.
 
 ## Activation
 
-Cloud Push activates only when all four settings are present in `.env`:
+Cloud Push starts only when the exact opt-in and both required values are set:
 
 ```env
 CLOUD_PUSH_ENABLED=true
-CLOUD_HUB_URL=https://your-hub.example.com
-CLOUD_AGENT_ID=your_agent_id_here
-CLOUD_AGENT_TOKEN=your_agent_token_here
-# Optional: unset defaults to 60; explicit values must be 60..86400.
-CLOUD_PUSH_INTERVAL=60
+CLOUD_HUB_URL=https://fleet.example.com
+CLOUD_AGENT_TOKEN=replace_with_a_show_once_agent_token
+# Optional: default 300; strict range 60..86400 seconds.
+CLOUD_PUSH_INTERVAL=300
 ```
 
-If `CLOUD_PUSH_ENABLED` is absent, empty, or set to anything other than the exact
-string `"true"`, no HTTP client is created, no background task is spawned, and no
-data leaves the server.
+`CLOUD_HUB_URL` must be an HTTPS origin: scheme, host, and optional port only;
+credentials, paths, queries, and fragments are rejected. Mini-Ops appends:
 
----
-
-## What data is sent?
-
-Each push is a JSON payload containing:
-
-| Field | Contents | Why |
-|-------|----------|-----|
-| `system` | CPU %, RAM, disk usage, load average, OS/kernel version, uptime | Core server health metrics |
-| `docker` | Container names, images, running/stopped state | Container fleet overview |
-| `security.ssh_hardening_score` | Severity-aware local security score, 0-100 | Security posture summary |
-| `security.fail2ban_active` | bool | `systemctl is-active fail2ban` result summarized as a boolean |
-| `security.ufw_enabled` | bool | Firewall status |
-| `security.open_ports` | List of local listening TCP ports detected by the security audit | Exposure overview |
-| `security.last_ssh_login` | Username + source IP + timestamp + `is_trusted` flag | Login activity across servers |
-| `security.trusted_ips` | List of IPs the operator marked as trusted | Needed to suppress false-positive alerts on the Hub |
-| `agent_id`, `agent_version`, `server_name`, `hostname` | Server identity | Route data to the correct server on the Hub |
-
-### Sensitive fields note
-
-`last_ssh_login.ip`, `trusted_ips`, `hostname`, `server_name`, and `open_ports`
-can reveal operational details about your infrastructure. Only point
-`CLOUD_HUB_URL` at an endpoint you control or fully trust.
-
----
-
-## Transport security
-
-- HTTPS is required by default. Attempts to use a plain `http://` URL fail at
-  startup with an error logged to the console.
-- For local development/testing only, you can override this:
-  ```env
-  CLOUD_PUSH_ALLOW_HTTP=true   # never set in production
-  ```
-  A `WARN` log is emitted every time this override is active.
-
----
-
-## Authentication
-
-Each push includes a bearer token in the `Authorization` header:
-
-```http
-Authorization: Bearer <CLOUD_AGENT_TOKEN>
+```text
+/api/v1/agent-observations
 ```
 
-The token is never embedded in the URL or the JSON body.
+`CLOUD_PUSH_ALLOW_HTTP=true` works only with `localhost` or a loopback IP for
+local development. It cannot enable plaintext delivery to another VPS.
 
----
+If `CLOUD_PUSH_ENABLED` is absent, empty, or not exactly `true`, no Fleet HTTP
+client or push task is created. Invalid explicit configuration disables the
+push task and emits only a closed configuration error code.
 
-## How to verify nothing is sent without opt-in
+## Data sent by Observation v1
 
-Search the source:
+| Section | Sent | Purpose |
+|---|---|---|
+| Envelope | schema version, random observation UUID, observation time, Mini-Ops version | Contract selection and idempotency |
+| `system` | collection time, CPU, RAM and disk byte counters, load averages, uptime | Server health overview |
+| `security` | availability state; only for a fresh complete snapshot: score and PASS/WARN/FAIL counts | Bounded security posture summary |
+| `certificates` | collector state, interval, and up to 32 configured TLS target summaries | Fleet-wide served-certificate expiry and failure visibility |
 
-```bash
-grep -n "CLOUD_PUSH_ENABLED" src/main.rs
-```
+For each configured certificate target, v1 may send its stable target ID,
+configured TLS `server_name`, port, freshness, check/success timestamps,
+reachability, trust, hostname, expiry, `not_after`, and a closed probe error
+code. Certificate data is present only when the separate direct-TLS monitor is
+enabled. See [SECURITY.md](SECURITY.md#tls-certificate-monitoring).
 
-The push loop starts only inside that guard. If the condition is false, the
-module stays inert.
+## Data intentionally not sent
 
----
+Observation v1 does not send:
 
-## Opting out completely
+- the local dashboard token or Fleet agent token;
+- an agent/server/workspace ID in the body;
+- SSH usernames, source IPs, trusted IPs, or SSH history;
+- container IDs, names, images, status strings, logs, or environment;
+- listening-port lists, OS name, kernel version, or local hostname;
+- certificate target labels or connect hosts;
+- certificate bytes/chains, SAN lists, subjects, issuers, serials,
+  fingerprints, filesystem paths, private keys, PFX, or secrets;
+- local security evidence, remediation text, event history, or Telegram data;
+- file-integrity paths, hashes, observations, or baselines.
 
-Do not set `CLOUD_PUSH_ENABLED=true`. You can also remove or comment out all
-`CLOUD_*` lines from your `.env`; the application will not reference them.
+The configured certificate `server_name` can still reveal infrastructure
+metadata. Enable Fleet Push only for a Hub you control or fully trust.
 
----
+## Unknown and stale state
 
-## Current Behavior
+Unknown data is explicit:
 
-- Cloud Push is compiled in but inactive unless `CLOUD_PUSH_ENABLED=true`.
-- If any required Cloud Push setting is missing, the push loop does not start.
-- An unset `CLOUD_PUSH_INTERVAL` defaults to `60` seconds. A blank, invalid, or
-  out-of-range explicit value disables the push loop instead of being clamped.
-- The first request is delayed by one validated interval after startup.
-- Security fields come from the latest shared local audit snapshot; Cloud Push
-  never starts security probes itself. The whole push is skipped when that
-  snapshot is missing, degraded, or older than twice the configured local audit
-  interval, because the current payload cannot represent unknown security
-  values safely.
-- No data is sent to any Mini-Ops-operated service by default.
-- Payloads are sent only to the configured `CLOUD_HUB_URL`.
-- HTTPS is required by default; `CLOUD_PUSH_ALLOW_HTTP=true` is only for local
-  testing.
+- security is `missing`, `stale`, or `degraded` without a score/counts;
+- certificates are `disabled`, `unavailable`, or `enabled`;
+- a target is `pending` before its first observation and `stale` after more
+  than twice the configured certificate interval;
+- a failed target keeps bounded status/error fields and never becomes healthy
+  by defaulting missing values to zero.
+
+A missing/degraded security snapshot no longer suppresses the system and
+certificate heartbeat.
+
+## Transport behavior
+
+- HTTPS is required except for the loopback-only development override.
+- Fleet delivery is direct and does not inherit process proxy settings.
+- Authentication is `Authorization: Bearer <CLOUD_AGENT_TOKEN>`.
+- The body contains no trusted agent identity. The Hub must bind the token to
+  exactly one agent/server record.
+- `Idempotency-Key` equals the body `observation_id` UUID.
+- Serialized request bodies are capped at 64 KiB.
+- The HTTP request timeout is 10 seconds.
+- The first request is delayed by one configured interval. Missed timer ticks
+  are skipped; a failed delivery is tried again with a new observation on the
+  next interval, not in an unbounded retry loop.
+- Any HTTP `2xx` is success. Authentication, rate-limit, contract, transport,
+  and Hub failures are logged as closed codes; response bodies and raw
+  transport errors are not logged.
+
+The exact receiver rules, JSON example, ordering requirements, and test
+checklist are in [FLEET_INTEGRATION.md](FLEET_INTEGRATION.md).
+
+## Opting out
+
+Leave `CLOUD_PUSH_ENABLED=false` or remove all `CLOUD_*` variables. Mini-Ops
+remains a complete standalone agent and sends no Fleet observations.

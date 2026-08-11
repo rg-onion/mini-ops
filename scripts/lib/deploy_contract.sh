@@ -22,6 +22,20 @@ deploy_validate_boolean() {
     esac
 }
 
+deploy_validate_local_build_toolchain() {
+    local node_version="$1"
+    local npm_version="$2"
+
+    if [[ ! "$node_version" =~ ^v24\.17\.[0-9]+$ ]]; then
+        deploy_error "local Node.js must match v24.17.x for a managed source build"
+        return 1
+    fi
+    if [[ ! "$npm_version" =~ ^12\.0\.[0-9]+$ ]]; then
+        deploy_error "local npm must match 12.0.x for a managed source build"
+        return 1
+    fi
+}
+
 deploy_validate_port() {
     local name="$1"
     local value="$2"
@@ -338,7 +352,7 @@ deploy_print_plan() {
         env_plan="replace-from-redacted-local-input"
     fi
     if [[ "$DEPLOY_RUN_LOCAL_BUILD" == "1" ]]; then
-        build_plan="frontend:npm-ci backend:cargo-release-locked architecture=artifact-vs-remote"
+        build_plan="frontend:npm-ci-strict(node=24.17.x,npm=12.0.x) backend:cargo-release-locked architecture=artifact-vs-remote"
     fi
 
     printf '%s\n' 'Mini-Ops managed bootstrap dry-run'
