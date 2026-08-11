@@ -51,7 +51,7 @@ jobs:
           grep -Fxq 'publish = false' Cargo.toml
 
       - name: Install frontend dependencies
-        run: npm --prefix frontend ci
+        run: npm --prefix frontend ci --strict-allow-scripts
 
       - name: Audit complete frontend dependency graph
         run: npm --prefix frontend audit --audit-level=moderate

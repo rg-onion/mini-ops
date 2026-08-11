@@ -69,7 +69,7 @@ jobs:
 
       - name: Install and audit frontend dependencies
         run: |
-          npm --prefix frontend ci
+          npm --prefix frontend ci --strict-allow-scripts
           npm --prefix frontend audit --audit-level=moderate
 
       - name: Build frontend
