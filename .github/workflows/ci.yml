@@ -47,6 +47,8 @@ jobs:
           rust_version="$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
           frontend_version="$(node -p "require('./frontend/package.json').version")"
           test "$rust_version" = "$frontend_version"
+          test "$(node -p "require('./frontend/package-lock.json').version")" = "$frontend_version"
+          test "$(node -p "require('./frontend/package-lock.json').packages[''].version")" = "$frontend_version"
           test "$(node -p "require('./frontend/package.json').private")" = "true"
           grep -Fxq 'publish = false' Cargo.toml
 

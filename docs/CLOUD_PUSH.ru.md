@@ -16,9 +16,9 @@ names/images, SSH login identities/IP, trusted IP, listening ports,
 OS/kernel strings и agent ID из body. Эти поля намеренно не входят в v1.
 
 > [!IMPORTANT]
-> Mini-Ops v1.1.0 не содержал Observation v1. Пока не опубликован следующий
-> release с этим кодом, для integration testing нужна сборка из source. Этот
-> репозиторий пока не доказывает end-to-end Hub deployment.
+> Observation v1 впервые входит в Mini-Ops v1.2.0; v1.1.0 не содержит этот
+> контракт. Репозиторий пока не доказывает end-to-end Hub deployment, поэтому
+> начинайте с одного явно авторизованного canary agent.
 
 ## Включение
 

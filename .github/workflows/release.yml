@@ -63,6 +63,8 @@ jobs:
           test "$RELEASE_TAG" = "v${version}"
           test "$version" = "$(awk -F'"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
           test "$version" = "$(node -p "require('./frontend/package.json').version")"
+          test "$version" = "$(node -p "require('./frontend/package-lock.json').version")"
+          test "$version" = "$(node -p "require('./frontend/package-lock.json').packages[''].version")"
           test "$(node -p "require('./frontend/package.json').private")" = "true"
           grep -Fxq 'publish = false' Cargo.toml
           echo "version=$version" >> "$GITHUB_OUTPUT"

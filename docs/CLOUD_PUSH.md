@@ -16,9 +16,9 @@ SSH login identities/IPs, trusted IPs, listening ports, OS/kernel strings, and
 a body-provided agent ID. Those fields are intentionally not part of v1.
 
 > [!IMPORTANT]
-> Mini-Ops v1.1.0 did not ship Observation v1. Until a later release containing
-> this code is published, a source build is required for integration testing.
-> No end-to-end Hub deployment is proven by this repository yet.
+> Observation v1 first ships with Mini-Ops v1.2.0; v1.1.0 does not contain this
+> contract. No end-to-end Hub deployment is proven by this repository yet, so
+> start with one explicitly authorized canary agent.
 
 ## Activation
 

@@ -14,9 +14,9 @@ v1. Документ описывает текущее поведение аге
 | End-to-end agent -> remote Hub test | Пока не выполнялся |
 | Production compatibility claim | Не заявляется; начинать нужно с одного disposable/canary agent |
 
-Observation v1 не входит в опубликованный release Mini-Ops v1.1.0. Для теста
-нужна сборка из source или более поздний release, который явно содержит этот
-контракт.
+Observation v1 впервые входит в Mini-Ops v1.2.0; v1.1.0 не содержит этот
+контракт. До любого production compatibility claim начните с одного
+disposable/canary агента v1.2.0.
 
 ## Request
 
@@ -42,7 +42,7 @@ Percentages и load averages — finite non-negative JSON numbers или `null`.
   "schema_version": 1,
   "observation_id": "7c89b17a-0583-4476-8676-c05c31a02a36",
   "observed_at": 1784707200,
-  "agent_version": "1.1.0",
+  "agent_version": "1.2.0",
   "system": {
     "collected_at": 1784707198,
     "cpu_usage_percent": 12.5,

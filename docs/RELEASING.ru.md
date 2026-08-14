@@ -21,15 +21,46 @@ embedded frontend не публикуются отдельно в crates.io ил
 
 ## Подготовка release
 
+### Start gate кандидата
+
+Для совместного или co-located product soak не нужно ждать stable tag. До
+deployment владелец Mini-Ops передаёт ровно два входа:
+
+- полный `MERGED_SHA` release candidate в default branch;
+- подтверждение green post-merge CI default branch для этого commit.
+
+Собирайте и разворачивайте именно этот commit, а не PR head, движущийся tip
+ветки, старый публичный tag или случайно последний локальный commit. Отсчёт 72
+часов начинается только после deployment кандидата с rollback point и
+успешного fresh post-deploy preflight. Значимое для runtime изменение source,
+artifact или configuration создаёт нового кандидата и обнуляет отсчёт.
+
+### Stable release gate
+
+Кандидат получает право на stable tag только после успешного непрерывного
+72-часового soak. Tag ставится на exact прошедший soak `MERGED_SHA`, после чего
+tag-triggered workflow создаёт официальные release artifacts. Поэтому tag или
+GitHub Release — результат soak gate, а не вход для его запуска.
+
 1. Завершите release audit и устраните все blockers.
 2. В отдельной version-задаче одновременно обновите Rust и frontend versions.
 3. Проверьте exact diff и выполните локальные CI-equivalent checks.
-4. Закоммитьте и отправьте release-ready tree.
-5. Создайте и отправьте соответствующий signed или annotated tag `vX.Y.Z`.
+4. Закоммитьте, проверьте и смержите release-ready tree без создания tag;
+   post-merge CI default branch должен пройти.
+5. Разверните этот exact default-branch commit на test VPS с rollback point и проведите
+   непрерывный 72-часовой soak. Требуются `NRestarts=0`, RSS ниже 50 MiB,
+   успешный SQLite quick check, отсутствие новых warning/error patterns и хотя
+   бы один плановый certificate cycle при включённом collector.
+6. Создайте и отправьте соответствующий signed или annotated tag `vX.Y.Z` на
+   exact commit, прошедший soak.
 
 Push tag запускает `.github/workflows/release.yml`. Не заменяйте вручную assets
 существующего tag. По возможности включите immutable GitHub Releases в
 настройках репозитория.
+
+После публикации скачайте официальный archive и проверьте checksum и
+attestations до финального smoke на test VPS. Локально собранный candidate
+является soak evidence, но не заменяет проверку опубликованного artifact.
 
 Если workflow, запущенный tag, завершился до публикации release, исправьте его
 в default branch и повторите через `workflow_dispatch`, передав существующий

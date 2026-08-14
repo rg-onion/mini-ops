@@ -14,8 +14,9 @@ Hub already exists.
 | End-to-end agent -> remote Hub test | Not performed yet |
 | Production compatibility claim | Not made; start with one disposable/canary agent |
 
-Observation v1 is not in the published Mini-Ops v1.1.0 release. Test a source
-build or a later release that explicitly includes this contract.
+Observation v1 first ships with Mini-Ops v1.2.0; v1.1.0 does not contain this
+contract. Start with one disposable/canary v1.2.0 agent before making any
+production compatibility claim.
 
 ## Request
 
@@ -41,7 +42,7 @@ Percentages and load averages are finite non-negative JSON numbers or `null`.
   "schema_version": 1,
   "observation_id": "7c89b17a-0583-4476-8676-c05c31a02a36",
   "observed_at": 1784707200,
-  "agent_version": "1.1.0",
+  "agent_version": "1.2.0",
   "system": {
     "collected_at": 1784707198,
     "cpu_usage_percent": 12.5,

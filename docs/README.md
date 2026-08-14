@@ -2,6 +2,8 @@
 
 ## Core
 - [Deploy Guide](DEPLOY.md) - Installation and deployment instructions.
+- [Upgrade Guide](UPGRADING.md) - State-safe upgrade notes and retired surfaces.
+- [Release Guide](RELEASING.md) - Version, soak, artifact, and provenance gates.
 - [Configuration](../.env.example) - Environment variables.
 - [Security](SECURITY.md) - Security principles and hardening.
 - [Metrics History](METRICS_HISTORY.md) - Bounded CPU, memory, and disk history API.
@@ -16,6 +18,8 @@
 
 ## Russian Documentation / Русская документация
 - [Инструкция по деплою](DEPLOY.ru.md)
+- [Инструкция по обновлению](UPGRADING.ru.md)
+- [Выпуск Mini-Ops](RELEASING.ru.md)
 - [Безопасность](SECURITY.ru.md)
 - [Мониторинг](MONITORING.ru.md)
 - [История метрик](METRICS_HISTORY.ru.md)
