@@ -21,6 +21,28 @@ configuration examples, and operational documentation.
 
 ## Prepare a release
 
+### Candidate start gate
+
+A downstream or co-located-product soak must not wait for a stable tag. The
+Mini-Ops owner supplies exactly two inputs before deployment:
+
+- the full `MERGED_SHA` of the release candidate on the default branch;
+- evidence that the post-merge default-branch CI for that commit is green.
+
+Build and deploy that exact commit, not a pull-request head, a moving branch
+tip, an older public tag, or whichever commit happens to be latest locally.
+The 72-hour clock starts only after the candidate is deployed with a rollback
+point and its fresh post-deploy preflight passes. A runtime-relevant source,
+artifact, or configuration change creates a new candidate and resets the
+clock.
+
+### Stable release gate
+
+The candidate becomes eligible for a stable tag only after the uninterrupted
+72-hour soak passes. Tag the exact soaked `MERGED_SHA`; the tag-triggered
+workflow then produces the official release artifacts. A tag or GitHub Release
+is therefore an output of the soak gate, not an input to starting it.
+
 1. Complete the release audit and resolve every blocker.
 2. Update Rust and frontend versions together in an explicit version task.
 3. Review the exact diff and run the local CI-equivalent checks.
@@ -29,8 +51,7 @@ configuration examples, and operational documentation.
 5. Deploy that exact default-branch commit to the test VPS with a rollback point and
    complete a continuous 72-hour soak. Require `NRestarts=0`, RSS below 50 MiB,
    a healthy SQLite quick check, no new warning/error pattern, and at least one
-   scheduled certificate cycle when that collector is enabled. Any source
-   change creates a new candidate and restarts the soak.
+   scheduled certificate cycle when that collector is enabled.
 6. Create and push the matching signed or annotated `vX.Y.Z` tag on the exact
    soaked commit.
 
