@@ -67,6 +67,11 @@ Remote account должен быть root либо иметь passwordless `sudo
 non-interactive. Новый host key отклоняется, если явно не выбран
 `DEPLOY_ACCEPT_NEW_HOST_KEY=1`; полученный fingerprint нужно проверить отдельно.
 
+Отсутствующий systemd unit считается отсутствующим только после отдельной
+bounded-проверки `LoadState=not-found`. Это поддерживает поведение exit code в
+systemd 255 на fresh host, но не разрешает произвольный exit 4: timeout,
+противоречивое состояние и malformed output по-прежнему завершаются fail-closed.
+
 Каждая дополнительная mutation включается отдельно:
 
 - `DEPLOY_INSTALL_DOCKER=1` устанавливает/включает Docker;

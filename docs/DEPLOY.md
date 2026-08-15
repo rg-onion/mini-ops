@@ -67,6 +67,11 @@ non-interactive. A new host key is rejected unless
 `DEPLOY_ACCEPT_NEW_HOST_KEY=1` is explicitly selected and the learned
 fingerprint is verified out of band.
 
+Missing systemd units are treated as absent only when a separate bounded
+`LoadState=not-found` probe confirms that state. This covers the systemd 255
+exit-code behavior on a fresh host without accepting arbitrary exit 4 results;
+timeouts, contradictory states, and malformed output still fail closed.
+
 Every additional mutation is separately opt-in:
 
 - `DEPLOY_INSTALL_DOCKER=1` installs/enables Docker;
