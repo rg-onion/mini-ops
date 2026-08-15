@@ -78,7 +78,7 @@ artifact_architecture() {
     esac
 }
 
-for required in ssh scp mktemp readelf awk chmod; do
+for required in ssh scp mktemp readelf awk cat chmod; do
     require_command "$required"
 done
 if [[ "$DEPLOY_RUN_LOCAL_BUILD" == "1" ]]; then
@@ -150,6 +150,13 @@ remote_root() {
     else
         "${REMOTE_SSH[@]}" "$REMOTE" sudo -n /bin/bash -s -- "$@"
     fi
+}
+
+remote_root_with_systemd_probes() {
+    {
+        deploy_emit_systemd_probe_functions
+        cat
+    } | remote_root "$@"
 }
 
 release_remote_lock() {
@@ -224,7 +231,7 @@ if [[ "$DEPLOY_HARDENING" == "1" ]]; then
     fi
 fi
 
-remote_arch="$(remote_root \
+remote_arch="$(remote_root_with_systemd_probes \
     "$DEPLOY_TARGET_DIR" \
     "$DEPLOY_APP_USER" \
     "$DEPLOY_WRITE_ENV" \
@@ -405,27 +412,21 @@ available_kib="$(df -Pk /var | awk 'NR==2 {print $4}')"
 [[ "$available_kib" =~ ^[0-9]+$ ]] || die 'free-space probe was ambiguous'
 (( available_kib >= 262144 )) || die 'at least 256 MiB free under /var is required'
 
-set +e
-service_state="$(timeout 5 systemctl is-active mini-ops 2>/dev/null)"
-service_state_status=$?
-set -e
-case "$service_state:$service_state_status" in
-    active:0|inactive:3|failed:3|unknown:4) ;;
-    *) die 'mini-ops service state probe was ambiguous or transitional' ;;
-esac
-set +e
-service_enabled_state="$(timeout 5 systemctl is-enabled mini-ops 2>/dev/null)"
-service_enabled_status=$?
-set -e
-case "$service_enabled_state:$service_enabled_status" in
-    enabled:0|disabled:1|not-found:1) ;;
-    enabled-runtime:0|static:0|indirect:0)
+service_was_active=-1
+deploy_systemd_probe_active mini-ops service_was_active ||
+    die 'mini-ops service state probe was ambiguous or transitional'
+service_was_enabled=-1
+service_enabled_probe_status=0
+deploy_systemd_probe_enabled mini-ops service_was_enabled || service_enabled_probe_status=$?
+case "$service_enabled_probe_status" in
+    0) ;;
+    2)
         die 'mini-ops enabled state cannot be preserved exactly; normalize it before bootstrap'
         ;;
-    masked:1|masked-runtime:1) die 'mini-ops service is masked; operator choice is required' ;;
+    3) die 'mini-ops service is masked; operator choice is required' ;;
     *) die 'mini-ops enabled state probe was ambiguous' ;;
 esac
-if [[ "$service_state" != active ]]; then
+if [[ "$service_was_active" == 0 ]]; then
     set +e
     timeout 5 pgrep -x mini-ops >/dev/null 2>&1
     process_status=$?
@@ -524,15 +525,11 @@ if [[ "$HARDENING" == 1 ]]; then
     command -v ss >/dev/null 2>&1 || die 'ss is required for firewall listener proof'
     listener_count="$(timeout 5 ss -H -ltn | awk -v wanted="$SSH_PORT" '{local=$4; sub(/^.*:/, "", local); if (local == wanted) count++} END {print count+0}')"
     (( listener_count > 0 )) || die 'no bounded TCP listener proof for the actual SSH port'
-    set +e
-    firewalld_state="$(timeout 5 systemctl is-active firewalld 2>/dev/null)"
-    firewalld_status=$?
-    set -e
-    case "$firewalld_state:$firewalld_status" in
-        active:0) die 'firewalld is active; mixed firewall managers are unsupported' ;;
-        inactive:3|failed:3|unknown:4) ;;
-        *) die 'firewalld state probe was ambiguous or transitional' ;;
-    esac
+    firewalld_is_active=-1
+    deploy_systemd_probe_active firewalld firewalld_is_active ||
+        die 'firewalld state probe was ambiguous or transitional'
+    [[ "$firewalld_is_active" == 0 ]] ||
+        die 'firewalld is active; mixed firewall managers are unsupported'
     for directory in /var/lib/mini-ops-bootstrap /var/lib/mini-ops-bootstrap/ufw-rollback; do
         if [[ -e "$directory" || -L "$directory" ]]; then
             [[ -d "$directory" && ! -L "$directory" && "$(stat -c %u:%g:%a "$directory")" == 0:0:700 ]] || die 'existing UFW rollback root is unsafe'
@@ -754,7 +751,7 @@ fi
 assert_remote_lock || deploy_error 'exclusive deploy lease was lost before the core transaction'
 
 printf '%s\n' '[6/8] Atomic managed install, migration, rollback guard, and health proof'
-remote_root \
+remote_root_with_systemd_probes \
     "$REMOTE_STAGE" \
     "$REMOTE_UID" \
     "$DEPLOY_APP_USER" \
@@ -863,34 +860,21 @@ restore_directory_metadata() {
 probe_active_state() {
     local unit="$1"
     local result_name="$2"
-    local output
-    local status
-    set +e
-    output="$(timeout 5 systemctl is-active "$unit" 2>/dev/null)"
-    status=$?
-    set -e
-    case "$output:$status" in
-        active:0) printf -v "$result_name" '%s' 1 ;;
-        inactive:3|failed:3|unknown:4) printf -v "$result_name" '%s' 0 ;;
-        *) die "ambiguous or transitional active state for $unit" ;;
-    esac
+    deploy_systemd_probe_active "$unit" "$result_name" ||
+        die "ambiguous or transitional active state for $unit"
 }
 
 probe_enabled_state() {
     local unit="$1"
     local result_name="$2"
-    local output
-    local status
-    set +e
-    output="$(timeout 5 systemctl is-enabled "$unit" 2>/dev/null)"
-    status=$?
-    set -e
-    case "$output:$status" in
-        enabled:0) printf -v "$result_name" '%s' 1 ;;
-        disabled:1|not-found:1) printf -v "$result_name" '%s' 0 ;;
-        enabled-runtime:0|static:0|indirect:0)
+    local probe_status=0
+    deploy_systemd_probe_enabled "$unit" "$result_name" || probe_status=$?
+    case "$probe_status" in
+        0) ;;
+        2)
             die "$unit enabled state cannot be preserved exactly"
             ;;
+        3) die "$unit is masked; operator choice is required" ;;
         *) die "ambiguous enabled state for $unit" ;;
     esac
 }
@@ -1134,8 +1118,7 @@ cleanup_isolated_state() {
 }
 
 rollback_stop_guard() {
-    local active_state
-    local active_status
+    local service_is_active=-1
     local process_status
     local app_uid
 
@@ -1143,12 +1126,8 @@ rollback_stop_guard() {
     # bounded state and process proofs below are authoritative, not stop's
     # unit-not-found exit status.
     timeout 5 systemctl stop mini-ops >/dev/null 2>&1 || true
-    active_state="$(timeout 5 systemctl is-active mini-ops 2>/dev/null)"
-    active_status=$?
-    case "$active_state:$active_status" in
-        inactive:3|failed:3|unknown:4) ;;
-        *) return 1 ;;
-    esac
+    deploy_systemd_probe_active mini-ops service_is_active || return 1
+    [[ "$service_is_active" == 0 ]] || return 1
     timeout 5 pgrep -x mini-ops >/dev/null 2>&1
     process_status=$?
     [[ "$process_status" == 1 ]] || return 1
@@ -1343,20 +1322,15 @@ rollback_on_exit() {
             else
                 [[ ! -e "$NGINX_DEFAULT" && ! -L "$NGINX_DEFAULT" ]] || rollback_verification_failed=1
             fi
-            set +e
-            restored_nginx_active="$(timeout 5 systemctl is-active nginx 2>/dev/null)"
-            restored_nginx_active_status=$?
-            restored_nginx_enabled="$(timeout 5 systemctl is-enabled nginx 2>/dev/null)"
-            restored_nginx_enabled_status=$?
-            if [[ "$NGINX_WAS_ACTIVE" == 1 ]]; then
-                [[ "$restored_nginx_active:$restored_nginx_active_status" == active:0 ]] || rollback_verification_failed=1
-            else
-                case "$restored_nginx_active:$restored_nginx_active_status" in inactive:3|failed:3|unknown:4) ;; *) rollback_verification_failed=1 ;; esac
+            restored_nginx_active=-1
+            if ! deploy_systemd_probe_active nginx restored_nginx_active ||
+                [[ "$restored_nginx_active" != "$NGINX_WAS_ACTIVE" ]]; then
+                rollback_verification_failed=1
             fi
-            if [[ "$NGINX_WAS_ENABLED" == 1 ]]; then
-                case "$restored_nginx_enabled:$restored_nginx_enabled_status" in enabled:0) ;; *) rollback_verification_failed=1 ;; esac
-            else
-                case "$restored_nginx_enabled:$restored_nginx_enabled_status" in disabled:1|not-found:1) ;; *) rollback_verification_failed=1 ;; esac
+            restored_nginx_enabled=-1
+            if ! deploy_systemd_probe_enabled nginx restored_nginx_enabled ||
+                [[ "$restored_nginx_enabled" != "$NGINX_WAS_ENABLED" ]]; then
+                rollback_verification_failed=1
             fi
         fi
         # STATE remains root-controlled through every privileged restore and
@@ -1379,23 +1353,18 @@ rollback_on_exit() {
         else
             systemctl disable mini-ops >/dev/null 2>&1
         fi
-        restored_service_enabled="$(timeout 5 systemctl is-enabled mini-ops 2>/dev/null)"
-        restored_service_enabled_status=$?
-        if [[ "$SERVICE_WAS_ENABLED" == 1 ]]; then
-            [[ "$restored_service_enabled:$restored_service_enabled_status" == enabled:0 ]] || rollback_verification_failed=1
-        else
-            case "$restored_service_enabled:$restored_service_enabled_status" in
-                disabled:1|not-found:1) ;;
-                *) rollback_verification_failed=1 ;;
-            esac
+        restored_service_enabled=-1
+        if ! deploy_systemd_probe_enabled mini-ops restored_service_enabled ||
+            [[ "$restored_service_enabled" != "$SERVICE_WAS_ENABLED" ]]; then
+            rollback_verification_failed=1
         fi
         if [[ "$SERVICE_WAS_ACTIVE" == 1 ]]; then
             systemctl start mini-ops >/dev/null 2>&1
-            set +e
-            restored_service_state="$(timeout 5 systemctl is-active mini-ops 2>/dev/null)"
-            restored_service_status=$?
-            set +e
-            [[ "$restored_service_state:$restored_service_status" == active:0 ]] || rollback_verification_failed=1
+            restored_service_state=-1
+            if ! deploy_systemd_probe_active mini-ops restored_service_state ||
+                [[ "$restored_service_state" != 1 ]]; then
+                rollback_verification_failed=1
+            fi
 
             restored_host="$(awk -F= '$1 == "APP_HOST" {sub(/^[^=]*=/, ""); print; exit}' "$TARGET/.env")"
             restored_port="$(awk -F= '$1 == "APP_PORT" {sub(/^[^=]*=/, ""); print; exit}' "$TARGET/.env")"
@@ -1440,14 +1409,11 @@ ROLLBACK_PY
                 rollback_verification_failed=1
             fi
         else
-            set +e
-            restored_service_state="$(timeout 5 systemctl is-active mini-ops 2>/dev/null)"
-            restored_service_status=$?
-            set +e
-            case "$restored_service_state:$restored_service_status" in
-                inactive:3|failed:3|unknown:4) ;;
-                *) rollback_verification_failed=1 ;;
-            esac
+            restored_service_state=-1
+            if ! deploy_systemd_probe_active mini-ops restored_service_state ||
+                [[ "$restored_service_state" != 0 ]]; then
+                rollback_verification_failed=1
+            fi
         fi
         if [[ "$rollback_verification_failed" == 1 ]]; then
             printf 'REMOTE INSTALL: ROLLBACK DEGRADED; exact file/service/API/DB proof failed\n' >&2
@@ -2143,7 +2109,7 @@ verify_firewall_committed_connectivity() {
 
     while :; do
         set +e
-        remote_root \
+        remote_root_with_systemd_probes \
             "$transaction_unit" \
             "$rollback_script" \
             "$DEPLOY_SSH_PORT" \
@@ -2183,11 +2149,9 @@ if [[ "$SETUP_NGINX" == 1 && "$EXPOSE_HTTP" == 1 ]]; then
 fi
 listener_count="$(timeout 5 ss -H -ltn | awk -v wanted="$SSH_PORT" '{local=$4; sub(/^.*:/, "", local); if (local == wanted) count++} END {print count+0}')"
 (( listener_count > 0 ))
-set +e
-rollback_service_state="$(timeout 5 systemctl is-active "${UNIT}.service" 2>/dev/null)"
-rollback_service_status=$?
-set -e
-case "$rollback_service_state:$rollback_service_status" in inactive:3|failed:3|unknown:4) ;; *) exit 1 ;; esac
+rollback_service_is_active=-1
+deploy_systemd_probe_active "${UNIT}.service" rollback_service_is_active || exit 1
+[[ "$rollback_service_is_active" == 0 ]]
 REMOTE_UFW_COMMITTED_PROOF
         status=$?
         set -e
@@ -2233,7 +2197,7 @@ apply_firewall_transaction() {
     local extra
 
     set +e
-    transaction="$(remote_root \
+    transaction="$(remote_root_with_systemd_probes \
         "$DEPLOY_SSH_PORT" \
         "$DEPLOY_SETUP_NGINX" \
         "$DEPLOY_EXPOSE_HTTP" \
@@ -2267,15 +2231,10 @@ source "$TX_HELPER"
 for tool in awk bash chmod chown cp dirname du find flock grep install mktemp mv rm sort ss stat sync systemctl systemd-run timeout touch ufw wc; do
     command -v "$tool" >/dev/null 2>&1 || die "required tool unavailable: $tool"
 done
-set +e
-firewalld_state="$(timeout 5 systemctl is-active firewalld 2>/dev/null)"
-firewalld_status=$?
-set -e
-case "$firewalld_state:$firewalld_status" in
-    active:0) die 'firewalld is active; refusing mixed firewall managers' ;;
-    inactive:3|failed:3|unknown:4) ;;
-    *) die 'firewalld state probe was ambiguous or transitional' ;;
-esac
+firewalld_is_active=-1
+deploy_systemd_probe_active firewalld firewalld_is_active ||
+    die 'firewalld state probe was ambiguous or transitional'
+[[ "$firewalld_is_active" == 0 ]] || die 'firewalld is active; refusing mixed firewall managers'
 listener_count="$(timeout 5 ss -H -ltn | awk -v wanted="$SSH_PORT" '{local=$4; sub(/^.*:/, "", local); if (local == wanted) count++} END {print count+0}')"
 (( listener_count > 0 )) || die 'actual SSH listener disappeared before firewall mutation'
 

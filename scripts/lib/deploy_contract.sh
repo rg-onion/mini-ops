@@ -12,6 +12,79 @@ deploy_warning() {
     printf 'WARNING: %s\n' "$*" >&2
 }
 
+# systemctl changed the output/exit-code pair for a missing unit in systemd
+# 255. Treat exit 4 as an absent unit only after a separate, exact LoadState
+# proof; every timeout, malformed response, and contradictory state fails
+# closed. These functions are serialized into the bounded remote scripts by
+# deploy_emit_systemd_probe_functions.
+deploy_systemd_unit_is_absent() {
+    local unit="$1"
+    local output
+    local status
+
+    if output="$(timeout 5 systemctl show "$unit" --property=LoadState --value 2>/dev/null)"; then
+        status=0
+    else
+        status=$?
+    fi
+    [[ "$output:$status" == not-found:0 ]]
+}
+
+deploy_systemd_probe_active() {
+    local unit="$1"
+    local destination="$2"
+    local output
+    local status
+
+    if output="$(timeout 5 systemctl is-active "$unit" 2>/dev/null)"; then
+        status=0
+    else
+        status=$?
+    fi
+    case "$output:$status" in
+        active:0) printf -v "$destination" '%s' 1 ;;
+        inactive:3|failed:3) printf -v "$destination" '%s' 0 ;;
+        inactive:4|unknown:4)
+            deploy_systemd_unit_is_absent "$unit" || return 1
+            printf -v "$destination" '%s' 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Return 2 for an enabled state that cannot be restored as a persistent
+# enabled/disabled boolean, and 3 for a masked unit. Other non-zero returns are
+# ambiguous probe failures.
+deploy_systemd_probe_enabled() {
+    local unit="$1"
+    local destination="$2"
+    local output
+    local status
+
+    if output="$(timeout 5 systemctl is-enabled "$unit" 2>/dev/null)"; then
+        status=0
+    else
+        status=$?
+    fi
+    case "$output:$status" in
+        enabled:0) printf -v "$destination" '%s' 1 ;;
+        disabled:1) printf -v "$destination" '%s' 0 ;;
+        not-found:1|not-found:4)
+            deploy_systemd_unit_is_absent "$unit" || return 1
+            printf -v "$destination" '%s' 0
+            ;;
+        enabled-runtime:0|static:0|indirect:0) return 2 ;;
+        masked:1|masked-runtime:1) return 3 ;;
+        *) return 1 ;;
+    esac
+}
+
+deploy_emit_systemd_probe_functions() {
+    declare -f deploy_systemd_unit_is_absent
+    declare -f deploy_systemd_probe_active
+    declare -f deploy_systemd_probe_enabled
+}
+
 deploy_validate_boolean() {
     local name="$1"
     local value="$2"

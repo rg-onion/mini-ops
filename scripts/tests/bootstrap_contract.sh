@@ -247,6 +247,165 @@ for invalid_npm in 11.4.2 v12.0.1 12.1.0 12.0; do
     fi
     assert_contains "$TMP_ROOT/invalid-npm.err" 'local npm must match 12.0.x'
 done
+
+SYSTEMD_PROBE_BIN="$TMP_ROOT/systemd-probe-bin"
+SYSTEMD_PROBE_MARKER="$TMP_ROOT/systemd-probe-calls"
+mkdir -p "$SYSTEMD_PROBE_BIN"
+# The generated fixture must expand its own arguments and exported values.
+# shellcheck disable=SC2016
+{
+    printf '#!/bin/bash\n'
+    printf 'set -u\n'
+    printf 'case "${1:-}" in\n'
+    printf '  is-active)\n'
+    printf '    printf "active %%s\\n" "${2:-}" >> "$SYSTEMD_PROBE_MARKER"\n'
+    printf '    printf "%%s\\n" "$SYSTEMD_PROBE_ACTIVE_OUTPUT"\n'
+    printf '    exit "$SYSTEMD_PROBE_ACTIVE_STATUS"\n'
+    printf '    ;;\n'
+    printf '  is-enabled)\n'
+    printf '    printf "enabled %%s\\n" "${2:-}" >> "$SYSTEMD_PROBE_MARKER"\n'
+    printf '    printf "%%s\\n" "$SYSTEMD_PROBE_ENABLED_OUTPUT"\n'
+    printf '    exit "$SYSTEMD_PROBE_ENABLED_STATUS"\n'
+    printf '    ;;\n'
+    printf '  show)\n'
+    printf '    [[ "$#" == 4 && "${3:-}" == --property=LoadState && "${4:-}" == --value ]] || exit 98\n'
+    printf '    printf "show %%s\\n" "${2:-}" >> "$SYSTEMD_PROBE_MARKER"\n'
+    printf '    printf "%%s\\n" "$SYSTEMD_PROBE_LOAD_OUTPUT"\n'
+    printf '    exit "$SYSTEMD_PROBE_LOAD_STATUS"\n'
+    printf '    ;;\n'
+    printf '  *) exit 99 ;;\n'
+    printf 'esac\n'
+} > "$SYSTEMD_PROBE_BIN/systemctl"
+chmod 0755 "$SYSTEMD_PROBE_BIN/systemctl"
+
+export SYSTEMD_PROBE_MARKER
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=inactive
+export SYSTEMD_PROBE_ACTIVE_STATUS=4
+export SYSTEMD_PROBE_ENABLED_OUTPUT=not-found
+export SYSTEMD_PROBE_ENABLED_STATUS=4
+export SYSTEMD_PROBE_LOAD_OUTPUT=not-found
+export SYSTEMD_PROBE_LOAD_STATUS=0
+: > "$SYSTEMD_PROBE_MARKER"
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result ||
+    fail 'systemd 255 inactive:4 missing-unit state was rejected'
+[[ "$systemd_probe_result" == 0 ]] || fail 'systemd 255 missing unit was not normalized to inactive'
+assert_contains "$SYSTEMD_PROBE_MARKER" 'show mini-ops'
+
+: > "$SYSTEMD_PROBE_MARKER"
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result ||
+    fail 'systemd 255 not-found:4 enabled state was rejected'
+[[ "$systemd_probe_result" == 0 ]] || fail 'systemd 255 missing unit was not normalized to disabled'
+assert_contains "$SYSTEMD_PROBE_MARKER" 'show mini-ops'
+
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=unknown
+export SYSTEMD_PROBE_ACTIVE_STATUS=4
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result ||
+    fail 'legacy unknown:4 missing-unit state was rejected despite exact proof'
+[[ "$systemd_probe_result" == 0 ]] || fail 'legacy missing unit was not normalized to inactive'
+
+export SYSTEMD_PROBE_ENABLED_OUTPUT=not-found
+export SYSTEMD_PROBE_ENABLED_STATUS=1
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result ||
+    fail 'legacy not-found:1 enabled state was rejected despite exact proof'
+[[ "$systemd_probe_result" == 0 ]] || fail 'legacy missing unit was not normalized to disabled'
+
+export SYSTEMD_PROBE_LOAD_OUTPUT=loaded
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=inactive
+export SYSTEMD_PROBE_ACTIVE_STATUS=4
+export SYSTEMD_PROBE_ENABLED_STATUS=4
+if PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result; then
+    fail 'inactive:4 was accepted without an exact LoadState=not-found proof'
+fi
+if PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result; then
+    fail 'not-found:4 was accepted with a contradictory loaded unit proof'
+fi
+
+export SYSTEMD_PROBE_LOAD_OUTPUT=not-found
+export SYSTEMD_PROBE_LOAD_STATUS=1
+if PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result; then
+    fail 'missing-unit proof accepted a non-zero systemctl show status'
+fi
+
+export SYSTEMD_PROBE_LOAD_STATUS=0
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=maintenance
+if PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result; then
+    fail 'an arbitrary exit 4 active-state output was accepted'
+fi
+
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=active
+export SYSTEMD_PROBE_ACTIVE_STATUS=0
+: > "$SYSTEMD_PROBE_MARKER"
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_active mini-ops systemd_probe_result ||
+    fail 'existing active unit was rejected'
+[[ "$systemd_probe_result" == 1 ]] || fail 'existing active unit was not preserved'
+assert_not_contains "$SYSTEMD_PROBE_MARKER" 'show mini-ops'
+
+export SYSTEMD_PROBE_ENABLED_OUTPUT=disabled
+export SYSTEMD_PROBE_ENABLED_STATUS=1
+: > "$SYSTEMD_PROBE_MARKER"
+systemd_probe_result=-1
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result ||
+    fail 'existing disabled unit was rejected'
+[[ "$systemd_probe_result" == 0 ]] || fail 'existing disabled unit was not preserved'
+assert_not_contains "$SYSTEMD_PROBE_MARKER" 'show mini-ops'
+
+export SYSTEMD_PROBE_ENABLED_OUTPUT=static
+export SYSTEMD_PROBE_ENABLED_STATUS=0
+systemd_probe_status=0
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result || systemd_probe_status=$?
+[[ "$systemd_probe_status" == 2 ]] || fail 'static unit did not retain its non-restorable classification'
+
+export SYSTEMD_PROBE_ENABLED_OUTPUT=masked
+export SYSTEMD_PROBE_ENABLED_STATUS=1
+systemd_probe_status=0
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    deploy_systemd_probe_enabled mini-ops systemd_probe_result || systemd_probe_status=$?
+[[ "$systemd_probe_status" == 3 ]] || fail 'masked unit did not retain its operator-choice classification'
+
+deploy_emit_systemd_probe_functions > "$TMP_ROOT/systemd-probes.remote.sh"
+bash -n "$TMP_ROOT/systemd-probes.remote.sh" || fail 'serialized remote systemd probes are not valid Bash'
+assert_contains "$TMP_ROOT/systemd-probes.remote.sh" 'deploy_systemd_unit_is_absent'
+export SYSTEMD_PROBE_ACTIVE_OUTPUT=inactive
+export SYSTEMD_PROBE_ACTIVE_STATUS=4
+export SYSTEMD_PROBE_LOAD_OUTPUT=not-found
+export SYSTEMD_PROBE_LOAD_STATUS=0
+# The generated remote script must evaluate its own result variable.
+# shellcheck disable=SC2016
+{
+    deploy_emit_systemd_probe_functions
+    printf 'set -euo pipefail\n'
+    printf 'remote_result=-1\n'
+    printf 'deploy_systemd_probe_active mini-ops remote_result\n'
+    printf '[[ "$remote_result" == 0 ]]\n'
+} > "$TMP_ROOT/systemd-probes.remote-runtime.sh"
+PATH="$SYSTEMD_PROBE_BIN:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash "$TMP_ROOT/systemd-probes.remote-runtime.sh" ||
+    fail 'serialized remote systemd probes rejected the systemd 255 fixture'
+assert_contains "$BOOTSTRAP" "remote_arch=\"\$(remote_root_with_systemd_probes"
+assert_contains "$BOOTSTRAP" "transaction=\"\$(remote_root_with_systemd_probes"
+assert_contains "$BOOTSTRAP" 'deploy_systemd_probe_active mini-ops service_was_active'
+assert_contains "$BOOTSTRAP" 'deploy_systemd_probe_enabled mini-ops service_was_enabled'
+assert_contains "$BOOTSTRAP" 'deploy_systemd_probe_active mini-ops service_is_active'
+assert_contains "$BOOTSTRAP" 'deploy_systemd_probe_enabled mini-ops restored_service_enabled'
+assert_contains "$BOOTSTRAP" "deploy_systemd_probe_active \"\${UNIT}.service\" rollback_service_is_active"
+assert_contains "$BOOTSTRAP" 'deploy_systemd_probe_active firewalld firewalld_is_active'
+
 deploy_render_unit "$UNIT_TEMPLATE" miniops 0 > "$TMP_ROOT/default.service"
 assert_contains "$TMP_ROOT/default.service" 'User=miniops'
 assert_contains "$TMP_ROOT/default.service" 'Group=miniops'
