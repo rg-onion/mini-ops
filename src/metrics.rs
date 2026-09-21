@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use sysinfo::{Disks, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
+
+/// CPU usage above this percentage counts towards a critical CPU alert.
+pub const CPU_ALERT_THRESHOLD_PERCENT: f32 = 95.0;
+/// Consecutive one-minute samples above the threshold required before alerting.
+pub const CPU_ALERT_SUSTAINED_SAMPLES: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SystemStats {
@@ -18,11 +23,20 @@ pub struct MetricsState {
     pub current: Mutex<SystemStats>,
 }
 
+/// Only global CPU usage and memory are refreshed. Processes must stay out: on
+/// Linux a process refresh re-reads `/proc/stat` once the `/proc` scan exceeds
+/// `MINIMUM_CPU_UPDATE_INTERVAL`, replacing the interval average with the
+/// agent's own scan window and reporting a false ~100% on small hosts.
+fn system_refresh_kind() -> RefreshKind {
+    RefreshKind::nothing()
+        .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+        .with_memory(MemoryRefreshKind::everything())
+}
+
 impl MetricsState {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
+        let mut sys = System::new_with_specifics(system_refresh_kind());
         let disks = Disks::new_with_refreshed_list();
-        sys.refresh_all();
 
         let stats = Self::collect_internal(&mut sys, &disks);
 
@@ -37,8 +51,7 @@ impl MetricsState {
         let mut sys = self.sys.lock().unwrap();
         let mut disks = self.disks.lock().unwrap();
 
-        sys.refresh_all();
-        sys.refresh_memory();
+        sys.refresh_specifics(system_refresh_kind());
         disks.refresh(true);
 
         let stats = Self::collect_internal(&mut sys, &disks);
@@ -88,6 +101,36 @@ impl MetricsState {
     }
 }
 
+/// Counts consecutive samples above a threshold so one noisy sample cannot
+/// raise an alert on its own.
+#[derive(Debug)]
+pub struct SustainedThreshold {
+    threshold: f32,
+    required: u32,
+    streak: u32,
+}
+
+impl SustainedThreshold {
+    pub fn new(threshold: f32, required: u32) -> Self {
+        Self {
+            threshold,
+            required: required.max(1),
+            streak: 0,
+        }
+    }
+
+    /// Records a sample and returns whether the threshold has been exceeded for
+    /// at least `required` consecutive samples, including this one.
+    pub fn observe(&mut self, value: f32) -> bool {
+        if value > self.threshold {
+            self.streak = self.streak.saturating_add(1);
+        } else {
+            self.streak = 0;
+        }
+        self.streak >= self.required
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +142,36 @@ mod tests {
 
         assert!(stats.cpu_usage >= 0.0);
         assert!(stats.memory_total > 0);
+    }
+
+    #[test]
+    fn refresh_does_not_scan_processes() {
+        let state = MetricsState::new();
+        state.refresh();
+
+        assert!(state.sys.lock().unwrap().processes().is_empty());
+    }
+
+    #[test]
+    fn sustained_threshold_requires_consecutive_samples() {
+        let mut cpu = SustainedThreshold::new(95.0, 3);
+
+        assert!(!cpu.observe(100.0));
+        assert!(!cpu.observe(100.0));
+        assert!(cpu.observe(100.0));
+        assert!(cpu.observe(96.0));
+    }
+
+    #[test]
+    fn sustained_threshold_resets_on_normal_or_invalid_sample() {
+        let mut cpu = SustainedThreshold::new(95.0, 3);
+
+        assert!(!cpu.observe(100.0));
+        assert!(!cpu.observe(100.0));
+        assert!(!cpu.observe(95.0));
+        assert!(!cpu.observe(100.0));
+        assert!(!cpu.observe(100.0));
+        assert!(!cpu.observe(f32::NAN));
+        assert!(!cpu.observe(100.0));
     }
 }

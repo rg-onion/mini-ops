@@ -348,6 +348,10 @@ async fn main() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut next_metrics_cleanup_at = 0_i64;
+        let mut cpu_critical = metrics::SustainedThreshold::new(
+            metrics::CPU_ALERT_THRESHOLD_PERCENT,
+            metrics::CPU_ALERT_SUSTAINED_SAMPLES,
+        );
         loop {
             interval.tick().await;
             metrics_clone.refresh();
@@ -355,7 +359,7 @@ async fn main() {
 
             // Check for critical alerts
             let lang = i18n::Lang::from_headers(&header::HeaderMap::new());
-            if stats.cpu_usage > 95.0 {
+            if cpu_critical.observe(stats.cpu_usage) {
                 let message = i18n::t_val(
                     "alert.critical_cpu",
                     &lang,
