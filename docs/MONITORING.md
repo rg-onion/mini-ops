@@ -25,7 +25,8 @@ You can view Docker container logs in real-time:
 
 ## 🛎 Notifications (Telegram)
 The system automatically sends a Telegram message when critical thresholds are reached:
-- **CPU > 95%**
+- **CPU > 95%** for 3 consecutive one-minute samples (each sample is the
+  average CPU usage since the previous one)
 - **Disk Usage > 90%**
 
 ### Configuration
