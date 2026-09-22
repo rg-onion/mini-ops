@@ -2807,6 +2807,10 @@ fn synthetic_degraded_status(
     status
 }
 
+fn invalid_integrity_state() -> sqlx::Error {
+    sqlx::Error::Protocol("invalid file-integrity state".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::collector::ScanErrorCount;
@@ -2816,6 +2820,9 @@ mod tests {
     use std::sync::Arc;
 
     const NOW: i64 = 1_700_000_000;
+
+    /// Baseline generation, manifest, and `(path_id, content_digest, generation)` rows.
+    type BaselineSnapshot = (i64, Vec<u8>, Vec<(String, Option<Vec<u8>>, i64)>);
 
     async fn test_context() -> (SqlitePool, NotificationOutbox) {
         let db = SqlitePoolOptions::new()
@@ -4350,7 +4357,7 @@ mod tests {
         publish_scan_inner(&db, &outbox, trusted.clone())
             .await
             .expect("enroll observed-manifest fixture");
-        let baseline_before: (i64, Vec<u8>, Vec<(String, Option<Vec<u8>>, i64)>) = (
+        let baseline_before: BaselineSnapshot = (
             sqlx::query_scalar("SELECT baseline_generation FROM file_integrity_state WHERE id = 1")
                 .fetch_one(&db)
                 .await
@@ -4406,7 +4413,7 @@ mod tests {
             evidence.change_kinds,
             vec![FileChangeKindV1::ContentChanged]
         );
-        let baseline_after: (i64, Vec<u8>, Vec<(String, Option<Vec<u8>>, i64)>) = (
+        let baseline_after: BaselineSnapshot = (
             sqlx::query_scalar("SELECT baseline_generation FROM file_integrity_state WHERE id = 1")
                 .fetch_one(&db)
                 .await
@@ -4885,8 +4892,4 @@ mod tests {
             .await
             .expect("rollback re-enroll CAS fixture");
     }
-}
-
-fn invalid_integrity_state() -> sqlx::Error {
-    sqlx::Error::Protocol("invalid file-integrity state".to_owned())
 }
