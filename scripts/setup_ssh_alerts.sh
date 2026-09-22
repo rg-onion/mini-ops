@@ -201,6 +201,14 @@ if [ -e "$CONFIG_DIR" ] || [ -L "$CONFIG_DIR" ]; then
         exit 1
     fi
     CONFIG_DIR_EXISTED=1
+    read -r ORIGINAL_CONFIG_DIR_UID ORIGINAL_CONFIG_DIR_GID ORIGINAL_CONFIG_DIR_MODE < <(
+        /usr/bin/stat -c '%u %g %a' "$CONFIG_DIR"
+    )
+    if [ "$ORIGINAL_CONFIG_DIR_UID" -ne 0 ] ||
+        (( (8#$ORIGINAL_CONFIG_DIR_MODE & 8#022) != 0 )); then
+        echo "SSH-alert config directory must be root-owned and not group/other-writable" >&2
+        exit 1
+    fi
 fi
 if [ -e "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ]; then
     if [ ! -d "$BACKUP_ROOT" ] || [ -L "$BACKUP_ROOT" ] ||
@@ -327,7 +335,9 @@ install -o root -g root -m 0755 "$HOOK_SOURCE" "$HOOK_TMP"
 mv -fT "$HOOK_TMP" "$HOOK_FILE"
 /usr/bin/sync -f /usr/local/bin
 
-install -d -o root -g root -m 0755 "$CONFIG_DIR"
+if [ "$CONFIG_DIR_EXISTED" -eq 0 ]; then
+    install -d -o root -g root -m 0750 "$CONFIG_DIR"
+fi
 assert_existing_directory_chain "$CONFIG_DIR" || {
     echo "SSH-alert config path component proof failed" >&2
     exit 1
@@ -372,6 +382,23 @@ fi
 if [ "$(/usr/bin/stat -c '%u:%g:%a' "$HOOK_FILE")" != "0:0:755" ] ||
     [ "$(/usr/bin/stat -c '%u:%g:%a' "$CONFIG_FILE")" != "0:0:600" ]; then
     echo "SSH-alert ownership/mode post-write proof failed" >&2
+    exit 1
+fi
+read -r CONFIG_DIR_UID CONFIG_DIR_GID CONFIG_DIR_MODE < <(
+    /usr/bin/stat -c '%u %g %a' "$CONFIG_DIR"
+)
+if [ "$CONFIG_DIR_UID" -ne 0 ] || (( (8#$CONFIG_DIR_MODE & 8#022) != 0 )); then
+    echo "SSH-alert config directory post-write proof failed" >&2
+    exit 1
+fi
+if [ "$CONFIG_DIR_EXISTED" -eq 1 ]; then
+    if [ "$CONFIG_DIR_UID:$CONFIG_DIR_GID:$CONFIG_DIR_MODE" != \
+        "$ORIGINAL_CONFIG_DIR_UID:$ORIGINAL_CONFIG_DIR_GID:$ORIGINAL_CONFIG_DIR_MODE" ]; then
+        echo "SSH-alert config directory metadata changed unexpectedly" >&2
+        exit 1
+    fi
+elif [ "$CONFIG_DIR_UID:$CONFIG_DIR_GID:$CONFIG_DIR_MODE" != "0:0:750" ]; then
+    echo "SSH-alert config directory creation proof failed" >&2
     exit 1
 fi
 
