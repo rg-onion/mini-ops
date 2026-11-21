@@ -2,16 +2,23 @@
 
 import assert from 'node:assert/strict';
 import {
+  REVIEWED_LOCK_PACKAGES,
   REVIEWED_YANK,
   validateAuditPolicy,
   validateAuditReport,
   validateDependencyTree,
+  validateReviewedLockPackages,
 } from '../check_cargo_audit.mjs';
 
 function auditReport(warnings = undefined) {
   return {
     settings: {
-      ignore: ['RUSTSEC-2023-0071'],
+      ignore: [
+        'RUSTSEC-2023-0071',
+        'RUSTSEC-2026-0459',
+        'RUSTSEC-2026-0543',
+        'RUSTSEC-2026-0441',
+      ],
       informational_warnings: ['unmaintained', 'unsound', 'notice'],
       target_arch: [],
       target_os: [],
@@ -47,7 +54,26 @@ function dependencyTree(extraParent = false) {
   ].join('\n');
 }
 
-validateAuditPolicy(auditReport(), dependencyTree());
+function lockFile(overrides = {}, omit = []) {
+  return REVIEWED_LOCK_PACKAGES.filter((entry) => !omit.includes(entry.name))
+    .map((entry) => {
+      const merged = { ...entry, ...(overrides[entry.name] ?? {}) };
+      return [
+        '[[package]]',
+        `name = "${merged.name}"`,
+        `version = "${merged.version}"`,
+        `source = "${merged.source}"`,
+        `checksum = "${merged.checksum}"`,
+        'dependencies = [',
+        ' "unrelated",',
+        ']',
+        '',
+      ].join('\n');
+    })
+    .join('\n');
+}
+
+validateAuditPolicy(auditReport(), dependencyTree(), lockFile());
 
 assert.throws(
   () =>
@@ -93,5 +119,41 @@ assert.throws(
   () => validateDependencyTree('0spin v0.9.8\n1flume v0.11.1'),
   /no longer reachable/,
 );
+
+validateReviewedLockPackages(lockFile());
+for (const reviewed of REVIEWED_LOCK_PACKAGES) {
+  assert.throws(
+    () => validateReviewedLockPackages(lockFile({ [reviewed.name]: { version: '9.9.9' } })),
+    new RegExp(`${reviewed.name} changed in Cargo.lock; re-review or remove the ${reviewed.advisory}`),
+  );
+  assert.throws(
+    () =>
+      validateReviewedLockPackages(lockFile({ [reviewed.name]: { checksum: 'different' } })),
+    /changed in Cargo.lock/,
+  );
+  assert.throws(
+    () => validateReviewedLockPackages(lockFile({}, [reviewed.name])),
+    new RegExp(`${reviewed.name} is no longer in Cargo.lock; remove the ${reviewed.advisory}`),
+  );
+  // A second, unreviewed version of the same crate must not ride on the exception.
+  assert.throws(
+    () =>
+      validateReviewedLockPackages(
+        `${lockFile()}\n${lockFile({ [reviewed.name]: { version: '9.9.9' } })}`,
+      ),
+    /changed in Cargo.lock/,
+  );
+}
+assert.throws(() => validateReviewedLockPackages(''), /Cargo.lock is missing or empty/);
+assert.throws(
+  () => validateAuditPolicy(auditReport(), dependencyTree(), undefined),
+  /Cargo.lock is missing or empty/,
+);
+const droppedIgnore = auditReport();
+droppedIgnore.settings.ignore = ['RUSTSEC-2023-0071'];
+assert.throws(() => validateAuditReport(droppedIgnore), /ignore policy changed/);
+const extraIgnore = auditReport();
+extraIgnore.settings.ignore.push('RUSTSEC-2026-0460');
+assert.throws(() => validateAuditReport(extraIgnore), /ignore policy changed/);
 
 console.log('Cargo audit policy fixture tests passed');
