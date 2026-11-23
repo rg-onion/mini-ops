@@ -15,8 +15,31 @@
 # that name/version/checksum/direct-dependent tuple and rejects every advisory,
 # other warning, other yank, or new dependency path. Remove the exception as
 # soon as SQLx can use flume 0.12+ or the package is no longer reachable.
+#
+# The three ignores below were reviewed on 2026-11-21 (re-review by 2027-02-21).
+# Each is matched by exact advisory ID only, and
+# `scripts/check_cargo_audit.mjs` additionally pins the affected package to the
+# exact name/version/checksum recorded in Cargo.lock. Any version change makes
+# `scripts/check_cargo_audit.sh` fail so the exception is re-reviewed or removed.
+#
+# RUSTSEC-2026-0459 (`libsqlite3-sys` 0.30.1, fixed in >=0.39.0): reached via
+# `sqlx-sqlite` 0.8.6 (bundled SQLite). The attack is local and needs a crafted
+# database file together with a sibling `-wal` file with a different page size;
+# Mini-Ops only opens its own database. Remove this ignore after upgrading SQLx
+# to 0.9 (requires Rust >= 1.94).
+#
+# RUSTSEC-2026-0543 (`chrono` 0.4.43, unmaintained): no fixed release exists.
+# Direct dependency; candidate for replacement with `jiff` or `time`.
+#
+# RUSTSEC-2026-0441 (`pin-utils` 0.1.0, unmaintained): no fixed release exists.
+# Transitive dependency via `futures-util` 0.3.31.
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2026-0459",
+  "RUSTSEC-2026-0543",
+  "RUSTSEC-2026-0441",
+]
 
 [output]
 deny = ["warnings"]

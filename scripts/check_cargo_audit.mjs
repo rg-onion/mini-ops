@@ -14,7 +14,35 @@ export const REVIEWED_YANK = Object.freeze({
   checksum: '6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67',
   directDependents: Object.freeze(['flume@0.11.1']),
 });
-const REVIEWED_ADVISORY_IGNORES = Object.freeze(['RUSTSEC-2023-0071']);
+// Advisories ignored in .cargo/audit.toml by exact ID, reviewed 2026-11-21
+// (re-review by 2027-02-21). Each is pinned to the exact Cargo.lock entry it
+// was reviewed against; see validateReviewedLockPackages.
+export const REVIEWED_LOCK_PACKAGES = Object.freeze([
+  Object.freeze({
+    advisory: 'RUSTSEC-2026-0459',
+    name: 'libsqlite3-sys',
+    version: '0.30.1',
+    source: REGISTRY_SOURCE,
+    checksum: '2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149',
+  }),
+  Object.freeze({
+    advisory: 'RUSTSEC-2026-0543',
+    name: 'chrono',
+    version: '0.4.43',
+    source: REGISTRY_SOURCE,
+    checksum: 'fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118',
+  }),
+  Object.freeze({
+    advisory: 'RUSTSEC-2026-0441',
+    name: 'pin-utils',
+    version: '0.1.0',
+    source: REGISTRY_SOURCE,
+    checksum: '8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184',
+  }),
+]);
+const REVIEWED_ADVISORY_IGNORES = Object.freeze(
+  ['RUSTSEC-2023-0071', ...REVIEWED_LOCK_PACKAGES.map((entry) => entry.advisory)].sort(),
+);
 const REQUIRED_INFORMATIONAL_WARNINGS = Object.freeze(['notice', 'unmaintained', 'unsound']);
 
 class AuditPolicyError extends Error {}
@@ -146,9 +174,50 @@ export function validateDependencyTree(tree) {
   );
 }
 
-export function validateAuditPolicy(report, dependencyTree) {
+function parseLockPackages(lockText) {
+  const entries = [];
+  for (const block of lockText.split(/^\[\[package\]\]$/m).slice(1)) {
+    const field = (key) => new RegExp(`^${key} = "([^"\\n]*)"$`, 'm').exec(block)?.[1];
+    entries.push({
+      name: field('name'),
+      version: field('version'),
+      source: field('source'),
+      checksum: field('checksum'),
+    });
+  }
+  return entries;
+}
+
+// The ignores for REVIEWED_LOCK_PACKAGES hide their advisories for any version,
+// so the exact reviewed Cargo.lock entry must stay in place. A changed version
+// (including a patched one) or a removed package fails until the exception is
+// re-reviewed or removed.
+export function validateReviewedLockPackages(lockText) {
+  requireCondition(
+    typeof lockText === 'string' && lockText.length > 0,
+    'Cargo.lock is missing or empty',
+  );
+  const entries = parseLockPackages(lockText);
+  for (const reviewed of REVIEWED_LOCK_PACKAGES) {
+    const matches = entries.filter((entry) => entry.name === reviewed.name);
+    requireCondition(
+      matches.length > 0,
+      `reviewed ${reviewed.name} is no longer in Cargo.lock; remove the ${reviewed.advisory} exception`,
+    );
+    requireCondition(
+      matches.length === 1 &&
+        matches[0].version === reviewed.version &&
+        matches[0].source === reviewed.source &&
+        matches[0].checksum === reviewed.checksum,
+      `reviewed ${reviewed.name} changed in Cargo.lock; re-review or remove the ${reviewed.advisory} exception`,
+    );
+  }
+}
+
+export function validateAuditPolicy(report, dependencyTree, lockText) {
   validateAuditReport(report);
   validateDependencyTree(dependencyTree);
+  validateReviewedLockPackages(lockText);
 }
 
 function readBoundedJson(filePath) {
@@ -191,9 +260,13 @@ function main() {
   );
   const report = readBoundedJson(cliArguments[0]);
   const dependencyTree = readBoundedText(cliArguments[1]);
-  validateAuditPolicy(report, dependencyTree);
+  const lockText = readBoundedText(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'Cargo.lock'),
+  );
+  validateAuditPolicy(report, dependencyTree, lockText);
   console.log(
-    `Rust audit policy passed: only reviewed yank ${REVIEWED_YANK.name} ${REVIEWED_YANK.version}`,
+    `Rust audit policy passed: only reviewed yank ${REVIEWED_YANK.name} ${REVIEWED_YANK.version} ` +
+      `and reviewed ignores ${REVIEWED_ADVISORY_IGNORES.join(', ')}`,
   );
 }
 

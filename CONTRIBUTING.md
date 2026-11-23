@@ -59,6 +59,19 @@ The policy wrapper keeps RustSec fail-closed while allowing only the reviewed
 can be removed. Any vulnerability, additional warning/yank, changed checksum,
 or new direct dependent fails the wrapper and CI.
 
+Three further RustSec advisories are ignored in `.cargo/audit.toml` by exact ID,
+reviewed on 2026-11-21 with a re-review due by 2027-02-21. The wrapper pins each
+affected package to its exact `Cargo.lock` name, version and checksum, so any
+version change fails CI until the exception is re-reviewed or removed:
+
+- `RUSTSEC-2026-0459` (`libsqlite3-sys` 0.30.1): the attack is local and needs a
+  crafted database file plus a sibling `-wal` file; Mini-Ops only opens its own
+  database. Remove after upgrading SQLx to 0.9 (requires Rust 1.94 or newer).
+- `RUSTSEC-2026-0543` (`chrono` 0.4.43, unmaintained): no fixed release; direct
+  dependency, a candidate for replacement with `jiff` or `time`.
+- `RUSTSEC-2026-0441` (`pin-utils` 0.1.0, unmaintained): no fixed release;
+  transitive dependency through `futures-util` 0.3.31.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
