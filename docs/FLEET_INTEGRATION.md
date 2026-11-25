@@ -173,11 +173,11 @@ interpret missing observations as healthy.
 
 Fleet Push does not discover certificates. The operator must separately enable
 the Mini-Ops direct-TLS collector and install a root-owned static target file;
-see [SECURITY.md](SECURITY.md#tls-certificate-monitoring). For a Mini-CRM host,
-configure the public CRM hostname and any separately served Mini-Ops hostname
-as independent TLS targets. If both endpoints serve the same certificate, the
-Hub may group them later, but it must retain per-endpoint reachability,
-hostname, trust, and freshness.
+see [SECURITY.md](SECURITY.md#tls-certificate-monitoring). For an application
+host, configure the public application hostname and any separately served
+Mini-Ops hostname as independent TLS targets. If both endpoints serve the same
+certificate, the Hub may group them later, but it must retain per-endpoint
+reachability, hostname, trust, and freshness.
 
 Do not add recursive scans of `/etc`, ACME trees, Docker volumes, home
 directories, or application directories to make Fleet ingestion work. Do not
@@ -193,7 +193,8 @@ an independent threat review. It is not part of Observation v1.
 
 - Fleet push interval: default 300 seconds, strict `60..86400` range.
 - Certificate probe interval: independent default 21600 seconds, strict
-  `300..86400`; once daily (`86400`) is a reasonable low-cost Mini-CRM default.
+  `300..86400`; once daily (`86400`) is a reasonable low-cost default for a
+  single application host.
 - Certificate targets: 1..32 per enabled agent; probe concurrency 1..8.
 - Fleet serialization: at most 32 current target rows and a 64 KiB request.
 - Each Fleet push adds one bounded current-state SQLite read when certificate

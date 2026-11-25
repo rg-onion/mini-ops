@@ -172,11 +172,11 @@ replay-ятся. Поэтому Fleet UI обязан показывать agent
 
 Fleet Push не обнаруживает сертификаты. Оператор отдельно включает Mini-Ops
 direct-TLS collector и устанавливает root-owned static targets file; см.
-[SECURITY.ru.md](SECURITY.ru.md#мониторинг-tls-сертификатов). Для Mini-CRM host
-настройте public CRM hostname и отдельно обслуживаемый Mini-Ops hostname как
-независимые TLS targets. Если оба endpoints отдают один certificate, Hub позже
-может сгруппировать их, но обязан сохранить per-endpoint reachability,
-hostname, trust и freshness.
+[SECURITY.ru.md](SECURITY.ru.md#мониторинг-tls-сертификатов). Для application
+host настройте public application hostname и отдельно обслуживаемый Mini-Ops
+hostname как независимые TLS targets. Если оба endpoints отдают один
+certificate, Hub позже может сгруппировать их, но обязан сохранить
+per-endpoint reachability, hostname, trust и freshness.
 
 Не добавляйте recursive scans `/etc`, ACME trees, Docker volumes, home или
 application directories ради Fleet ingestion. Не читайте `privkey.pem`,
@@ -192,7 +192,8 @@ collector с fixed root-owned source IDs, bounded metadata-only output и
 
 - Fleet push interval: default 300 seconds, strict `60..86400` range.
 - Certificate probe interval: independent default 21600 seconds, strict
-  `300..86400`; once daily (`86400`) — разумный low-cost default для Mini-CRM.
+  `300..86400`; once daily (`86400`) — разумный low-cost default для одного
+  application host.
 - Certificate targets: 1..32 на enabled agent; probe concurrency 1..8.
 - Fleet serialization: максимум 32 current target rows и request 64 KiB.
 - Каждый Fleet push добавляет один bounded current-state SQLite read при
